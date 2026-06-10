@@ -45,6 +45,9 @@ def _build_api_call_where(filters: LogListFilters, alias: str = "") -> tuple[str
     if filters.source_channel:
         clauses.append(f"{prefix}source_channel = :source_channel")
         params["source_channel"] = filters.source_channel
+    if filters.agent_profile:
+        clauses.append(f"COALESCE({prefix}request_json->>'agent_profile', '') = :agent_profile")
+        params["agent_profile"] = filters.agent_profile
     if filters.route:
         clauses.append(f"{prefix}route = :route")
         params["route"] = filters.route
@@ -163,8 +166,9 @@ def query_api_calls(filters: LogListFilters) -> dict[str, Any]:
 
     list_sql = text(
         f"""
-        SELECT id, run_id, session_id, user_id, source_channel, route, intent_hint,
-               http_status_code, status, latency_ms, created_at
+        SELECT id, run_id, session_id, user_id, source_channel,
+               request_json ->> 'agent_profile' AS agent_profile,
+               route, intent_hint, http_status_code, status, latency_ms, created_at
         FROM observability.api_calls
         {where_sql}
         ORDER BY created_at DESC
@@ -241,6 +245,9 @@ def query_log_detail(run_id: str) -> dict[str, Any]:
     api_call_dict = dict(api_call) if api_call else None
     trace: list[dict[str, Any]] = []
     if api_call_dict:
+        request_json = api_call_dict.get("request_json") or {}
+        if isinstance(request_json, dict):
+            api_call_dict["agent_profile"] = request_json.get("agent_profile")
         trace.append(
             {
                 "type": "request",
@@ -290,6 +297,7 @@ def query_log_detail(run_id: str) -> dict[str, Any]:
             "session_id": api_call_dict.get("session_id") if api_call_dict else None,
             "user_id": api_call_dict.get("user_id") if api_call_dict else None,
             "source_channel": api_call_dict.get("source_channel") if api_call_dict else None,
+            "agent_profile": api_call_dict.get("agent_profile") if api_call_dict else None,
             "route": api_call_dict.get("route") if api_call_dict else None,
             "status": api_call_dict.get("status") if api_call_dict else None,
             "latency_ms": api_call_dict.get("latency_ms") if api_call_dict else None,
@@ -304,8 +312,9 @@ def query_session_calls(session_id: str) -> list[dict[str, Any]]:
     ensure_schema()
     sql = text(
         """
-        SELECT id, run_id, session_id, user_id, source_channel, route, intent_hint,
-               http_status_code, status, latency_ms, created_at, request_json, response_json
+        SELECT id, run_id, session_id, user_id, source_channel,
+               request_json ->> 'agent_profile' AS agent_profile,
+               route, intent_hint, http_status_code, status, latency_ms, created_at, request_json, response_json
         FROM observability.api_calls
         WHERE session_id = :session_id
         ORDER BY created_at ASC
@@ -347,6 +356,7 @@ def query_session_summaries(filters: LogListFilters) -> dict[str, Any]:
                 run_id AS latest_run_id,
                 user_id,
                 source_channel,
+                request_json ->> 'agent_profile' AS agent_profile,
                 route AS latest_route,
                 status AS latest_status,
                 request_json,
@@ -372,6 +382,7 @@ def query_session_summaries(filters: LogListFilters) -> dict[str, Any]:
             latest.latest_run_id,
             latest.user_id,
             latest.source_channel,
+            latest.agent_profile,
             latest.latest_route,
             latest.latest_status,
             latest.request_json,
@@ -469,12 +480,23 @@ def query_dashboard_summary(filters: LogListFilters) -> dict[str, Any]:
         LIMIT 5
         """
     )
+    profile_sql = text(
+        f"""
+        SELECT COALESCE(a.request_json ->> 'agent_profile', 'unknown') AS label, COUNT(*) AS value
+        FROM observability.api_calls a
+        {where_sql}
+        GROUP BY 1
+        ORDER BY value DESC
+        LIMIT 5
+        """
+    )
     risky_sql = text(
         f"""
         SELECT
             a.session_id,
             MAX(a.user_id) AS user_id,
             MAX(a.source_channel) AS source_channel,
+            MAX(a.request_json ->> 'agent_profile') AS agent_profile,
             MAX(a.created_at) AS updated_at,
             COUNT(*) AS turn_count,
             COUNT(*) FILTER (WHERE a.status = 'error') AS error_count,
@@ -491,6 +513,7 @@ def query_dashboard_summary(filters: LogListFilters) -> dict[str, Any]:
         trends = [dict(row._mapping) for row in conn.execute(trend_sql, params)]
         by_channel = [dict(row._mapping) for row in conn.execute(channel_sql, params)]
         by_route = [dict(row._mapping) for row in conn.execute(route_sql, params)]
+        by_profile = [dict(row._mapping) for row in conn.execute(profile_sql, params)]
         risky_sessions = [dict(row._mapping) for row in conn.execute(risky_sql, params)]
     request_count = int(kpi.get("request_count") or 0)
     success_count = int(kpi.get("success_count") or 0)
@@ -510,6 +533,7 @@ def query_dashboard_summary(filters: LogListFilters) -> dict[str, Any]:
         "distribution": {
             "by_channel": by_channel,
             "by_route": by_route,
+            "by_profile": by_profile,
         },
         "health": {
             "service": "healthy",

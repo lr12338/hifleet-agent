@@ -21,6 +21,8 @@
         "get_strait_traffic",
         "upload_ship_position",
         "update_ship_static_info",
-        "smart_search"
+        "smart_search",
+        "inspect_tabular_file",
+        "run_sandboxed_python"
     ]
 }

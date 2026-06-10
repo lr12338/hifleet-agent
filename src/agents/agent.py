@@ -29,6 +29,13 @@ from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
 from coze_coding_utils.runtime_ctx.context import default_headers
 from storage.memory.memory_saver import get_memory_saver
 from skills import SkillLoader
+from agents.profiles import (
+    AgentProfile,
+    PROFILE_HEADER,
+    get_current_agent_profile_id,
+    get_profile,
+    read_profile_prompt,
+)
 
 # 配置文件路径
 LLM_CONFIG = "config/agent_llm_config.json"
@@ -36,11 +43,7 @@ SYSTEM_PROMPT_BASE = "config/system_prompt_base.md"
 
 # 默认保留最近20轮对话（40条消息）
 MAX_MESSAGES = 40
-ENABLED_SKILLS = {"hifleet_ship_service", "knowledge_qa"}
-INTENT_SKILL_MAP = {
-    "ship": {"hifleet_ship_service"},
-    "knowledge": {"knowledge_qa"},
-}
+DEFAULT_SKILLS = {"hifleet_ship_service", "knowledge_qa"}
 
 logger = logging.getLogger(__name__)
 
@@ -130,10 +133,14 @@ def _resolve_intent_hint(ctx=None, explicit_intent: str = "") -> str:
     return ""
 
 
-def _enabled_skills_for_intent(intent_hint: str) -> set:
-    if intent_hint in INTENT_SKILL_MAP:
-        return INTENT_SKILL_MAP[intent_hint]
-    return ENABLED_SKILLS
+def _resolve_agent_profile(ctx=None) -> AgentProfile:
+    headers = getattr(ctx, "headers", {}) if ctx is not None else {}
+    profile_id = ""
+    if isinstance(headers, dict):
+        profile_id = str(headers.get(PROFILE_HEADER, "")).strip()
+    if not profile_id:
+        profile_id = get_current_agent_profile_id()
+    return get_profile(profile_id)
 
 
 def classify_intent_fast(user_text: str, has_media: bool = False) -> str:
@@ -159,25 +166,17 @@ def classify_intent_fast(user_text: str, has_media: bool = False) -> str:
     return "knowledge"
 
 
-def _build_system_prompt(workspace_path: str, intent_hint: str = "") -> str:
-    """
-    动态组装System Prompt：Base Prompt + 所有Skill的SKILL.md
-    
-    拼接策略：
-    1. 加载基础Prompt（角色、路由规则、行为红线）
-    2. 逐个加载Skill的SKILL.md（领域知识、工具使用指南）
-    3. 按Skill顺序拼接，确保路由规则在前面
-    
-    Returns:
-        完整的System Prompt文本
-    """
-    # 1. 加载Base Prompt
+def _build_system_prompt(workspace_path: str, profile: AgentProfile, intent_hint: str = "") -> str:
+    """Build system prompt from base prompt, active profile prompt, and allowed skill docs."""
     base_path = os.path.join(workspace_path, SYSTEM_PROMPT_BASE)
     with open(base_path, 'r', encoding='utf-8') as f:
         parts = [f.read()]
-    
-    selected_skills = _enabled_skills_for_intent(intent_hint)
-    # 2. 加载选定Skill的SKILL.md
+
+    profile_prompt = read_profile_prompt(profile)
+    if profile_prompt.strip():
+        parts.append(f"\n\n---\n\n# Active Agent Profile: {profile.profile_id}\n\n{profile_prompt}")
+
+    selected_skills = set(profile.skills or DEFAULT_SKILLS)
     skills_dir = os.path.join(workspace_path, "src/skills")
     if os.path.isdir(skills_dir):
         for skill_name in sorted(os.listdir(skills_dir)):
@@ -190,34 +189,25 @@ def _build_system_prompt(workspace_path: str, intent_hint: str = "") -> str:
                     skill_doc = f.read()
                 parts.append(f"\n\n---\n\n# Skill: {skill_name}\n\n{skill_doc}")
                 logger.info(f"[MainAgent] Loaded skill prompt: {skill_name} ({len(skill_doc)} chars)")
-    
+
     full_prompt = "".join(parts)
     logger.info(
         f"[MainAgent] Total system prompt: {len(full_prompt)} chars, "
-        f"intent_hint={intent_hint or 'all'}"
+        f"profile={profile.profile_id}, intent_hint={intent_hint or 'none'}"
     )
     return full_prompt
 
-
-def _load_all_tools(intent_hint: str = "") -> list:
-    """
-    从所有Skill加载工具
-    
-    加载策略：
-    - 遍历所有已注册Skill
-    - 每个Skill导出其工具列表
-    - 汇总去重后返回
-    
-    Returns:
-        工具列表
-    """
-    if intent_hint in ("ship", "knowledge"):
-        all_tools = SkillLoader.get_tools_by_intent(intent_hint)
-    else:
-        all_tools = SkillLoader.get_all_tools()
-    logger.info(f"[MainAgent] Total tools loaded: {len(all_tools)}")
+def _load_all_tools(profile: AgentProfile) -> list:
+    """Load tools allowed by the active profile."""
+    all_tools = SkillLoader.get_tools_by_skill_names(list(profile.skills or DEFAULT_SKILLS))
+    disabled = set(profile.disabled_tools or [])
+    if disabled:
+        all_tools = [tool for tool in all_tools if tool.name not in disabled]
+    logger.info(
+        f"[MainAgent] Tools for profile={profile.profile_id}: "
+        f"{[t.name for t in all_tools]}"
+    )
     return all_tools
-
 
 def build_agent(ctx=None, intent: str = ""):
     """
@@ -237,15 +227,18 @@ def build_agent(ctx=None, intent: str = ""):
     logger.info("[MainAgent] Building Hifleet customer service agent (Skills architecture)...")
     
     # 1. 读取配置
-    workspace_path = os.getenv("COZE_WORKSPACE_PATH", "/workspace/projects")
+    workspace_path = os.getenv("COZE_WORKSPACE_PATH")
+    if not workspace_path:
+        workspace_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
     config_path = os.path.join(workspace_path, LLM_CONFIG)
     
     with open(config_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     
     intent_hint = _resolve_intent_hint(ctx, explicit_intent=intent)
+    profile = _resolve_agent_profile(ctx)
     # 2. 动态组装System Prompt
-    system_prompt = _build_system_prompt(workspace_path, intent_hint=intent_hint)
+    system_prompt = _build_system_prompt(workspace_path, profile=profile, intent_hint=intent_hint)
     
     # 3. 初始化LLM
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
@@ -268,10 +261,8 @@ def build_agent(ctx=None, intent: str = ""):
     
     logger.info(f"[MainAgent] LLM initialized: {cfg['config'].get('model')}")
     
-    # 4. 从Skills动态加载工具
-    tools = _load_all_tools(intent_hint=intent_hint)
-    
-    logger.info(f"[MainAgent] Tools: {[t.name for t in tools]}")
+    # 4. 从Profile允许的Skills动态加载工具
+    tools = _load_all_tools(profile)
     
     # 5. 创建Agent
     agent = create_agent(
@@ -283,18 +274,8 @@ def build_agent(ctx=None, intent: str = ""):
     )
     
     logger.info(
-        f"[MainAgent] Agent built successfully (Skills architecture), "
-        f"intent_hint={intent_hint or 'all'}"
+        f"[MainAgent] Agent built successfully (Profile architecture), "
+        f"profile={profile.profile_id}, intent_hint={intent_hint or 'none'}"
     )
     
     return agent
-
-
-# 兼容旧版本的工作流构建函数（已废弃）
-def build_workflow_with_agent_state():
-    """
-    已废弃：工作流模式已不再使用
-    保留此函数仅用于向后兼容
-    """
-    logger.warning("[Deprecated] Workflow mode is deprecated, using unified agent mode instead")
-    return build_agent()

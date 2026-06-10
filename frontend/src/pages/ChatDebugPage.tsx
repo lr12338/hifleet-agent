@@ -71,6 +71,7 @@ interface SessionMeta {
   session_id: string;
   user_id: string;
   source_channel: string;
+  agent_profile: string;
 }
 
 interface ChatSession {
@@ -142,7 +143,8 @@ function createSession(seed = 1): ChatSession {
       thinking: "enabled",
       session_id: `admin_chat_debug_${Date.now()}`,
       user_id: "admin_debug_user",
-      source_channel: "admin_panel"
+      source_channel: "admin_panel",
+      agent_profile: "employee_assistant"
     },
     userMessages: [],
     assistantMessages: [],
@@ -342,7 +344,8 @@ export function ChatDebugPage() {
     advancedForm.setFieldsValue({
       session_id: activeSession.meta.session_id,
       user_id: activeSession.meta.user_id,
-      source_channel: activeSession.meta.source_channel
+      source_channel: activeSession.meta.source_channel,
+      agent_profile: activeSession.meta.agent_profile
     });
   }, [activeSession, advancedForm, form]);
 
@@ -361,6 +364,7 @@ export function ChatDebugPage() {
       meta_session_id: activeSession.meta.session_id,
       user_id: activeSession.meta.user_id,
       source_channel: activeSession.meta.source_channel,
+      agent_profile: activeSession.meta.agent_profile,
       model: activeSession.meta.model,
       payload: activeSession
     };
@@ -567,7 +571,8 @@ export function ChatDebugPage() {
       thinking: String(values.thinkingMode || activeSession.meta.thinking) as SessionMeta["thinking"],
       session_id: String(advancedValues.session_id || activeSession.meta.session_id),
       user_id: String(advancedValues.user_id || activeSession.meta.user_id),
-      source_channel: String(advancedValues.source_channel || activeSession.meta.source_channel)
+      source_channel: String(advancedValues.source_channel || activeSession.meta.source_channel),
+      agent_profile: String(advancedValues.agent_profile || activeSession.meta.agent_profile)
     };
 
     setSessions((prev) =>
@@ -614,6 +619,7 @@ export function ChatDebugPage() {
         session_id: nextMeta.session_id,
         user_id: nextMeta.user_id,
         source_channel: nextMeta.source_channel,
+        agent_profile: nextMeta.agent_profile,
         model: nextMeta.model,
         thinking: nextMeta.thinking
       };
@@ -850,7 +856,8 @@ export function ChatDebugPage() {
     advancedForm.setFieldsValue({
       session_id: activeSession.meta.session_id,
       user_id: activeSession.meta.user_id,
-      source_channel: activeSession.meta.source_channel
+      source_channel: activeSession.meta.source_channel,
+      agent_profile: activeSession.meta.agent_profile
     });
     form.setFieldsValue({
       model: activeSession.meta.model,
@@ -894,6 +901,7 @@ export function ChatDebugPage() {
                 meta_session_id: activeSession.meta.session_id,
                 user_id: activeSession.meta.user_id,
                 source_channel: activeSession.meta.source_channel,
+                agent_profile: activeSession.meta.agent_profile,
                 model: activeSession.meta.model,
                 payload: activeSession
               }).then(() => message.success("当前调试案例已保存"));
@@ -1017,6 +1025,9 @@ export function ChatDebugPage() {
                       <Form.Item label="source_channel" name="source_channel">
                         <Input />
                       </Form.Item>
+                      <Form.Item label="agent_profile" name="agent_profile">
+                        <Select allowClear options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} />
+                      </Form.Item>
                     </Form>
                   )
                 }
@@ -1029,7 +1040,7 @@ export function ChatDebugPage() {
           <div className="chat-debug-content-header">
             <div className="chat-debug-content-title">{activeSession.title}</div>
             <div className="chat-debug-content-subtitle">
-              {activeSession.status === "running" ? "运行中" : "已结束"} | {activeSession.meta.model} | {activeSession.createdAt} | session={activeSession.meta.session_id}
+              {activeSession.status === "running" ? "运行中" : "已结束"} | {activeSession.meta.model} | profile={activeSession.meta.agent_profile} | {activeSession.createdAt} | session={activeSession.meta.session_id}
             </div>
           </div>
 

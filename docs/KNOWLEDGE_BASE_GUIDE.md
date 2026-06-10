@@ -384,8 +384,7 @@ python scripts/knowledge_base_cli.py test-search
 |---------|------|
 | `scripts/enhanced_import_knowledge.py` | 增强版导入脚本 |
 | `scripts/knowledge_base_cli.py` | CLI管理工具 |
-| `src/tools/knowledge_search_tool.py` | 基础检索工具 |
-| `src/tools/enhanced_knowledge_search_tool.py` | 增强检索工具 |
+| `src/skills/knowledge_qa/tools.py` | `smart_search` 知识库/联网搜索工具 |
 | `scripts/import_knowledge.py` | 基础导入脚本 |
 
 ---

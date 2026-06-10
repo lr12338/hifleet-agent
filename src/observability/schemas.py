@@ -50,6 +50,7 @@ class LogListFilters(BaseModel):
     session_id: str | None = None
     user_id: str | None = None
     source_channel: str | None = None
+    agent_profile: str | None = None
     route: str | None = None
     status: str | None = None
     keyword: str | None = None

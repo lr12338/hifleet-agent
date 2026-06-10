@@ -59,7 +59,7 @@ export async function fetchLogDetail(runId: string) {
 }
 
 export async function fetchSessionTimeline(sessionId: string) {
-  return requestJson<{ session_id: string; user_id?: string; source_channel?: string; summary?: Record<string, unknown>; calls: ApiCallItem[] }>(
+  return requestJson<{ session_id: string; user_id?: string; source_channel?: string; agent_profile?: string; summary?: Record<string, unknown>; calls: ApiCallItem[] }>(
     `/admin/sessions/${encodeURIComponent(sessionId)}`
   );
 }

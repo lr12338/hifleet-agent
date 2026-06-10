@@ -49,6 +49,7 @@ class SkillLoader:
     INTENT_MAP = {
         "knowledge": "knowledge_qa",
         "ship": "hifleet_ship_service",
+        "employee": "employee_workspace",
     }
 
     # 缓存
@@ -111,6 +112,7 @@ class SkillLoader:
                 "update_ship_static_info",
             ],
             "knowledge_qa": ["smart_search"],
+            "employee_workspace": ["inspect_tabular_file", "run_sandboxed_python"],
         }
 
         if skill_name not in TOOL_MAP:
@@ -191,6 +193,24 @@ class SkillLoader:
         return all_tools
 
     @classmethod
+    def get_tools_by_skill_names(cls, skill_names: List[str]) -> List[BaseTool]:
+        """Load tools for an explicit skill allowlist."""
+        all_tools = []
+        seen = set()
+        intent_by_skill = {v: k for k, v in cls.INTENT_MAP.items()}
+        for skill_name in skill_names:
+            intent = intent_by_skill.get(skill_name)
+            if not intent:
+                logger.warning(f"Unknown skill '{skill_name}' in profile allowlist")
+                continue
+            skill = cls.load(intent)
+            for tool in skill.tools:
+                if tool.name not in seen:
+                    all_tools.append(tool)
+                    seen.add(tool.name)
+        return all_tools
+
+    @classmethod
     def get_tools_by_intent(cls, intent: str) -> List[BaseTool]:
         """
         按意图获取工具集合。
@@ -202,6 +222,9 @@ class SkillLoader:
             return skill.tools
         if normalized_intent == "knowledge":
             skill = cls.load("knowledge")
+            return skill.tools
+        if normalized_intent == "employee":
+            skill = cls.load("employee")
             return skill.tools
 
         logger.warning(f"Unknown intent '{intent}', fallback to knowledge tools")

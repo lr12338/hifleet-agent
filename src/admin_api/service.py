@@ -86,6 +86,7 @@ def get_session_timeline(session_id: str) -> dict[str, Any]:
     calls = repository.query_session_calls(session_id)
     user_id = calls[0].get("user_id") if calls else None
     source_channel = calls[0].get("source_channel") if calls else None
+    agent_profile = calls[0].get("agent_profile") if calls else None
     summary = {
         "turn_count": len(calls),
         "error_count": sum(1 for call in calls if call.get("status") == "error"),
@@ -96,6 +97,7 @@ def get_session_timeline(session_id: str) -> dict[str, Any]:
         "session_id": session_id,
         "user_id": user_id,
         "source_channel": source_channel,
+        "agent_profile": agent_profile,
         "summary": summary,
         "calls": calls,
     }

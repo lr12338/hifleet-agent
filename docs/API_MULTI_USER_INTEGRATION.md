@@ -1,58 +1,80 @@
 # 多用户接入与会话隔离指南
 
-本文用于指导其他服务调用当前客服 API 时，保证：
-- 每个用户会话彼此隔离
-- 支持多轮上下文记忆
-- 支持文本/图片/语音/视频输入
+本文指导外部服务或内部系统调用 HiFleet Agent API，重点解决三件事：
 
-如需排查线上问题（串话、丢上下文、工具异常、慢请求），可配合后台管理系统使用：
-- 系统全景：`docs/ADMIN_PLATFORM_DEVELOPER_GUIDE.md`
-- 操作手册：`docs/ADMIN_BACKEND_SYSTEM_GUIDE.md`
-- 关键接口：`/admin/logs`、`/admin/logs/{run_id}`、`/admin/sessions`、`/admin/sessions/{session_id}`
+- 多用户、多会话不串话。
+- 正确选择客服或数字员工 Profile。
+- 出现慢请求、错误、工具异常时可在后台管理系统定位。
 
-## 1. 必填参数与语义
+主架构说明见 `docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
 
-调用 `/run` 或 `/stream_run` 时，至少传入：
+## 1. 核心接口
 
-- `messages`: 对话消息数组（建议每次仅传当前轮 user 消息）
-- `session_id`: 会话唯一标识（决定上下文线程）
-- `user_id`: 用户唯一标识
-- `source_channel`: 渠道标识（如 `websdk` / `wechat_mp` / 你方系统名）
+- `POST /run`：同步问答，推荐默认使用。
+- `POST /stream_run`：SSE 流式问答，适合前端实时展示。
+- `POST /cancel/{run_id}`：取消正在执行的请求。
+- `GET /health`：健康检查。
 
-说明：
-- 服务端记忆主键使用 `session_id`。
-- 同一会话必须复用同一个 `session_id`，否则会被当作新会话。
-- 不同用户必须使用不同 `session_id`，避免串话。
+## 2. 必填参数
 
-## 2. session_id 生成规则（推荐）
+调用 `/run` 或 `/stream_run` 时建议至少传入：
+
+- `messages`：OpenAI 风格消息数组，通常只传当前轮用户消息。
+- `session_id`：会话唯一标识，决定多轮上下文记忆。
+- `user_id`：用户唯一标识。
+- `source_channel`：来源渠道，用于 Profile 映射和后台筛选。
+- `agent_profile`：可选但推荐显式传入，取值为 `customer_support` 或 `employee_assistant`。
+
+Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profile` -> `source_channel` 映射 -> 默认 `customer_support`。
+
+## 3. Profile 选择
+
+| 场景 | 推荐 agent_profile | 推荐 source_channel | 说明 |
+| --- | --- | --- | --- |
+| 官网/产品内客服 | `customer_support` | `websdk` | 对客户友好回复，可检索公开信息和知识库 |
+| 微信公众号/客服 | `customer_support` | `wechat_mp` / `wechat_kf` | 多轮客服问答 |
+| CRM/工单系统 | `customer_support` | `crm` / `customer_api` | 外部客户支持场景 |
+| 内部后台测试 | `employee_assistant` | `admin_panel` | 可测试内部工具和文件能力 |
+| 内部员工助手 | `employee_assistant` | `employee_api` / `internal_web` | 需要内部鉴权和访问控制 |
+
+安全要求：不要把 `employee_assistant` 暴露给未鉴权外部用户。该 Profile 可使用文件处理和受控 Python 分析能力。
+
+## 4. session_id 生成规则
 
 推荐格式：
 
-`{channel}:{tenant_id}:{user_id}:{conversation_id}`
+```text
+{channel}:{tenant_id}:{user_id}:{conversation_id}
+```
 
 示例：
-- `crm:cn_hifleet:u_10086:c_20260610_0001`
-- `wechat_mp:public:u_openid_xxx:c_default`
+
+- `websdk:tenant_a:u_10086:c_20260610_0001`
+- `wechat_mp:hifleet:openid_xxx:c_default`
+- `employee:finance:emp_001:quote_20260610`
 
 约束：
-- 长度建议 <= 128
-- 仅使用字母/数字/`-`/`_`/`:`
-- 不要复用历史会话 ID 到新会话
 
-## 3. 单轮调用示例（文本）
+- 同一会话必须复用同一个 `session_id`。
+- 不同用户或不同业务会话不要复用 `session_id`。
+- 同一个 `session_id` 上的并发请求建议串行化，避免上下文竞争。
+- 长度建议不超过 128，字符建议使用字母、数字、`-`、`_`、`:`。
+
+## 5. 客服调用示例
 
 ```json
 {
   "messages": [
     {"role": "user", "content": "为什么轨迹查询没有反应？"}
   ],
-  "session_id": "crm:tenant_a:u_10086:c_20260610_0001",
+  "session_id": "websdk:tenant_a:u_10086:c_20260610_0001",
   "user_id": "u_10086",
-  "source_channel": "crm"
+  "source_channel": "websdk",
+  "agent_profile": "customer_support"
 }
 ```
 
-## 4. 单轮调用示例（多模态）
+多模态示例：
 
 ```json
 {
@@ -67,50 +89,86 @@
   ],
   "session_id": "crm:tenant_a:u_10086:c_20260610_0001",
   "user_id": "u_10086",
-  "source_channel": "crm"
+  "source_channel": "crm",
+  "agent_profile": "customer_support"
 }
 ```
 
-语音/视频格式：
-- 语音：`{"type":"input_audio","input_audio":{"url":"...","format":"mp3"}}`
-- 视频：`{"type":"video_url","video_url":{"url":"..."}}`
+## 6. 数字员工调用示例
 
-## 5. 多轮上下文调用方式
+```json
+{
+  "messages": [
+    {"role": "user", "content": "检查 /tmp/orders.xlsx，统计每个客户的报价总额。"}
+  ],
+  "session_id": "employee:finance:emp_001:quote_20260610",
+  "user_id": "emp_001",
+  "source_channel": "employee_api",
+  "agent_profile": "employee_assistant"
+}
+```
 
-调用方无需回传完整历史，可仅发送当前轮用户问题，但必须保持同一个 `session_id`。
+文件处理约定：
 
-示例：
-- 第 1 轮：`session_id = crm:tenant_a:u_10086:c_1`，问“我查 LIN HAI 00330”
-- 第 2 轮：同 `session_id`，问“上面我查的是哪艘船”
-- 服务将基于同一会话记忆回复上下文
+- 文件路径必须位于工作目录、`/tmp` 或 `HIFLEET_AGENT_ARTIFACT_DIR` 下。
+- Python 生成结果写入 `HIFLEET_AGENT_ARTIFACT_DIR`。
+- 不要把敏感系统路径或未授权文件路径传给 Agent。
 
-## 6. 并发与隔离建议
+## 7. 流式调用
 
-- 同一个 `session_id` 上的并发请求建议串行化，避免上下文竞争
-- 不同 `session_id` 可并发
-- 不要把 `session_id` 仅设置为 `user_id`（会混入多个业务会话）
+```bash
+curl -N -X POST http://127.0.0.1:10123/stream_run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "请介绍HiFleet轨迹功能"}],
+    "session_id": "websdk:u1:c1",
+    "user_id": "u1",
+    "source_channel": "websdk",
+    "agent_profile": "customer_support"
+  }'
+```
 
-## 7. 生产配置建议
+返回格式为 SSE：
 
-为保证多 worker 下会话一致性，请启用共享持久化 checkpointer：
+```text
+event: message
+data: {...}
+```
 
-- 设置 `PGDATABASE_URL`
-- 设置 `COZE_CHECKPOINTER_MODE=postgres`
-- 设置 `COZE_HTTP_WORKERS=2~4`
+## 8. 生产配置建议
 
-未启用 Postgres 时，回退到进程内 MemorySaver，会在多 worker 场景出现会话记忆不一致。
+为保证多 worker 下会话一致性：
 
-## 8. 常见错误排查
+```bash
+PGDATABASE_URL=postgresql://user:password@host:5432/postgres
+COZE_CHECKPOINTER_MODE=postgres
+COZE_HTTP_WORKERS=2
+```
 
-- 现象：同用户多轮“记不住上文”
-  - 排查：是否每轮更换了 `session_id`
-  - 排查：是否开启多 worker 且仍在 MemorySaver 模式
+未启用 Postgres checkpointer 时会回退到进程内记忆，多 worker 场景可能出现同一会话上下文不一致。
 
-- 现象：不同用户串话
-  - 排查：是否复用了相同 `session_id`
-  - 排查：网关层是否错误缓存了请求体
+## 9. 排障
 
-- 现象：用户反馈“回复慢/异常，但调用方侧无法定位”
-  - 排查：通过 `/admin/logs` 按 `session_id` 或 `user_id` 检索目标请求
-  - 排查：进入 `/admin/logs/{run_id}` 查看工具调用与错误明细
+后台入口：
 
+```text
+http://<server>:10123/admin-ui
+```
+
+常用后台接口：
+
+- `GET /admin/logs?session_id=...`
+- `GET /admin/logs?agent_profile=customer_support`
+- `GET /admin/logs/{run_id}`
+- `GET /admin/sessions?agent_profile=employee_assistant`
+- `GET /admin/dashboard/summary`
+
+常见问题：
+
+| 现象 | 排查方向 |
+| --- | --- |
+| 多轮不记得上文 | 每轮是否更换了 `session_id`；多 worker 是否启用 Postgres checkpointer |
+| 不同用户串话 | 是否复用了相同 `session_id`；网关是否错误缓存请求体 |
+| 客服调用到了内部工具 | 是否误传 `agent_profile=employee_assistant` 或使用了内部 `source_channel` |
+| 数字员工无法执行 Python | 是否使用 `employee_assistant`；路径是否在允许目录；代码是否触发安全规则 |
+| 回复慢或异常 | 后台 Logs 按 `session_id`、`run_id`、`agent_profile` 查工具链和错误 |

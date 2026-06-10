@@ -4,6 +4,7 @@ export interface ApiCallItem {
   session_id?: string;
   user_id?: string;
   source_channel?: string;
+  agent_profile?: string;
   route: string;
   intent_hint?: string;
   http_status_code?: number;
@@ -51,6 +52,7 @@ export interface SessionSummaryItem {
   session_id: string;
   user_id?: string;
   source_channel?: string;
+  agent_profile?: string;
   latest_run_id?: string;
   latest_route?: string;
   latest_status?: string;
@@ -83,6 +85,7 @@ export interface DashboardSummary {
   distribution: {
     by_channel: Array<{ label: string; value: number }>;
     by_route: Array<{ label: string; value: number }>;
+    by_profile: Array<{ label: string; value: number }>;
   };
   health: {
     service: string;
@@ -94,6 +97,7 @@ export interface DashboardSummary {
     session_id: string;
     user_id?: string;
     source_channel?: string;
+    agent_profile?: string;
     updated_at: string;
     turn_count: number;
     error_count: number;

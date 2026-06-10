@@ -11,7 +11,8 @@ const defaultPayload = `{
   "messages": [{"role":"user","content":"你好"}],
   "session_id": "admin_test_s1",
   "user_id": "admin",
-  "source_channel": "admin_panel"
+  "source_channel": "admin_panel",
+  "agent_profile": "employee_assistant"
 }`;
 
 const REQUEST_HISTORY_KEY = "agent-admin-test-history";
@@ -73,6 +74,9 @@ export function TestPage() {
                 const startedAt = Date.now();
                 try {
                   const parsedPayload = JSON.parse(vals.payload || "{}");
+                  ["user_id", "session_id", "source_channel", "agent_profile", "model", "temperature", "tool_policy"].forEach((key) => {
+                    if (vals[key]) parsedPayload[key] = vals[key];
+                  });
                   window.localStorage.setItem(
                     REQUEST_HISTORY_KEY,
                     JSON.stringify([{ endpoint: vals.endpoint, payload: vals.payload }, ...recentRequests].slice(0, 8))
@@ -139,6 +143,7 @@ export function TestPage() {
                 <Col span={8}><Form.Item label="user_id" name="user_id"><Input placeholder="可选覆盖" /></Form.Item></Col>
                 <Col span={8}><Form.Item label="session_id" name="session_id"><Input placeholder="可选覆盖" /></Form.Item></Col>
                 <Col span={8}><Form.Item label="source_channel" name="source_channel"><Input placeholder="admin_panel" /></Form.Item></Col>
+                <Col span={8}><Form.Item label="agent_profile" name="agent_profile"><Select allowClear options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} /></Form.Item></Col>
               </Row>
               <Card size="small" title="高级参数" style={{ marginBottom: 16 }}>
                 <Row gutter={12}>

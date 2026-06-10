@@ -36,6 +36,7 @@ export function LogsPage() {
     session_id?: string;
     user_id?: string;
     source_channel?: string;
+    agent_profile?: string;
     status?: string;
     keyword?: string;
   }>({});
@@ -49,6 +50,7 @@ export function LogsPage() {
       session_id: searchParams.get("session_id") || undefined,
       user_id: searchParams.get("user_id") || undefined,
       source_channel: searchParams.get("source_channel") || undefined,
+      agent_profile: searchParams.get("agent_profile") || undefined,
       status: searchParams.get("status") || undefined,
       keyword: searchParams.get("keyword") || undefined
     }),
@@ -69,6 +71,7 @@ export function LogsPage() {
     if (nextFilters.session_id) params.set("session_id", nextFilters.session_id);
     if (nextFilters.user_id) params.set("user_id", nextFilters.user_id);
     if (nextFilters.source_channel) params.set("source_channel", nextFilters.source_channel);
+    if (nextFilters.agent_profile) params.set("agent_profile", nextFilters.agent_profile);
     if (nextFilters.status) params.set("status", nextFilters.status);
     if (nextFilters.keyword) params.set("keyword", nextFilters.keyword);
     setSearchParams(params);
@@ -183,6 +186,12 @@ export function LogsPage() {
       render: (value?: string) => value || "-"
     },
     {
+      title: "agent_profile",
+      dataIndex: "agent_profile",
+      width: 170,
+      render: (value?: string) => value || "-"
+    },
+    {
       title: "user_id",
       dataIndex: "user_id",
       width: 220,
@@ -226,7 +235,7 @@ export function LogsPage() {
     <>
       <PageHeader
         title="请求与执行日志"
-        description="按时间、状态、渠道、关键词等维度检索 Agent 请求，右侧抽屉查看完整请求、响应、工具链与错误。"
+        description="按时间、状态、渠道、Agent Profile、关键词等维度检索 Agent 请求，右侧抽屉查看完整请求、响应、工具链与错误。"
         extra={<Typography.Text type="secondary">环境：{environmentLabel}</Typography.Text>}
         actions={[
           { key: "export", label: "导出", onClick: exportCurrent },
@@ -253,6 +262,7 @@ export function LogsPage() {
               session_id: vals.session_id || undefined,
               user_id: vals.user_id || undefined,
               source_channel: vals.source_channel || undefined,
+              agent_profile: vals.agent_profile || undefined,
               status: vals.status || undefined,
               keyword: vals.keyword || undefined
             };
@@ -264,6 +274,7 @@ export function LogsPage() {
             <Col xs={24} md={8} lg={6}><Form.Item name="status" label="状态"><Select allowClear options={[{ value: "success", label: "success" }, { value: "streaming", label: "streaming" }, { value: "error", label: "error" }, { value: "timeout", label: "timeout" }]} /></Form.Item></Col>
             <Col xs={24} md={8} lg={6}><Form.Item name="route" label="路由"><Select allowClear options={[{ value: "/run", label: "/run" }, { value: "/stream_run", label: "/stream_run" }]} /></Form.Item></Col>
             <Col xs={24} md={8} lg={6}><Form.Item name="source_channel" label="渠道"><Input placeholder="websdk / admin_panel" /></Form.Item></Col>
+            <Col xs={24} md={8} lg={6}><Form.Item name="agent_profile" label="Agent Profile"><Select allowClear options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} /></Form.Item></Col>
             <Col xs={24} md={8} lg={6}><Form.Item name="user_id" label="用户"><Input placeholder="user_id" /></Form.Item></Col>
             <Col xs={24} md={8} lg={6}><Form.Item name="session_id" label="会话"><Input placeholder="session_id" /></Form.Item></Col>
             <Col xs={24} md={8} lg={6}><Form.Item name="keyword" label="关键词"><Input placeholder="trace / 问题关键词 / run_id" /></Form.Item></Col>
@@ -318,7 +329,7 @@ export function LogsPage() {
             pageSize: 20,
             onChange: (next) => void load(next)
           }}
-          scroll={{ x: 1200 }}
+          scroll={{ x: 1400 }}
           tableLayout="fixed"
         />
       </Card>

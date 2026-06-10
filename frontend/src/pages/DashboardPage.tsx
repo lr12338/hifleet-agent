@@ -74,7 +74,7 @@ export function DashboardPage() {
       />
 
       <ContextBar>
-        <Tag color="blue">统一导航已切换到业务工作流</Tag>
+        <Tag color="blue">Agent Profile 已接入日志观测</Tag>
         <Tag color="gold">日志 / 会话 / 调试 / API 已可联动</Tag>
         <Typography.Text type="secondary">点击下方 KPI、异常会话与分布榜单可进一步钻取排障。</Typography.Text>
       </ContextBar>
@@ -154,7 +154,7 @@ export function DashboardPage() {
           </Row>
 
           <Row gutter={[16, 16]}>
-            <Col xs={24} xl={8}>
+            <Col xs={24} xl={6}>
               <Card bordered={false} title="热门渠道">
                 <List
                   dataSource={summary.distribution.by_channel}
@@ -166,7 +166,7 @@ export function DashboardPage() {
                 />
               </Card>
             </Col>
-            <Col xs={24} xl={8}>
+            <Col xs={24} xl={6}>
               <Card bordered={false} title="热门路由">
                 <List
                   dataSource={summary.distribution.by_route}
@@ -178,7 +178,19 @@ export function DashboardPage() {
                 />
               </Card>
             </Col>
-            <Col xs={24} xl={8}>
+            <Col xs={24} xl={6}>
+              <Card bordered={false} title="Agent Profile">
+                <List
+                  dataSource={summary.distribution.by_profile || []}
+                  renderItem={(item) => (
+                    <List.Item actions={[<Button type="link" onClick={() => navigate(`/logs?agent_profile=${encodeURIComponent(item.label)}`)}>查看</Button>]}>
+                      <List.Item.Meta title={item.label} description={`${item.value} 次调用`} />
+                    </List.Item>
+                  )}
+                />
+              </Card>
+            </Col>
+            <Col xs={24} xl={6}>
               <Card bordered={false} title="系统健康">
                 <List
                   dataSource={[
@@ -221,7 +233,7 @@ export function DashboardPage() {
                 >
                   <List.Item.Meta
                     title={item.session_id}
-                    description={`用户 ${item.user_id || "-"} · 渠道 ${item.source_channel || "-"} · 最近活跃 ${item.updated_at}`}
+                    description={`用户 ${item.user_id || "-"} · 渠道 ${item.source_channel || "-"} · Profile ${item.agent_profile || "-"} · 最近活跃 ${item.updated_at}`}
                   />
                   <Space size={24}>
                     <Typography.Text>轮次 {item.turn_count}</Typography.Text>

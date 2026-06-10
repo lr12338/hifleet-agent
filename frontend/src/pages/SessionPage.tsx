@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Button, Card, Col, Form, Input, List, Row, Space, Tabs, Typography } from "antd";
+import { Button, Card, Col, Form, Input, List, Row, Select, Space, Tabs, Typography } from "antd";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { fetchLogDetail, fetchSessionSummaries, fetchSessionTimeline } from "../api/client";
@@ -61,7 +61,7 @@ export function SessionPage() {
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [error, setError] = useState("");
 
-  const loadSessions = async (keyword?: string) => {
+  const loadSessions = async (keyword?: string, agentProfile?: string) => {
     setLoadingList(true);
     setError("");
     try {
@@ -73,6 +73,7 @@ export function SessionPage() {
       if (timeQuery.start_time) params.set("start_time", timeQuery.start_time);
       if (timeQuery.end_time) params.set("end_time", timeQuery.end_time);
       if (keyword) params.set("keyword", keyword);
+      if (agentProfile) params.set("agent_profile", agentProfile);
       const response = await fetchSessionSummaries(params);
       setSessions(response.items);
       if (!selectedSessionId && response.items[0]?.session_id) {
@@ -101,7 +102,7 @@ export function SessionPage() {
   };
 
   useEffect(() => {
-    void loadSessions(form.getFieldValue("keyword"));
+    void loadSessions(form.getFieldValue("keyword"), form.getFieldValue("agent_profile"));
   }, [timeRange, customRange]);
 
   useEffect(() => {
@@ -146,11 +147,14 @@ export function SessionPage() {
           form={form}
           layout="inline"
           onFinish={(values) => {
-            void loadSessions(values.keyword);
+            void loadSessions(values.keyword, values.agent_profile);
           }}
         >
           <Form.Item name="keyword" label="搜索会话">
             <Input placeholder="session_id / 用户问题关键词" style={{ width: 280 }} />
+          </Form.Item>
+          <Form.Item name="agent_profile" label="Agent Profile">
+            <Select allowClear style={{ width: 210 }} options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} />
           </Form.Item>
           <Form.Item>
             <Button type="primary" htmlType="submit">查询</Button>
@@ -195,6 +199,7 @@ export function SessionPage() {
                             <StatusTag status={item.latest_status} />
                             <Typography.Text type="secondary">轮次 {item.turn_count}</Typography.Text>
                             <Typography.Text type="secondary">工具 {item.tool_count}</Typography.Text>
+                            <Typography.Text type="secondary">Profile {item.agent_profile || "-"}</Typography.Text>
                           </Space>
                         </Space>
                       }
@@ -274,6 +279,7 @@ export function SessionPage() {
                 <Space direction="vertical" size={12} style={{ width: "100%" }}>
                   <div><Typography.Text type="secondary">session_id</Typography.Text><div>{selectedSession.session_id}</div></div>
                   <div><Typography.Text type="secondary">用户 / 渠道</Typography.Text><div>{selectedSession.user_id || "-"} / {selectedSession.source_channel || "-"}</div></div>
+                  <div><Typography.Text type="secondary">Agent Profile</Typography.Text><div>{selectedSession.agent_profile || "-"}</div></div>
                   <div><Typography.Text type="secondary">最近状态</Typography.Text><div><StatusTag status={selectedSession.latest_status} /></div></div>
                   <div><Typography.Text type="secondary">轮次 / 工具 / 错误</Typography.Text><div>{selectedSession.turn_count} / {selectedSession.tool_count} / {selectedSession.error_count}</div></div>
                   <div><Typography.Text type="secondary">平均延迟</Typography.Text><div>{selectedSession.avg_latency_ms}ms</div></div>

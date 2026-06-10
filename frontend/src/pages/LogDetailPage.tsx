@@ -27,10 +27,12 @@ export function LogDetailPage() {
       {detail ? (
         <>
           <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-            <Col xs={24} md={6}><Card bordered={false}><Typography.Text type="secondary">状态</Typography.Text><div><StatusTag status={detail.api_call?.status} /></div></Card></Col>
-            <Col xs={24} md={6}><Card bordered={false}><Typography.Text type="secondary">路由</Typography.Text><div>{detail.api_call?.route || "-"}</div></Card></Col>
-            <Col xs={24} md={6}><Card bordered={false}><Typography.Text type="secondary">延迟</Typography.Text><div>{detail.api_call?.latency_ms || 0}ms</div></Card></Col>
-            <Col xs={24} md={6}><Card bordered={false}><Typography.Text type="secondary">工具 / 错误</Typography.Text><div>{detail.tool_invocations.length} / {detail.errors.length}</div></Card></Col>
+            <Col xs={24} md={8} xl={4}><Card bordered={false}><Typography.Text type="secondary">状态</Typography.Text><div><StatusTag status={detail.api_call?.status} /></div></Card></Col>
+            <Col xs={24} md={8} xl={4}><Card bordered={false}><Typography.Text type="secondary">Profile</Typography.Text><div>{detail.api_call?.agent_profile || "-"}</div></Card></Col>
+            <Col xs={24} md={8} xl={4}><Card bordered={false}><Typography.Text type="secondary">渠道</Typography.Text><div>{detail.api_call?.source_channel || "-"}</div></Card></Col>
+            <Col xs={24} md={8} xl={4}><Card bordered={false}><Typography.Text type="secondary">路由</Typography.Text><div>{detail.api_call?.route || "-"}</div></Card></Col>
+            <Col xs={24} md={8} xl={4}><Card bordered={false}><Typography.Text type="secondary">延迟</Typography.Text><div>{detail.api_call?.latency_ms || 0}ms</div></Card></Col>
+            <Col xs={24} md={8} xl={4}><Card bordered={false}><Typography.Text type="secondary">工具 / 错误</Typography.Text><div>{detail.tool_invocations.length} / {detail.errors.length}</div></Card></Col>
           </Row>
           <Card bordered={false}>
             <Tabs

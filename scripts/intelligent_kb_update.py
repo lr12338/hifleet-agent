@@ -597,7 +597,7 @@ def _update_glossary_from_conflicts(new_entries: List[Dict]):
     for entry in conflicts:
         info = entry["duplication_info"]
         print(f"  - {entry.get('title')}: {info.get('reason')}")
-    print("  请手动检查 src/tools/knowledge_search_tool.py 中的 PLATFORM_GLOSSARY")
+    print("  请手动检查 src/skills/knowledge_qa/tools.py 中的术语/检索配置")
 
 
 if __name__ == "__main__":
