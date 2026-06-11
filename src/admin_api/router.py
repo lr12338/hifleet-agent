@@ -4,9 +4,10 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 from .auth import verify_admin_api_key
-from .schemas import AdminTestRunRequest, ArkChatRequest, ChatDebugSessionListQuery, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LogListQuery, SessionListQuery
+from .schemas import AdminTestRunRequest, ArkChatRequest, ChatDebugSessionListQuery, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LLMConfigRequest, LogListQuery, SessionListQuery
 from .service import (
     get_dashboard_summary,
+    get_llm_config,
     get_log_detail,
     get_session_timeline,
     list_chat_debug_sessions,
@@ -17,6 +18,7 @@ from .service import (
     save_chat_debug_session,
     stream_ark_chat,
     stream_test_run,
+    update_llm_config,
     upload_admin_file,
 )
 
@@ -98,6 +100,16 @@ async def admin_session_detail(session_id: str):
     return get_session_timeline(session_id)
 
 
+@router.get("/config/llm")
+async def admin_llm_config():
+    return get_llm_config()
+
+
+@router.put("/config/llm")
+async def admin_llm_config_update(req: LLMConfigRequest):
+    return update_llm_config(req)
+
+
 @router.get("/chat-debug/sessions")
 async def admin_chat_debug_sessions(limit: int = Query(default=20, ge=1, le=100)):
     query = ChatDebugSessionListQuery(limit=limit)
@@ -135,9 +147,10 @@ async def admin_file_upload(file: UploadFile = File(...)):
 
 @router.post("/ark/chat")
 async def admin_ark_chat(req: ArkChatRequest):
-    iterator, request_body = await stream_ark_chat(req)
+    iterator, request_body, resolved = await stream_ark_chat(req)
     response = StreamingResponse(iterator, media_type="text/event-stream")
-    response.headers["x-admin-ark-model"] = req.model
-    response.headers["x-admin-ark-thinking"] = req.thinking
+    response.headers["x-admin-ark-model"] = str(resolved.get("model", ""))
+    response.headers["x-admin-ark-thinking"] = str(resolved.get("thinking_type", ""))
+    response.headers["x-admin-ark-modality"] = str(resolved.get("modality", "text"))
     response.headers["x-admin-request-size"] = str(len(str(request_body)))
     return response

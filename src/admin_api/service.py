@@ -13,8 +13,9 @@ from fastapi import HTTPException, UploadFile
 
 from observability import repository
 from observability.schemas import LogListFilters
+from llm_config import export_llm_config_view, load_llm_config, resolve_model_selection, save_llm_config
 
-from .schemas import AdminTestRunRequest, ArkAttachment, ArkChatRequest, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LogListQuery, SessionListQuery
+from .schemas import AdminTestRunRequest, ArkAttachment, ArkChatRequest, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LLMConfigRequest, LogListQuery, SessionListQuery
 
 
 def list_logs(query: LogListQuery) -> dict[str, Any]:
@@ -113,6 +114,22 @@ def get_dashboard_summary(query: DashboardSummaryQuery) -> dict[str, Any]:
         }
     )
     return repository.query_dashboard_summary(filters)
+
+
+
+def get_llm_config() -> dict[str, Any]:
+    return export_llm_config_view(load_llm_config())
+
+
+def update_llm_config(req: LLMConfigRequest) -> dict[str, Any]:
+    cfg = load_llm_config()
+    cfg['config']['text_model'] = req.text_model.strip()
+    cfg['config']['multimodal_model'] = req.multimodal_model.strip()
+    cfg['config']['thinking_type'] = req.thinking_type
+    cfg['config']['deep_thinking_enabled'] = req.thinking_type != 'disabled'
+    cfg['config']['model'] = cfg['config']['text_model']
+    normalized = save_llm_config(cfg)
+    return export_llm_config_view(normalized)
 
 
 def list_chat_debug_sessions(limit: int = 20) -> dict[str, Any]:
@@ -308,6 +325,10 @@ def _extract_text(value: Any) -> str:
     return ""
 
 
+def _thinking_payload(thinking_type: str) -> dict[str, str]:
+    return {"type": str(thinking_type or "disabled").strip() or "disabled"}
+
+
 def _normalize_ark_content(attachments: list[ArkAttachment], text: str | None) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = []
     for item in attachments:
@@ -364,9 +385,15 @@ async def stream_ark_chat(req: ArkChatRequest):
     if not input_content:
         raise HTTPException(status_code=400, detail="text or attachments is required")
 
+    resolved = resolve_model_selection(
+        load_llm_config(),
+        has_multimodal_input=bool(req.attachments),
+        requested_model=str(req.model or "").strip(),
+        requested_thinking=str(req.thinking or "").strip(),
+    )
     request_body = {
-        "model": req.model,
-        "thinking": req.thinking,
+        "model": resolved["model"],
+        "thinking": _thinking_payload(resolved["thinking_type"]),
         "stream": True,
         "input": [
             {
@@ -405,8 +432,9 @@ async def stream_ark_chat(req: ArkChatRequest):
                     "session_id": req.session_id,
                     "user_id": req.user_id,
                     "source_channel": req.source_channel,
-                    "model": req.model,
-                    "thinking": req.thinking,
+                    "model": resolved["model"],
+                    "thinking": resolved["thinking_type"],
+                    "modality": resolved["modality"],
                 },
             )
             current_event = "message"
@@ -451,4 +479,4 @@ async def stream_ark_chat(req: ArkChatRequest):
             await response.aclose()
             await client.aclose()
 
-    return _iterator(), request_body
+    return _iterator(), request_body, resolved

@@ -17,6 +17,14 @@
 
 ## 2. 运行时流程
 
+在进入 employee loop 之前，请求会先经过统一模型路由层：
+
+- 纯文本消息默认走文本模型 `doubao-seed-2-0-pro-260215`
+- 图片/音频/视频消息默认走多模态模型 `doubao-seed-2-0-lite-260428`
+- 运行态路由结果会回写到 `llm_route`，用于调试页和 `/run` 返回体对齐
+
+随后才进入以下 employee 执行流程：
+
 1. `/run` 或 `/stream_run` 进入 `src/main.py`，解析 `agent_profile/source_channel`。
 2. `src/agents/agent.py` 在 `employee_assistant` 下识别是否为“表格分析/产物任务”。
 3. 命中后进入 `route -> plan -> act -> check -> loop/finalize/fail`。
@@ -33,8 +41,8 @@
 
 ```bash
 HIFLEET_AGENT_ARTIFACT_DIR=/workspace/artifacts
-HIFLEET_PY_SANDBOX_IMAGE=python:3.11-slim
-HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES=python:3.11-slim,registry.example.com/hifleet/python:3.11-slim
+HIFLEET_PY_SANDBOX_IMAGE=hifleet/python-sandbox:3.11
+HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES=hifleet/python-sandbox:3.11,swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/python:3.11-slim
 HIFLEET_PY_SANDBOX_AUTO_PULL=1
 HIFLEET_PY_SANDBOX_VOLUME=coze_ai_shared-artifacts
 HIFLEET_PY_SANDBOX_VOLUME_MOUNT=/workspace/artifacts
@@ -83,9 +91,17 @@ HIFLEET_PUBLIC_FILE_MAX_MB=100
 PYTHONPATH=src .venv/bin/python scripts/test_agent_profiles.py
 PYTHONPATH=src .venv/bin/python scripts/test_employee_workspace.py
 PYTHONPATH=src .venv/bin/python scripts/test_employee_agent_loop.py
+PYTHONPATH=src .venv/bin/python scripts/test_llm_config.py
 bash scripts/prepare_employee_sandbox_image.sh
 cd frontend && npm run build
 ```
+
+模型路由专项验证：
+
+1. `PUT /admin/config/llm` 设置 `text_model/multimodal_model/thinking_type`。
+2. 发一条纯文本 `/run` 请求，检查返回体中的 `llm_route.model=文本模型`。
+3. 发一条包含 `image_url` 或 `input_audio` 的 `/run` 请求，检查返回体中的 `llm_route.model=多模态模型`。
+4. 如需追查实际模型名，查看最终 AI message 的 `response_metadata.model_name`。
 
 ## 6. 排障
 
@@ -104,3 +120,10 @@ cd frontend && npm run build
 
 - 检查模型要求输出的文件名与 `expected_artifact` 是否一致。
 - 检查文件是否实际写入 `ARTIFACT_DIR`。
+
+模型路由与返回模型名不一致
+
+- 先看 `/run` 返回体中的 `llm_route`，确认应用层解析结果。
+- 再看最终 AI message 的 `response_metadata.model_name`，确认上游实际返回模型。
+- 若只在并发更新 `/admin/config/llm` 与并发请求时出现一次性不一致，优先按运行态竞态处理，不要立即修改核心路由代码。
+- 若顺序复现也稳定失败，再分别用 OpenAI SDK 直连、`ChatOpenAI` 直连、`bind_tools` 最小样本拆分验证。

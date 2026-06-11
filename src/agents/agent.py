@@ -20,8 +20,10 @@ from agents.profiles import (
     read_profile_prompt,
 )
 from coze_coding_utils.runtime_ctx.context import default_headers
+from llm_config import load_llm_config
 from skills import SkillLoader
 from storage.memory.memory_saver import get_memory_saver
+from utils.llm_route_state import get_current_llm_route
 
 LLM_CONFIG = "config/agent_llm_config.json"
 SYSTEM_PROMPT_BASE = "config/system_prompt_base.md"
@@ -104,7 +106,9 @@ class EmployeeAgentState(TypedDict, total=False):
     intent_hint: str
     status: str
     loop_count: int
-    phase: Literal["route", "download", "plan", "act", "check", "loop", "done", "failed"]
+    phase: Literal["route", "download", "plan", "act", "check", "loop", "done", "failed", "delegated"]
+    phase_history: list[str]
+    workspace_task: bool
     task_goal: str
     target_file_path: str
     source_file_url: str
@@ -200,22 +204,37 @@ def _load_all_tools(profile: AgentProfile) -> list:
 
 
 def _load_llm_config(workspace_path: str) -> dict[str, Any]:
-    config_path = os.path.join(workspace_path, LLM_CONFIG)
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return load_llm_config(workspace_path)
+
+
+def _resolve_runtime_llm_settings(ctx, cfg: dict[str, Any]) -> dict[str, str]:
+    config = dict(cfg.get("config") or {})
+    route = get_current_llm_route()
+    requested_model = str(route.get("model", "")).strip()
+    requested_thinking = str(route.get("thinking_type", "")).strip()
+    model = requested_model or str(config.get("text_model") or config.get("model") or "doubao-seed-2-0-pro-260215").strip()
+    thinking_type = requested_thinking or str(config.get("thinking_type") or "disabled").strip()
+    return {"model": model, "thinking_type": thinking_type}
 
 
 def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
     base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
+    logger.info(
+        "[MainAgent] Resolved model=%s thinking=%s streaming=%s",
+        runtime_settings["model"],
+        runtime_settings["thinking_type"],
+        streaming,
+    )
     return ChatOpenAI(
-        model=cfg["config"].get("model", "doubao-seed-2-0-lite-260215"),
+        model=runtime_settings["model"],
         api_key=api_key,
         base_url=base_url,
         temperature=cfg["config"].get("temperature", 0.7),
         streaming=streaming,
         timeout=cfg["config"].get("timeout", 600),
-        extra_body={"thinking": {"type": cfg["config"].get("thinking_type", "disabled")}},
+        extra_body={"thinking": {"type": runtime_settings["thinking_type"]}},
         default_headers=default_headers(ctx) if ctx else {},
     )
 
@@ -270,16 +289,25 @@ def _extract_local_file_path(text: str) -> str:
 
 
 def _extract_public_file_url(text: str) -> str:
-    candidates = re.findall(r'https?://[^\s\)\]\>\"\']+', text or "")
-    for candidate in candidates:
-        lowered = candidate.lower().rstrip('.,;')
-        if lowered.endswith(TABULAR_SUFFIXES):
-            return candidate.rstrip('.,;')
+    text = text or ""
+    trailing_punct = ".,;!?，。；！？）】》」』、"
+    delimiters = [" ", "\n", "\t", "\r", ")", "]", ">", '"', "'", "，", "。", "；", "！", "？", "）", "】", "》", "」", "』", "、"]
+    for prefix in ("https://", "http://"):
+        start_idx = text.find(prefix)
+        if start_idx < 0:
+            continue
+        candidate = text[start_idx:]
+        for delimiter in delimiters:
+            candidate = candidate.split(delimiter, 1)[0]
+        normalized = candidate.rstrip(trailing_punct)
+        if normalized.lower().endswith(TABULAR_SUFFIXES):
+            return normalized
     return ""
 
 
 def _extract_expected_artifact(text: str, source_file: str) -> str:
-    candidates = re.findall(r"[\w./-]+\.(?:xlsx|xls|csv)", text or "", flags=re.IGNORECASE)
+    text_wo_urls = re.sub(r'https?://[^\s\)\]\>\"\']+', ' ', text or "")
+    candidates = re.findall(r"[\w./-]+\.(?:xlsx|xls|csv)", text_wo_urls, flags=re.IGNORECASE)
     source_name = Path(source_file).name if source_file else ""
     for candidate in reversed(candidates):
         if Path(candidate).name != source_name:
@@ -350,8 +378,11 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         target_file_path = _extract_local_file_path(user_text)
         source_file_url = _extract_public_file_url(user_text)
         expected_artifact = _extract_expected_artifact(user_text, target_file_path or source_file_url)
+        workspace_task = bool((target_file_path or source_file_url) and any(keyword in user_text for keyword in ["分析", "表格", "csv", "excel", "xlsx", "报价", "统计", "数据", "生成", "python", "下载", "链接"]))
         return {
             "phase": "route",
+            "phase_history": ["route"],
+            "workspace_task": workspace_task,
             "task_goal": user_text,
             "target_file_path": target_file_path,
             "source_file_url": source_file_url,
@@ -368,12 +399,19 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             "agent_profile": state.get("agent_profile", profile.profile_id),
             "intent_hint": state.get("intent_hint", intent_hint),
         }
-        return await standard_agent.ainvoke(payload, context=ctx)
+        delegated = await standard_agent.ainvoke(payload, context=ctx)
+        delegated["phase"] = "delegated"
+        delegated["status"] = delegated.get("status", "delegated")
+        delegated["phase_history"] = list(state.get("phase_history", [])) + ["delegated"]
+        delegated["workspace_task"] = False
+        return delegated
 
     async def plan_node(state: EmployeeAgentState) -> dict[str, Any]:
         target_file_path = state.get("target_file_path") or _extract_local_file_path(state.get("task_goal", ""))
         source_file_url = state.get("source_file_url") or _extract_public_file_url(state.get("task_goal", ""))
+        phase_history = list(state.get("phase_history", []))
         if not target_file_path and source_file_url:
+            phase_history.append("download")
             download_raw = download_public_file_to_artifact.invoke({"file_url": source_file_url})
             download_payload = json.loads(download_raw)
             target_file_path = str(download_payload.get("local_path", "")).strip()
@@ -384,7 +422,8 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             raise RuntimeError(f"inspect_tabular_file returned non-JSON payload: {raw}") from exc
         if schema.get("file") is None:
             raise RuntimeError(f"inspect_tabular_file failed: {raw}")
-        return {"phase": "act", "file_schema": schema, "target_file_path": target_file_path, "source_file_url": source_file_url}
+        phase_history.append("plan")
+        return {"phase": "act", "phase_history": phase_history, "file_schema": schema, "target_file_path": target_file_path, "source_file_url": source_file_url}
 
     async def act_node(state: EmployeeAgentState) -> dict[str, Any]:
         prompt = f"""
@@ -416,7 +455,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         code = _extract_python_code(_content_to_text(getattr(response, "content", response)))
         if not code:
             raise RuntimeError("LLM returned empty python code")
-        return {"phase": "check", "generated_code": code}
+        return {"phase": "check", "phase_history": list(state.get("phase_history", [])) + ["act"], "generated_code": code}
 
     async def check_node(state: EmployeeAgentState) -> dict[str, Any]:
         attempt = int(state.get("loop_count") or 0) + 1
@@ -433,10 +472,12 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         except json.JSONDecodeError:
             result = {"exit_code": 1, "stderr": raw, "artifact_check": {"ok": False, "reason": "non_json_tool_response"}}
         ok = result.get("exit_code") == 0 and (result.get("artifact_check") or {}).get("ok", True)
+        phase_history = list(state.get("phase_history", [])) + ["check"]
         if ok:
-            return {"phase": "done", "status": "success", "sandbox_result": result}
+            return {"phase": "done", "status": "success", "phase_history": phase_history, "sandbox_result": result}
         return {
             "phase": "loop",
+            "phase_history": phase_history,
             "sandbox_result": result,
             "last_error": {
                 "stderr": result.get("stderr", ""),
@@ -446,16 +487,30 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         }
 
     async def loop_node(state: EmployeeAgentState) -> dict[str, Any]:
-        return {"phase": "act", "loop_count": int(state.get("loop_count") or 0) + 1}
+        return {
+            "phase": "act",
+            "phase_history": list(state.get("phase_history", [])) + ["loop"],
+            "loop_count": int(state.get("loop_count") or 0) + 1,
+        }
 
     async def finalize_node(state: EmployeeAgentState) -> dict[str, Any]:
-        return {"phase": "done", "status": "success", "messages": [AIMessage(content=_result_summary_message(state))]}
+        return {
+            "phase": "done",
+            "status": "success",
+            "phase_history": list(state.get("phase_history", [])) + ["done"],
+            "messages": [AIMessage(content=_result_summary_message(state))],
+        }
 
     async def fail_node(state: EmployeeAgentState) -> dict[str, Any]:
-        return {"phase": "failed", "status": "error", "messages": [AIMessage(content=_failure_summary_message(state))]}
+        return {
+            "phase": "failed",
+            "status": "error",
+            "phase_history": list(state.get("phase_history", [])) + ["failed"],
+            "messages": [AIMessage(content=_failure_summary_message(state))],
+        }
 
     def route_after_entry(state: EmployeeAgentState) -> str:
-        if _detect_workspace_task(profile, state.get("messages", [])):
+        if state.get("workspace_task"):
             return "plan"
         return "delegate"
 

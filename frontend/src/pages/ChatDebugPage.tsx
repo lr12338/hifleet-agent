@@ -6,6 +6,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   deleteChatDebugSession,
   fetchChatDebugSessions,
+  fetchLlmConfig,
   saveChatDebugSession,
   type StreamRunEvent,
   streamTestRun,
@@ -13,7 +14,7 @@ import {
 } from "../api/client";
 import { JsonViewer } from "../components/common/JsonViewer";
 import { StatusTag } from "../components/common/StatusTag";
-import { ARK_MODEL_OPTIONS, modelSupportsAutoThinking } from "../config/arkModels";
+import { ARK_MODEL_OPTIONS, AUTO_ROUTE_MODEL_OPTION, modelSupportsAutoThinking } from "../config/arkModels";
 import { useAdminShell } from "../layouts/AdminShell";
 import "./ChatDebugPage.css";
 
@@ -137,7 +138,7 @@ function createSession(seed = 1): ChatSession {
     status: "ended",
     createdAt,
     meta: {
-      model: ARK_MODEL_OPTIONS[0].value,
+      model: AUTO_ROUTE_MODEL_OPTION.value,
       thinking: "enabled",
       session_id: `admin_chat_debug_${Date.now()}`,
       user_id: "admin_debug_user",
@@ -288,11 +289,31 @@ export function ChatDebugPage() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [sessionKeyword, setSessionKeyword] = useState("");
   const [historyReady, setHistoryReady] = useState(false);
+  const [defaultTextModel, setDefaultTextModel] = useState(AUTO_ROUTE_MODEL_OPTION.value);
   const abortRef = useRef<AbortController | null>(null);
   const streamContainerRef = useRef<HTMLDivElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const lastSavedSnapshotRef = useRef<string>("");
   const deletedSessionIdsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadLlmDefaults = async () => {
+      try {
+        const response = await fetchLlmConfig();
+        if (cancelled) return;
+        setDefaultTextModel(response.text_model || AUTO_ROUTE_MODEL_OPTION.value);
+      } catch {
+        if (!cancelled) {
+          setDefaultTextModel(AUTO_ROUTE_MODEL_OPTION.value);
+        }
+      }
+    };
+    void loadLlmDefaults();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -465,9 +486,9 @@ export function ChatDebugPage() {
   }, [activeSession]);
 
   const textValue = Form.useWatch("text", form) || "";
-  const selectedModel = Form.useWatch("model", form) || ARK_MODEL_OPTIONS[0].value;
+  const selectedModel = Form.useWatch("model", form) || AUTO_ROUTE_MODEL_OPTION.value;
   const selectedThinkingMode = Form.useWatch("thinkingMode", form) || "enabled";
-  const supportsAutoThinking = modelSupportsAutoThinking(selectedModel);
+  const supportsAutoThinking = selectedModel === AUTO_ROUTE_MODEL_OPTION.value ? true : modelSupportsAutoThinking(selectedModel);
 
   useEffect(() => {
     if (!supportsAutoThinking && selectedThinkingMode === "auto") {
@@ -619,8 +640,8 @@ export function ChatDebugPage() {
         user_id: nextMeta.user_id,
         source_channel: nextMeta.source_channel,
         agent_profile: nextMeta.agent_profile,
-        model: nextMeta.model,
-        thinking: nextMeta.thinking
+        thinking: nextMeta.thinking,
+        ...(nextMeta.model && nextMeta.model !== AUTO_ROUTE_MODEL_OPTION.value ? { model: nextMeta.model } : {})
       };
       setSessions((prev) =>
         prev.map((session) =>
@@ -891,7 +912,7 @@ export function ChatDebugPage() {
           <div className="chat-debug-toolbar-meta">
             <Tag color={environmentTagColor}>环境：{environmentLabel}</Tag>
             <Tag>Agent：Hifleet 主 Agent</Tag>
-            <Tag>Model：{activeSession.meta.model}</Tag>
+            <Tag>Model：{activeSession.meta.model === AUTO_ROUTE_MODEL_OPTION.value ? `自动路由 / ${defaultTextModel}` : activeSession.meta.model}</Tag>
             <Tag>版本：admin-ui-v2</Tag>
           </div>
           <Space size={8} wrap className="chat-debug-toolbar-actions">
@@ -1183,7 +1204,7 @@ export function ChatDebugPage() {
               <div className="chat-debug-input-config">
                 <div className="chat-debug-input-config-left">
                   <Form.Item label="模型" name="model" className="chat-debug-model-item">
-                    <Select options={ARK_MODEL_OPTIONS} getPopupContainer={getSelectPopupContainer} />
+                    <Select options={[AUTO_ROUTE_MODEL_OPTION, ...ARK_MODEL_OPTIONS]} getPopupContainer={getSelectPopupContainer} />
                   </Form.Item>
                   <Form.Item label="深度思考" name="thinkingMode" className="chat-debug-model-item">
                     <Select
@@ -1217,7 +1238,7 @@ export function ChatDebugPage() {
               </div>
 
               <div className="chat-debug-input-hints">
-                {!supportsAutoThinking ? <Typography.Text type="secondary">当前模型不支持自动判断</Typography.Text> : <span />}
+                {!supportsAutoThinking ? <Typography.Text type="secondary">当前模型不支持自动判断</Typography.Text> : <Typography.Text type="secondary">默认按配置页自动路由，也可在此手动覆盖。</Typography.Text>}
                 <Space size={12} wrap>
                   <Tooltip title="上传依赖环境变量：OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME / OSS_ENDPOINT">
                     <Typography.Text style={{ color: "#2563eb", cursor: "help" }}>OSS配置提示</Typography.Text>

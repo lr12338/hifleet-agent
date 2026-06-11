@@ -5,8 +5,8 @@ services:
       - "10123:10123"
     environment:
       HIFLEET_AGENT_ARTIFACT_DIR: /workspace/artifacts
-      HIFLEET_PY_SANDBOX_IMAGE: python:3.11-slim
-      HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES: python:3.11-slim
+      HIFLEET_PY_SANDBOX_IMAGE: hifleet/python-sandbox:3.11
+      HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES: hifleet/python-sandbox:3.11,swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/python:3.11-slim
       HIFLEET_PY_SANDBOX_AUTO_PULL: "1"
       HIFLEET_PY_SANDBOX_VOLUME: coze_ai_shared-artifacts
       HIFLEET_PY_SANDBOX_VOLUME_MOUNT: /workspace/artifacts

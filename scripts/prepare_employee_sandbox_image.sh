@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PRIMARY_IMAGE="${HIFLEET_PY_SANDBOX_IMAGE:-python:3.11-slim}"
+PRIMARY_IMAGE="${HIFLEET_PY_SANDBOX_IMAGE:-hifleet/python-sandbox:3.11}"
 CANDIDATES_RAW="${HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES:-$PRIMARY_IMAGE}"
 IFS=',' read -r -a CANDIDATES <<< "$CANDIDATES_RAW"
 

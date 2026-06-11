@@ -41,6 +41,8 @@ from coze_coding_utils.log.config import LOG_LEVEL
 from coze_coding_utils.error.classifier import ErrorClassifier
 from coze_coding_utils.helper.stream_runner import AgentStreamRunner, agent_stream_handler, RunOpt
 from agents.profiles import PROFILE_HEADER, resolve_profile_id, set_current_agent_profile
+from llm_config import load_llm_config, messages_have_multimodal_content, resolve_model_selection
+from utils.llm_route_state import clear_current_llm_route, set_current_llm_route
 
 setup_logging(
     log_file=LOG_FILE,
@@ -315,6 +317,20 @@ def ensure_stream_compatible_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return adapted
 
 
+
+
+def _resolve_request_llm_route(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = load_llm_config()
+    resolved = resolve_model_selection(
+        cfg,
+        has_multimodal_input=messages_have_multimodal_content(payload.get("messages")),
+        requested_model=str(payload.get("model", "")).strip(),
+        requested_thinking=str(payload.get("thinking", "")).strip(),
+    )
+    payload["llm_route"] = resolved
+    return resolved
+
+
 def classify_intent_hint(payload: Dict[str, Any]) -> str:
     """
     轻量意图提示：
@@ -488,7 +504,8 @@ class AgentService:
         finally:
             # 清理任务记录
             self.running_tasks.pop(run_id, None)
-            cozeloop.flush()
+            clear_current_llm_route()
+        cozeloop.flush()
 
     # 取消执行 - 使用asyncio的标准方式
     def cancel_run(self, run_id: str, ctx: Optional[Context] = None) -> Dict[str, Any]:
@@ -681,15 +698,18 @@ async def http_run(request: Request) -> Dict[str, Any]:
             requested_profile=str(payload.get("agent_profile", "")).strip(),
             headers=headers,
         )
+        llm_route = _resolve_request_llm_route(payload)
         payload["intent_hint"] = intent_hint
         payload["agent_profile"] = agent_profile
         set_current_agent_profile(agent_profile)
+        set_current_llm_route(llm_route)
         headers[HEADER_X_INTENT_HINT] = intent_hint
         headers[PROFILE_HEADER] = agent_profile
         logger.info(
             f"Received request for /run: "
             f"run_id={run_id}, session_id={session_id}, "
-            f"source_channel={source_channel}, profile={agent_profile}, intent_hint={intent_hint}"
+            f"source_channel={source_channel}, profile={agent_profile}, intent_hint={intent_hint}, "
+            f"llm_model={llm_route.get('model')}, llm_modality={llm_route.get('modality')}, llm_thinking={llm_route.get('thinking_type')}"
         )
 
         # 创建任务并记录 - 这是关键，让我们可以通过run_id取消任务
@@ -729,6 +749,7 @@ async def http_run(request: Request) -> Dict[str, Any]:
             result = {}
         if isinstance(result, dict):
             result["run_id"] = run_id
+            result.setdefault("llm_route", payload.get("llm_route", {}))
         latency_ms = int((time.perf_counter() - started) * 1000)
         _log_api_call_event(
             run_id=run_id,
@@ -928,15 +949,18 @@ async def http_stream_run(request: Request):
         requested_profile=str(payload.get("agent_profile", "")).strip(),
         headers=headers,
     )
+    llm_route = _resolve_request_llm_route(payload)
     payload["intent_hint"] = intent_hint
     payload["agent_profile"] = agent_profile
     set_current_agent_profile(agent_profile)
+    set_current_llm_route(llm_route)
     headers[HEADER_X_INTENT_HINT] = intent_hint
     headers[PROFILE_HEADER] = agent_profile
     logger.info(
         f"Received request for /stream_run: "
         f"run_id={run_id}, session_id={session_id}, "
-        f"source_channel={source_channel}, profile={agent_profile}, intent_hint={intent_hint}"
+        f"source_channel={source_channel}, profile={agent_profile}, intent_hint={intent_hint}, "
+        f"llm_model={llm_route.get('model')}, llm_modality={llm_route.get('modality')}, llm_thinking={llm_route.get('thinking_type')}"
     )
     stream_payload = ensure_stream_compatible_payload(payload)
     

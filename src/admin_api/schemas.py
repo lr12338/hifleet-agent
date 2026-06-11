@@ -21,7 +21,7 @@ class LogListQuery(BaseModel):
 
 
 class AdminTestRunRequest(BaseModel):
-    endpoint: Literal["/run", "/stream_run"] = "/run"
+    endpoint: Literal['/run', '/stream_run'] = '/run'
     payload: dict[str, Any]
     run_id: str | None = None
     target_agent_url: str | None = None
@@ -30,15 +30,15 @@ class AdminTestRunRequest(BaseModel):
 
 
 class ArkAttachment(BaseModel):
-    type: Literal["image", "audio", "video"]
+    type: Literal['image', 'audio', 'video']
     url: str
     name: str | None = None
     mime_type: str | None = None
 
 
 class ArkChatRequest(BaseModel):
-    model: str
-    thinking: Literal["enabled", "disabled", "auto"] = "enabled"
+    model: str | None = None
+    thinking: Literal['enabled', 'disabled', 'auto'] | None = None
     text: str | None = None
     attachments: list[ArkAttachment] = Field(default_factory=list)
     session_id: str | None = None
@@ -47,10 +47,16 @@ class ArkChatRequest(BaseModel):
     stream: bool = True
 
 
+class LLMConfigRequest(BaseModel):
+    text_model: str = Field(min_length=1)
+    multimodal_model: str = Field(min_length=1)
+    thinking_type: Literal['enabled', 'disabled', 'auto'] = 'disabled'
+
+
 class ChatDebugSessionSaveRequest(BaseModel):
     session_key: str
     title: str
-    status: Literal["running", "ended"]
+    status: Literal['running', 'ended']
     meta_session_id: str
     user_id: str
     source_channel: str

@@ -1,0 +1,79 @@
+.config-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.config-page-card {
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+}
+
+.config-page-card .ant-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.config-page-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.config-page-card-head .ant-typography {
+  margin-bottom: 0;
+}
+
+.config-page-thinking-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border: 1px solid #e5edf8;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #f8fbff 0%, #f4f7fb 100%);
+}
+
+.config-page-actions {
+  justify-content: flex-end;
+}
+
+.config-page-summary-card {
+  min-height: 100%;
+}
+
+.config-page-summary-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.config-page-summary-item {
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+}
+
+.config-page-summary-label {
+  display: block;
+  margin-bottom: 6px;
+  color: #64748b;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.config-page-alert {
+  border-radius: 12px;
+}
+
+@media (max-width: 992px) {
+  .config-page-card-head,
+  .config-page-thinking-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

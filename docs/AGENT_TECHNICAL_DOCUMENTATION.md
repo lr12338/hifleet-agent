@@ -71,6 +71,29 @@ flowchart TD
 
 后台管理系统不单独部署服务，构建后的前端静态文件由主 FastAPI 服务挂载在 `/admin-ui`，后台 API 挂载在 `/admin/*`。
 
+### 2.3 模型路由层
+
+当前主链路已引入统一的模型路由层：
+
+- 共享配置文件：`config/agent_llm_config.json`
+- 共享配置模块：`src/llm_config.py`
+- 运行态路由状态：`src/utils/llm_route_state.py`
+
+默认规则：
+
+- 纯文本请求：默认使用 `doubao-seed-2-0-pro-260215`
+- 图片/音频/视频等多模态请求：默认使用 `doubao-seed-2-0-lite-260428`
+- 深度思考：默认 `disabled`，可在后台配置页切换为 `enabled` 或后续扩展 `auto`
+
+路由时机：
+
+1. `src/main.py` 在 `/run`、`/stream_run` 入口将请求统一归一化为 `messages`。
+2. 根据消息内容是否包含 `image_url`、`input_audio`、`video_url` 等片段判断 `text/multimodal`。
+3. 将解析出的 `model/modality/thinking_type` 写入 `payload.llm_route`，并同步写入 `ContextVar`。
+4. `src/agents/agent.py` 构建 `ChatOpenAI` 时不再只读静态配置，而是优先读取当前请求的 `llm_route`。
+
+这样可以保证同一套 Agent 拓扑在不同输入模态下自动切换模型，而不需要调用方自己传模型名。
+
 ## 3. Profile 设计
 
 ### 3.1 为什么选择“一个主 Agent + 多 Profile”
@@ -240,9 +263,9 @@ flowchart TD
 - Dashboard：KPI、趋势、渠道/路由/Profile 分布、高风险会话。
 - Sessions：会话列表、消息回放、Profile 筛选、日志联动。
 - Logs：按时间、状态、渠道、Profile、关键词检索请求，查看 request/response/tools/errors/trace。
-- Chat Debug：多会话调试、附件上传、显式 `agent_profile`、SSE 事件查看、案例保存。
+- Chat Debug：多会话调试、附件上传、显式 `agent_profile`、SSE 事件查看、案例保存。默认提供 `自动路由（按配置页）` 选项，也允许临时手动覆盖模型。
 - API Playground：同步/流式接口测试，支持覆盖 `source_channel` 和 `agent_profile`。
-- Config：配置中心骨架页。
+- Config：模型配置中心，支持设置默认文本模型、多模态模型、自定义模型 ID 和深度思考开关。
 
 观测字段：
 
@@ -252,7 +275,41 @@ flowchart TD
 - `source_channel`：来源渠道。
 - `agent_profile`：由请求体中的 `agent_profile` 写入 `request_json`，后台查询时派生展示。
 
-## 8. 外部接口
+## 8. 后台模型配置接口
+
+### 8.1 管理台配置接口
+
+```bash
+curl http://127.0.0.1:10123/admin/config/llm
+
+curl -X PUT http://127.0.0.1:10123/admin/config/llm \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text_model": "doubao-seed-2-0-pro-260215",
+    "multimodal_model": "doubao-seed-2-0-lite-260428",
+    "thinking_type": "disabled"
+  }'
+```
+
+返回字段：
+
+- `text_model`
+- `multimodal_model`
+- `thinking_type`
+- `deep_thinking_enabled`
+- `text_model_presets`
+- `multimodal_model_presets`
+
+### 8.2 真实联调结论
+
+2026-06-11 已完成真实运行态联调，结论如下：
+
+- `GET/PUT /admin/config/llm` 可正常读写并即时生效。
+- 纯文本 `/run` 请求稳定命中 `doubao-seed-2-0-pro-260215`。
+- 多模态 `/run` 请求稳定命中 `doubao-seed-2-0-lite-260428`。
+- 早期出现过一次 `llm_route=model=lite` 但 `response_metadata.model_name=pro` 的异常；后续通过顺序回归、OpenAI SDK 直连、LangChain `ChatOpenAI` 直连、`bind_tools` 最小复现均未再次出现。当前判断为测试时并行更新配置和并发请求造成的运行态竞态，不是稳定代码缺陷。
+
+## 9. 外部接口
 
 ### 8.1 健康检查
 
@@ -335,8 +392,8 @@ HIFLEET_AGENT_ARTIFACT_DIR=/tmp/hifleet_agent_artifacts
 HIFLEET_PY_SANDBOX_TIMEOUT_SEC=20
 HIFLEET_PY_SANDBOX_MAX_CODE_CHARS=12000
 HIFLEET_PY_SANDBOX_STDIO_CHARS=8000
-HIFLEET_PY_SANDBOX_IMAGE=python:3.11-slim
-HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES=python:3.11-slim
+HIFLEET_PY_SANDBOX_IMAGE=hifleet/python-sandbox:3.11
+HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES=hifleet/python-sandbox:3.11,swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/python:3.11-slim
 HIFLEET_PY_SANDBOX_AUTO_PULL=1
 HIFLEET_PY_SANDBOX_VOLUME=coze_ai_shared-artifacts
 HIFLEET_PY_SANDBOX_VOLUME_MOUNT=/workspace/artifacts

@@ -74,6 +74,30 @@ export async function fetchDashboardSummary(params: URLSearchParams) {
   return requestJson<DashboardSummary>(`/admin/dashboard/summary?${params.toString()}`);
 }
 
+export interface LlmRuntimeConfigResponse {
+  text_model: string;
+  multimodal_model: string;
+  thinking_type: "enabled" | "disabled" | "auto";
+  deep_thinking_enabled: boolean;
+  text_model_presets: string[];
+  multimodal_model_presets: string[];
+}
+
+export async function fetchLlmConfig() {
+  return requestJson<LlmRuntimeConfigResponse>("/admin/config/llm");
+}
+
+export async function saveLlmConfig(payload: {
+  text_model: string;
+  multimodal_model: string;
+  thinking_type: "enabled" | "disabled" | "auto";
+}) {
+  return requestJson<LlmRuntimeConfigResponse>("/admin/config/llm", {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
 export async function runTest(payload: {
   endpoint: "/run" | "/stream_run";
   payload: Record<string, unknown>;
