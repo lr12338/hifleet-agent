@@ -150,8 +150,9 @@ async def proxy_test_run(req: AdminTestRunRequest) -> dict[str, Any]:
     base_url = (req.target_agent_url or _default_target_agent_url()).rstrip("/")
     url = f"{base_url}{req.endpoint}"
     timeout = httpx.Timeout(req.timeout_s)
+    headers = {"x-run-id": req.run_id} if req.run_id else None
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, json=req.payload)
+        response = await client.post(url, json=req.payload, headers=headers)
     return {
         "target_url": url,
         "status_code": response.status_code,
@@ -173,7 +174,8 @@ async def stream_test_run(req: AdminTestRunRequest):
     timeout = httpx.Timeout(req.timeout_s)
 
     client = httpx.AsyncClient(timeout=timeout)
-    request = client.build_request("POST", url, json=req.payload)
+    headers = {"x-run-id": req.run_id} if req.run_id else None
+    request = client.build_request("POST", url, json=req.payload, headers=headers)
     response = await client.send(request, stream=True)
 
     async def _iterator():

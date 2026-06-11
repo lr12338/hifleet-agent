@@ -7,6 +7,7 @@ import { JsonViewer } from "../components/common/JsonViewer";
 import { StatusTag } from "../components/common/StatusTag";
 import { ContextBar } from "../components/page/ContextBar";
 import { PageHeader } from "../components/page/PageHeader";
+import { TimeRangeControls } from "../components/page/TimeRangeControls";
 import { EmptyState } from "../components/state/EmptyState";
 import { ErrorState } from "../components/state/ErrorState";
 import { LoadingState } from "../components/state/LoadingState";
@@ -143,27 +144,37 @@ export function SessionPage() {
       />
 
       <ContextBar>
-        <Form
-          form={form}
-          layout="inline"
-          onFinish={(values) => {
-            void loadSessions(values.keyword, values.agent_profile);
-          }}
-        >
-          <Form.Item name="keyword" label="搜索会话">
-            <Input placeholder="session_id / 用户问题关键词" style={{ width: 280 }} />
-          </Form.Item>
-          <Form.Item name="agent_profile" label="Agent Profile">
-            <Select allowClear style={{ width: 210 }} options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} />
-          </Form.Item>
-          <Form.Item>
-            <Button type="primary" htmlType="submit">查询</Button>
-          </Form.Item>
-          <Form.Item>
-            <Button onClick={() => { form.resetFields(); void loadSessions(); }}>重置</Button>
-          </Form.Item>
-        </Form>
-        <Typography.Text type="secondary">时间范围来自全局 Header，可从左侧快速切换最近活跃会话。</Typography.Text>
+        <div style={{ width: "100%" }}>
+          <TimeRangeControls label="会话时间窗口" />
+        </div>
+        <Typography.Text type="secondary">时间范围只控制当前会话列表，关键词与 Profile 用于页内局部筛选。</Typography.Text>
+        <div style={{ width: "100%" }}>
+          <Form
+            form={form}
+            layout="vertical"
+            style={{ width: "100%" }}
+            onFinish={(values) => {
+              void loadSessions(values.keyword, values.agent_profile);
+            }}
+          >
+            <Row gutter={12}>
+              <Col xs={24} md={12} lg={10}>
+                <Form.Item name="keyword" label="搜索会话">
+                  <Input placeholder="session_id / 用户问题关键词" />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={8} lg={6}>
+                <Form.Item name="agent_profile" label="Agent Profile">
+                  <Select allowClear options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={4} lg={8} className="admin-form-actions">
+                <Button type="primary" htmlType="submit">查询</Button>
+                <Button onClick={() => { form.resetFields(); void loadSessions(); }}>重置</Button>
+              </Col>
+            </Row>
+          </Form>
+        </div>
       </ContextBar>
 
       {error ? <ErrorState title="会话中心加载失败" error={error} onRetry={() => void loadSessions(form.getFieldValue("keyword"))} /> : null}
@@ -191,10 +202,10 @@ export function SessionPage() {
                     }}
                   >
                     <List.Item.Meta
-                      title={item.title || item.session_id}
+                      title={<span className="admin-text-break">{item.title || item.session_id}</span>}
                       description={
                         <Space direction="vertical" size={4}>
-                          <Typography.Text type="secondary">{item.last_message || item.session_id}</Typography.Text>
+                          <Typography.Text type="secondary" className="admin-text-break">{item.last_message || item.session_id}</Typography.Text>
                           <Space size={8} wrap>
                             <StatusTag status={item.latest_status} />
                             <Typography.Text type="secondary">轮次 {item.turn_count}</Typography.Text>
@@ -213,11 +224,11 @@ export function SessionPage() {
 
         <Col xs={24} xl={11}>
           <Card
-            title={selectedSession?.title || selectedSessionId || "消息流"}
+            title={<span className="admin-text-break">{selectedSession?.title || selectedSessionId || "消息流"}</span>}
             bordered={false}
             extra={
               selectedSessionId ? (
-                <Space>
+                <Space wrap>
                   <Button type="link" onClick={() => navigate(`/logs?session_id=${encodeURIComponent(selectedSessionId)}`)}>查看日志</Button>
                   <Button type="link" onClick={() => navigate(`/chat?session_id=${encodeURIComponent(selectedSessionId)}`)}>打开调试</Button>
                 </Space>
@@ -237,7 +248,7 @@ export function SessionPage() {
                         <Space>
                           <StatusTag status={call.status} />
                           <Typography.Text strong>{call.route}</Typography.Text>
-                          <Typography.Text type="secondary">{call.created_at}</Typography.Text>
+                          <Typography.Text type="secondary" className="admin-text-break">{call.created_at}</Typography.Text>
                         </Space>
                         <Space>
                           <Typography.Text type="secondary">{formatDuration(call.latency_ms)}</Typography.Text>
@@ -277,9 +288,9 @@ export function SessionPage() {
             <Card title="会话详情" bordered={false}>
               {selectedSession ? (
                 <Space direction="vertical" size={12} style={{ width: "100%" }}>
-                  <div><Typography.Text type="secondary">session_id</Typography.Text><div>{selectedSession.session_id}</div></div>
-                  <div><Typography.Text type="secondary">用户 / 渠道</Typography.Text><div>{selectedSession.user_id || "-"} / {selectedSession.source_channel || "-"}</div></div>
-                  <div><Typography.Text type="secondary">Agent Profile</Typography.Text><div>{selectedSession.agent_profile || "-"}</div></div>
+                  <div><Typography.Text type="secondary">session_id</Typography.Text><div className="admin-text-break">{selectedSession.session_id}</div></div>
+                  <div><Typography.Text type="secondary">用户 / 渠道</Typography.Text><div className="admin-text-break">{selectedSession.user_id || "-"} / {selectedSession.source_channel || "-"}</div></div>
+                  <div><Typography.Text type="secondary">Agent Profile</Typography.Text><div className="admin-text-break">{selectedSession.agent_profile || "-"}</div></div>
                   <div><Typography.Text type="secondary">最近状态</Typography.Text><div><StatusTag status={selectedSession.latest_status} /></div></div>
                   <div><Typography.Text type="secondary">轮次 / 工具 / 错误</Typography.Text><div>{selectedSession.turn_count} / {selectedSession.tool_count} / {selectedSession.error_count}</div></div>
                   <div><Typography.Text type="secondary">平均延迟</Typography.Text><div>{selectedSession.avg_latency_ms}ms</div></div>

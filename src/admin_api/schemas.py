@@ -23,6 +23,7 @@ class LogListQuery(BaseModel):
 class AdminTestRunRequest(BaseModel):
     endpoint: Literal["/run", "/stream_run"] = "/run"
     payload: dict[str, Any]
+    run_id: str | None = None
     target_agent_url: str | None = None
     timeout_s: int = Field(default=180, ge=1, le=900)
     stream: bool = False

@@ -17,12 +17,24 @@ const defaultPayload = `{
 
 const REQUEST_HISTORY_KEY = "agent-admin-test-history";
 
+function buildAdminRunId() {
+  return `admin-test-${Date.now()}`;
+}
+
 export function TestPage() {
   const [form] = Form.useForm();
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [streamEvents, setStreamEvents] = useState<StreamRunEvent[]>([]);
   const [loading, setLoading] = useState(false);
-  const [responseMeta, setResponseMeta] = useState<{ status?: number; latencyMs?: number; traceId?: string }>({});
+  const [responseMeta, setResponseMeta] = useState<{
+    status?: number;
+    latencyMs?: number;
+    runId?: string;
+    sessionId?: string;
+    userId?: string;
+    sourceChannel?: string;
+    agentProfile?: string;
+  }>({});
   const recentRequests = useMemo(() => {
     const raw = window.localStorage.getItem(REQUEST_HISTORY_KEY);
     return raw ? (JSON.parse(raw) as Array<{ endpoint: string; payload: string }>) : [];
@@ -74,6 +86,7 @@ export function TestPage() {
                 const startedAt = Date.now();
                 try {
                   const parsedPayload = JSON.parse(vals.payload || "{}");
+                  const runId = buildAdminRunId();
                   ["user_id", "session_id", "source_channel", "agent_profile", "model", "temperature", "tool_policy"].forEach((key) => {
                     if (vals[key]) parsedPayload[key] = vals[key];
                   });
@@ -82,23 +95,38 @@ export function TestPage() {
                     JSON.stringify([{ endpoint: vals.endpoint, payload: vals.payload }, ...recentRequests].slice(0, 8))
                   );
                   if (vals.endpoint === "/stream_run") {
+                    const collectedEvents: StreamRunEvent[] = [];
                     await streamTestRun(parsedPayload, {
                       onEvent: (event) => {
+                        collectedEvents.push(event);
                         setStreamEvents((prev) => [...prev, event]);
                       },
                       onDone: () => {
                         setResponseMeta({
                           status: 200,
                           latencyMs: Date.now() - startedAt,
-                          traceId: `stream-${startedAt}`
+                          runId,
+                          sessionId: String(parsedPayload.session_id || "-"),
+                          userId: String(parsedPayload.user_id || "-"),
+                          sourceChannel: String(parsedPayload.source_channel || "-"),
+                          agentProfile: String(parsedPayload.agent_profile || "-")
                         });
                       }
+                    }, undefined, runId);
+                    setResult({
+                      message: "stream completed",
+                      event_count: collectedEvents.length,
+                      run_id: runId,
+                      session_id: parsedPayload.session_id || "-",
+                      user_id: parsedPayload.user_id || "-",
+                      source_channel: parsedPayload.source_channel || "-",
+                      agent_profile: parsedPayload.agent_profile || "-"
                     });
-                    setResult({ message: "stream completed", event_count: streamEvents.length });
                   } else {
                     const res = await runTest({
                       endpoint: vals.endpoint,
                       payload: parsedPayload,
+                      run_id: runId,
                       stream: false
                     });
                     setResult(res);
@@ -106,7 +134,11 @@ export function TestPage() {
                     setResponseMeta({
                       status: Number(res.status_code || 200),
                       latencyMs: Date.now() - startedAt,
-                      traceId: String(body.run_id || body.target_url || `run-${startedAt}`)
+                      runId: String(body.run_id || runId),
+                      sessionId: String(parsedPayload.session_id || "-"),
+                      userId: String(parsedPayload.user_id || "-"),
+                      sourceChannel: String(parsedPayload.source_channel || "-"),
+                      agentProfile: String(parsedPayload.agent_profile || "-")
                     });
                   }
                 } catch (error) {
@@ -166,7 +198,13 @@ export function TestPage() {
               <Space size={24}>
                 <div><Typography.Text type="secondary">状态码</Typography.Text><div><StatusTag status={String(responseMeta.status || "-")} /></div></div>
                 <div><Typography.Text type="secondary">耗时</Typography.Text><div>{responseMeta.latencyMs ? `${responseMeta.latencyMs} ms` : "-"}</div></div>
-                <div><Typography.Text type="secondary">Trace ID</Typography.Text><div>{responseMeta.traceId || "-"}</div></div>
+                <div><Typography.Text type="secondary">run_id</Typography.Text><div>{responseMeta.runId || "-"}</div></div>
+              </Space>
+              <Space size={24} wrap style={{ marginTop: 12 }}>
+                <div><Typography.Text type="secondary">session_id</Typography.Text><div>{responseMeta.sessionId || "-"}</div></div>
+                <div><Typography.Text type="secondary">user_id</Typography.Text><div>{responseMeta.userId || "-"}</div></div>
+                <div><Typography.Text type="secondary">source_channel</Typography.Text><div>{responseMeta.sourceChannel || "-"}</div></div>
+                <div><Typography.Text type="secondary">agent_profile</Typography.Text><div>{responseMeta.agentProfile || "-"}</div></div>
               </Space>
             </Card>
 

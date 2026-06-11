@@ -1,0 +1,134 @@
+.admin-shell-layout {
+  min-height: 100vh;
+  background: #f5f7fb;
+}
+
+.admin-shell-sider {
+  border-right: 1px solid #e5e7eb;
+  background: #fff;
+}
+
+.admin-shell-logo {
+  height: 64px;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  border-bottom: 1px solid #eef2f7;
+}
+
+.admin-shell-header {
+  background: #fff;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 0 20px;
+}
+
+.admin-shell-header-inner {
+  min-height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.admin-shell-brand,
+.admin-shell-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.admin-shell-content {
+  padding: 20px;
+  overflow: auto;
+}
+
+.admin-page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.admin-page-header-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.admin-page-header-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.admin-context-bar {
+  margin-bottom: 16px;
+  border-radius: 8px;
+}
+
+.admin-form-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.admin-text-break {
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.json-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.json-viewer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.json-viewer-content {
+  margin: 0;
+  padding: 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 10px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.json-viewer-key {
+  color: #93c5fd;
+}
+
+.json-viewer-string {
+  color: #86efac;
+}
+
+.json-viewer-number {
+  color: #fca5a5;
+}
+
+.json-viewer-boolean {
+  color: #fcd34d;
+}
+
+.json-viewer-null {
+  color: #c4b5fd;
+}
+
+@media (max-width: 992px) {
+  .admin-shell-header-inner,
+  .admin-page-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .admin-shell-controls,
+  .admin-page-header-actions {
+    justify-content: flex-start;
+  }
+}

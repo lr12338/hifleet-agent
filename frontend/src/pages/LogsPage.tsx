@@ -152,7 +152,14 @@ export function LogsPage() {
       width: 250,
       ellipsis: true,
       render: (value: string) => (
-        <Button type="link" onClick={() => void openLogDrawer({ run_id: value } as ApiCallItem)} title={value}>
+        <Button
+          type="link"
+          onClick={(event) => {
+            event.stopPropagation();
+            void openLogDrawer({ run_id: value } as ApiCallItem);
+          }}
+          title={value}
+        >
           <span
             style={{
               maxWidth: 220,
@@ -174,7 +181,15 @@ export function LogsPage() {
       ellipsis: true,
       width: 260,
       render: (value?: string) => (
-        <Button type="link" onClick={() => value && navigate(`/sessions/${encodeURIComponent(value)}`)}>
+        <Button
+          type="link"
+          onClick={(event) => {
+            event.stopPropagation();
+            if (value) {
+              navigate(`/sessions/${encodeURIComponent(value)}`);
+            }
+          }}
+        >
           <TruncatedText value={value} />
         </Button>
       )

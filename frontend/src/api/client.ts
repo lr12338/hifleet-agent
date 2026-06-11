@@ -77,6 +77,7 @@ export async function fetchDashboardSummary(params: URLSearchParams) {
 export async function runTest(payload: {
   endpoint: "/run" | "/stream_run";
   payload: Record<string, unknown>;
+  run_id?: string;
   stream?: boolean;
 }) {
   return requestJson<Record<string, unknown>>("/admin/test/run", {
@@ -219,13 +220,15 @@ export async function streamTestRun(
     onEvent?: (event: StreamRunEvent) => void;
     onDone?: () => void;
   },
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  runId?: string
 ) {
   return consumeEventStream(
     "/admin/test/run",
     {
       endpoint: "/stream_run",
       stream: true,
+      run_id: runId,
       payload
     },
     handlers,

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Card, Collapse, Divider, Form, Input, Select, Space, Tag, Tooltip, Typography, Upload, type UploadProps, message } from "antd";
+import { Button, Card, Divider, Form, Input, Modal, Select, Space, Tag, Tooltip, Typography, Upload, type UploadProps, message } from "antd";
 import type { UploadFile } from "antd/es/upload/interface";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
@@ -13,8 +13,6 @@ import {
 } from "../api/client";
 import { JsonViewer } from "../components/common/JsonViewer";
 import { StatusTag } from "../components/common/StatusTag";
-import { ContextBar } from "../components/page/ContextBar";
-import { PageHeader } from "../components/page/PageHeader";
 import { ARK_MODEL_OPTIONS, modelSupportsAutoThinking } from "../config/arkModels";
 import { useAdminShell } from "../layouts/AdminShell";
 import "./ChatDebugPage.css";
@@ -287,6 +285,7 @@ export function ChatDebugPage() {
   const [sessions, setSessions] = useState<ChatSession[]>([createSession()]);
   const [activeSessionId, setActiveSessionId] = useState<string>("");
   const [activePanel, setActivePanel] = useState<PanelType>("chat");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [sessionKeyword, setSessionKeyword] = useState("");
   const [historyReady, setHistoryReady] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -876,85 +875,103 @@ export function ChatDebugPage() {
     api: "API视图",
     request: "原始日志视图"
   };
+  const environmentTagColor = environmentLabel === "production" ? "blue" : environmentLabel === "staging" ? "gold" : "default";
+  const getSelectPopupContainer = (triggerNode: HTMLElement) => triggerNode.parentElement ?? document.body;
 
   return (
     <div className="chat-debug-page">
-      <PageHeader
-        title="Chat Debug 工作台"
-        description="统一查看对话、Trace、API 与原始日志，支持会话持久化、附件上传、保存案例与跨页跳转。"
-        extra={
-          <Typography.Text type="secondary">
-            环境：{environmentLabel} | Agent：Hifleet 主 Agent | Model：{activeSession.meta.model} | 版本：admin-ui-v2
-          </Typography.Text>
-        }
-        actions={[
-          { key: "new", label: "新对话", onClick: createNewSession, type: "primary" },
-          {
-            key: "save-case",
-            label: "保存案例",
-            onClick: () => {
-              if (!activeSession) return;
-              void saveChatDebugSession(activeSession.id, {
-                session_key: activeSession.id,
-                title: activeSession.title,
-                status: activeSession.status,
-                meta_session_id: activeSession.meta.session_id,
-                user_id: activeSession.meta.user_id,
-                source_channel: activeSession.meta.source_channel,
-                agent_profile: activeSession.meta.agent_profile,
-                model: activeSession.meta.model,
-                payload: activeSession
-              }).then(() => message.success("当前调试案例已保存"));
-            }
-          },
-          {
-            key: "share",
-            label: "分享链接",
-            onClick: async () => {
-              await navigator.clipboard.writeText(`${window.location.origin}/admin-ui/chat?session_id=${encodeURIComponent(activeSession.meta.session_id)}`);
-              message.success("分享链接已复制");
-            }
-          },
-          {
-            key: "export",
-            label: "导出记录",
-            onClick: () => {
-              const blob = new Blob([JSON.stringify(activeSession, null, 2)], { type: "application/json" });
-              const url = window.URL.createObjectURL(blob);
-              const anchor = document.createElement("a");
-              anchor.href = url;
-              anchor.download = `${activeSession.title || "chat-debug"}-${Date.now()}.json`;
-              anchor.click();
-              window.URL.revokeObjectURL(url);
-            }
-          },
-          { key: "refresh", label: "刷新", onClick: refreshCurrentSession }
-        ]}
-      />
-
-      <ContextBar>
-        <div className="chat-debug-tabbar">
-          {([
-            ["chat", "对话视图"],
-            ["backend", "Trace视图"],
-            ["api", "API视图"],
-            ["request", "原始日志视图"]
-          ] as Array<[PanelType, string]>).map(([key, label]) => (
-            <button
-              type="button"
-              key={key}
-              className={`chat-debug-tab ${activePanel === key ? "active" : ""}`}
-              onClick={() => setActivePanel(key)}
+      <div className="chat-debug-top-shell">
+        <div className="chat-debug-toolbar">
+          <div className="chat-debug-toolbar-main">
+            <div className="chat-debug-toolbar-title">Chat Debug 工作台</div>
+            <div className="chat-debug-toolbar-description">
+              统一查看对话、Trace、API 与原始日志，支持会话持久化、附件上传、保存案例与跨页跳转。
+            </div>
+          </div>
+          <div className="chat-debug-toolbar-meta">
+            <Tag color={environmentTagColor}>环境：{environmentLabel}</Tag>
+            <Tag>Agent：Hifleet 主 Agent</Tag>
+            <Tag>Model：{activeSession.meta.model}</Tag>
+            <Tag>版本：admin-ui-v2</Tag>
+          </div>
+          <Space size={8} wrap className="chat-debug-toolbar-actions">
+            <Button type="primary" className="chat-debug-primary-button" onClick={createNewSession}>
+              新对话
+            </Button>
+            <Button
+              className="chat-debug-secondary-button"
+              onClick={() => {
+                if (!activeSession) return;
+                void saveChatDebugSession(activeSession.id, {
+                  session_key: activeSession.id,
+                  title: activeSession.title,
+                  status: activeSession.status,
+                  meta_session_id: activeSession.meta.session_id,
+                  user_id: activeSession.meta.user_id,
+                  source_channel: activeSession.meta.source_channel,
+                  agent_profile: activeSession.meta.agent_profile,
+                  model: activeSession.meta.model,
+                  payload: activeSession
+                }).then(() => message.success("当前调试案例已保存"));
+              }}
             >
-              {label}
-            </button>
-          ))}
+              保存案例
+            </Button>
+            <Button
+              className="chat-debug-secondary-button"
+              onClick={async () => {
+                await navigator.clipboard.writeText(`${window.location.origin}/admin-ui/chat?session_id=${encodeURIComponent(activeSession.meta.session_id)}`);
+                message.success("分享链接已复制");
+              }}
+            >
+              分享链接
+            </Button>
+            <Button
+              className="chat-debug-secondary-button"
+              onClick={() => {
+                const blob = new Blob([JSON.stringify(activeSession, null, 2)], { type: "application/json" });
+                const url = window.URL.createObjectURL(blob);
+                const anchor = document.createElement("a");
+                anchor.href = url;
+                anchor.download = `${activeSession.title || "chat-debug"}-${Date.now()}.json`;
+                anchor.click();
+                window.URL.revokeObjectURL(url);
+              }}
+            >
+              导出记录
+            </Button>
+            <Button className="chat-debug-secondary-button" onClick={refreshCurrentSession}>
+              刷新
+            </Button>
+          </Space>
         </div>
-        <Tag color="purple">思考 {eventStats.thought}</Tag>
-        <Tag color="gold">工具 {eventStats.tool}</Tag>
-        <Tag color="blue">流式 {eventStats.stream}</Tag>
-        <Typography.Text type="secondary">所有会话已自动缓存到 Postgres，刷新后可恢复。</Typography.Text>
-      </ContextBar>
+
+        <div className="chat-debug-toolbar-strip">
+          <div className="chat-debug-tabbar">
+            {([
+              ["chat", "对话视图"],
+              ["backend", "Trace视图"],
+              ["api", "API视图"],
+              ["request", "原始日志视图"]
+            ] as Array<[PanelType, string]>).map(([key, label]) => (
+              <button
+                type="button"
+                key={key}
+                className={`chat-debug-tab ${activePanel === key ? "active" : ""}`}
+                onClick={() => setActivePanel(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <Space size={8} wrap>
+            <Tag color="purple">思考 {eventStats.thought}</Tag>
+            <Tag color="gold">工具 {eventStats.tool}</Tag>
+            <Tag color="blue">流式 {eventStats.stream}</Tag>
+            <Typography.Text type="secondary">所有会话已自动缓存到 Postgres，刷新后可恢复。</Typography.Text>
+          </Space>
+        </div>
+      </div>
 
       <div className="chat-debug-main">
         <aside className="chat-debug-sidebar">
@@ -963,12 +980,9 @@ export function ChatDebugPage() {
               <div className="chat-debug-sidebar-title">会话历史</div>
               <div className="chat-debug-sidebar-subtitle">最近 / 收藏 / 异常</div>
             </div>
-            <Button type="primary" style={{ background: "#102a56" }} onClick={createNewSession}>
-              新对话
-            </Button>
           </div>
 
-          <div style={{ padding: "12px 12px 0" }}>
+          <div className="chat-debug-sidebar-search">
             <Input.Search
               placeholder="搜索标题 / session_id / user_id"
               allowClear
@@ -985,7 +999,10 @@ export function ChatDebugPage() {
                 onClick={() => setActiveSessionId(session.id)}
               >
                 <div className="chat-debug-session-card-header">
-                  <div className="chat-debug-session-title">{session.title}</div>
+                  <div className="chat-debug-session-title-wrap">
+                    <div className="chat-debug-session-title">{session.title}</div>
+                    <div className="chat-debug-session-model">{session.meta.model}</div>
+                  </div>
                   <button
                     type="button"
                     className="chat-debug-session-delete"
@@ -999,49 +1016,36 @@ export function ChatDebugPage() {
                 </div>
                 <div className="chat-debug-session-meta">
                   <div>{renderStatus(session.status)}</div>
-                  <div>{session.meta.model}</div>
-                  <div>{session.createdAt}</div>
-                  <div>消息 {session.userMessages.length + session.assistantMessages.length} · 工具 {session.assistantMessages.reduce((sum, item) => sum + item.tools.length, 0)}</div>
+                  <div className="chat-debug-session-meta-right">
+                    <span>{session.createdAt}</span>
+                    <span>
+                      消息 {session.userMessages.length + session.assistantMessages.length} / 工具{" "}
+                      {session.assistantMessages.reduce((sum, item) => sum + item.tools.length, 0)}
+                    </span>
+                  </div>
                 </div>
               </div>
             ))}
-          </div>
-
-          <div className="chat-debug-sidebar-footer">
-            <Collapse
-              size="small"
-              items={[
-                {
-                  key: "advanced",
-                  label: "高级参数",
-                  children: (
-                    <Form form={advancedForm} layout="vertical">
-                      <Form.Item label="session_id" name="session_id">
-                        <Input />
-                      </Form.Item>
-                      <Form.Item label="user_id" name="user_id">
-                        <Input />
-                      </Form.Item>
-                      <Form.Item label="source_channel" name="source_channel">
-                        <Input />
-                      </Form.Item>
-                      <Form.Item label="agent_profile" name="agent_profile">
-                        <Select allowClear options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} />
-                      </Form.Item>
-                    </Form>
-                  )
-                }
-              ]}
-            />
           </div>
         </aside>
 
         <section className="chat-debug-content">
           <div className="chat-debug-content-header">
-            <div className="chat-debug-content-title">{activeSession.title}</div>
-            <div className="chat-debug-content-subtitle">
-              {activeSession.status === "running" ? "运行中" : "已结束"} | {activeSession.meta.model} | profile={activeSession.meta.agent_profile} | {activeSession.createdAt} | session={activeSession.meta.session_id}
+            <div>
+              <div className="chat-debug-content-title">{activeSession.title}</div>
+              <div className="chat-debug-content-subtitle">
+                {activeSession.status === "running" ? "运行中" : "已结束"} | {activeSession.meta.model} | profile={activeSession.meta.agent_profile} |{" "}
+                {activeSession.createdAt} | session={activeSession.meta.session_id}
+              </div>
             </div>
+            <Space size={8}>
+              <Button className="chat-debug-secondary-button" onClick={() => navigate(`/sessions/${encodeURIComponent(activeSession.meta.session_id)}`)}>
+                会话中心
+              </Button>
+              <Button className="chat-debug-secondary-button" onClick={() => navigate(`/logs?session_id=${encodeURIComponent(activeSession.meta.session_id)}`)}>
+                请求日志
+              </Button>
+            </Space>
           </div>
 
           {activePanel === "chat" ? (
@@ -1175,18 +1179,57 @@ export function ChatDebugPage() {
           )}
 
           <div className="chat-debug-input-bar">
-            <Form form={form} layout="vertical" onFinish={sendMessage} initialValues={activeSession.meta}>
-              <div className="chat-debug-input-row" style={{ marginBottom: 12 }}>
-                <div className="chat-debug-input-placeholder" />
-                <Form.Item label="模型" name="model" style={{ minWidth: 320, marginBottom: 0 }}>
-                  <Select options={ARK_MODEL_OPTIONS} />
-                </Form.Item>
+            <Form form={form} layout="vertical" onFinish={sendMessage} initialValues={activeSession.meta} className="chat-debug-input-form">
+              <div className="chat-debug-input-config">
+                <div className="chat-debug-input-config-left">
+                  <Form.Item label="模型" name="model" className="chat-debug-model-item">
+                    <Select options={ARK_MODEL_OPTIONS} getPopupContainer={getSelectPopupContainer} />
+                  </Form.Item>
+                  <Form.Item label="深度思考" name="thinkingMode" className="chat-debug-model-item">
+                    <Select
+                      placement="topLeft"
+                      listHeight={96}
+                      getPopupContainer={getSelectPopupContainer}
+                      options={[
+                        { label: "强制开启", value: "enabled" },
+                        { label: "强制关闭", value: "disabled" },
+                        { label: "自动判断", value: "auto", disabled: !supportsAutoThinking }
+                      ]}
+                    />
+                  </Form.Item>
+                </div>
+
+                <div className="chat-debug-input-config-right">
+                  <Upload {...uploadProps} showUploadList={false}>
+                    <Button className="chat-debug-secondary-button chat-debug-config-action">上传附件</Button>
+                  </Upload>
+                  <Button className="chat-debug-secondary-button chat-debug-config-action" onClick={() => setAdvancedOpen(true)}>
+                    高级参数
+                  </Button>
+                  {attachmentFiles[0] ? (
+                    <Typography.Text type="secondary" className="chat-debug-attachment-name">
+                      {attachmentFiles[0].name}
+                    </Typography.Text>
+                  ) : (
+                    <span className="chat-debug-attachment-placeholder" />
+                  )}
+                </div>
               </div>
 
-              <div className="chat-debug-input-row">
+              <div className="chat-debug-input-hints">
+                {!supportsAutoThinking ? <Typography.Text type="secondary">当前模型不支持自动判断</Typography.Text> : <span />}
+                <Space size={12} wrap>
+                  <Tooltip title="上传依赖环境变量：OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME / OSS_ENDPOINT">
+                    <Typography.Text style={{ color: "#2563eb", cursor: "help" }}>OSS配置提示</Typography.Text>
+                  </Tooltip>
+                  <Typography.Text type="secondary">{panelTitleMap[activePanel]} 面板</Typography.Text>
+                </Space>
+              </div>
+
+              <div className="chat-debug-input-main">
                 <div className="chat-debug-input-box">
                   <Form.Item name="text" style={{ marginBottom: 0 }}>
-                    <Input.TextArea rows={5} placeholder="输入消息..." />
+                    <Input.TextArea rows={4} placeholder="输入消息..." />
                   </Form.Item>
                   <div className="chat-debug-hint-row">
                     <div>Ctrl + Enter 发送</div>
@@ -1195,73 +1238,76 @@ export function ChatDebugPage() {
                 </div>
 
                 <div className="chat-debug-input-actions">
-                  <Upload {...uploadProps} showUploadList={false}>
-                    <Button style={{ width: "100%" }}>上传附件</Button>
-                  </Upload>
-                  {attachmentFiles[0] ? (
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      {attachmentFiles[0].name}
-                    </Typography.Text>
-                  ) : null}
-                  <Button type="primary" htmlType="submit" style={{ background: "#102a56" }} loading={sending}>
+                  <Button type="primary" htmlType="submit" className="chat-debug-primary-button chat-debug-side-action" loading={sending}>
                     发送
                   </Button>
-                  <Button danger onClick={stopStream} disabled={!sending}>
+                  <Button className="chat-debug-stop-button chat-debug-side-action" onClick={stopStream} disabled={!sending}>
                     停止
                   </Button>
                 </div>
-              </div>
-
-              <div className="chat-debug-hint-row">
-                <Space>
-                  <Form.Item label="深度思考" name="thinkingMode" style={{ marginBottom: 0 }}>
-                    <Select
-                      style={{ width: 140 }}
-                      options={[
-                        { label: "强制开启", value: "enabled" },
-                        { label: "强制关闭", value: "disabled" },
-                        { label: "自动判断", value: "auto", disabled: !supportsAutoThinking }
-                      ]}
-                    />
-                  </Form.Item>
-                  {!supportsAutoThinking ? <Typography.Text type="secondary">当前模型不支持自动判断</Typography.Text> : null}
-                  <Tooltip title="上传依赖环境变量：OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME / OSS_ENDPOINT">
-                    <Typography.Text style={{ color: "#2563eb", cursor: "help" }}>OSS配置提示</Typography.Text>
-                  </Tooltip>
-                </Space>
-                <span>{panelTitleMap[activePanel]} 面板</span>
               </div>
             </Form>
           </div>
         </section>
 
         <aside className="chat-debug-inspector">
-          <Card title="调试详情" bordered={false} style={{ marginBottom: 12 }}>
-            <Space direction="vertical" size={10} style={{ width: "100%" }}>
-              <div><Typography.Text type="secondary">当前状态</Typography.Text><div><StatusTag status={activeSession.status} /></div></div>
-              <div><Typography.Text type="secondary">Prompt / Context</Typography.Text><div>{activeSession.meta.session_id}</div></div>
-              <div><Typography.Text type="secondary">Token / Latency / Tool Stats</Typography.Text><div>请求数 {activeSession.debugEvents.length} · 工具 {eventStats.tool}</div></div>
-              <div><Typography.Text type="secondary">错误与重试</Typography.Text><div>{activeSession.debugEvents.filter((item) => item.type === "raw").length} 条原始事件</div></div>
-            </Space>
-          </Card>
+          <div className="chat-debug-inspector-body">
+            <Card title="调试详情" bordered={false} className="chat-debug-inspector-card">
+              <Space direction="vertical" size={10} style={{ width: "100%" }}>
+                <div><Typography.Text type="secondary">当前状态</Typography.Text><div><StatusTag status={activeSession.status} /></div></div>
+                <div><Typography.Text type="secondary">Prompt / Context</Typography.Text><div>{activeSession.meta.session_id}</div></div>
+                <div><Typography.Text type="secondary">Token / Latency / Tool Stats</Typography.Text><div>请求数 {activeSession.debugEvents.length} · 工具 {eventStats.tool}</div></div>
+                <div><Typography.Text type="secondary">错误与重试</Typography.Text><div>{activeSession.debugEvents.filter((item) => item.type === "raw").length} 条原始事件</div></div>
+              </Space>
+            </Card>
 
-          <Card title="当前请求参数" bordered={false} style={{ marginBottom: 12 }}>
-            <JsonViewer value={activeSession.lastRequest || {}} maxHeight={220} />
-          </Card>
+            <Card title="当前请求参数" bordered={false} className="chat-debug-inspector-card">
+              <JsonViewer value={activeSession.lastRequest || {}} maxHeight={220} />
+            </Card>
 
-          <Card title="最近响应" bordered={false} style={{ marginBottom: 12 }}>
-            <JsonViewer value={activeSession.lastResponse || {}} maxHeight={220} />
-          </Card>
+            <Card title="最近响应" bordered={false} className="chat-debug-inspector-card">
+              <JsonViewer value={activeSession.lastResponse || {}} maxHeight={220} />
+            </Card>
+          </div>
 
-          <Card title="关联入口" bordered={false}>
-            <Space direction="vertical" style={{ width: "100%" }}>
-              <Button block onClick={() => navigate(`/sessions/${encodeURIComponent(activeSession.meta.session_id)}`)}>打开会话中心</Button>
-              <Button block onClick={() => navigate(`/logs?session_id=${encodeURIComponent(activeSession.meta.session_id)}`)}>打开请求日志</Button>
-              <Button block onClick={() => setActivePanel("backend")}>切换 Trace 视图</Button>
-            </Space>
-          </Card>
+          <div className="chat-debug-inspector-footer">
+            <Card title="关联入口" bordered={false} className="chat-debug-inspector-card">
+              <Space direction="vertical" style={{ width: "100%" }} size={8}>
+                <Button block className="chat-debug-secondary-button" onClick={() => navigate(`/sessions/${encodeURIComponent(activeSession.meta.session_id)}`)}>打开会话中心</Button>
+                <Button block className="chat-debug-secondary-button" onClick={() => navigate(`/logs?session_id=${encodeURIComponent(activeSession.meta.session_id)}`)}>打开请求日志</Button>
+                <Button block className="chat-debug-secondary-button" onClick={() => setActivePanel("backend")}>切换 Trace 视图</Button>
+              </Space>
+            </Card>
+          </div>
         </aside>
       </div>
+
+      <Modal
+        title="高级参数"
+        open={advancedOpen}
+        onCancel={() => setAdvancedOpen(false)}
+        footer={[
+          <Button key="close" className="chat-debug-secondary-button" onClick={() => setAdvancedOpen(false)}>
+            完成
+          </Button>
+        ]}
+        width={560}
+      >
+        <Form form={advancedForm} layout="vertical" className="chat-debug-advanced-form">
+          <Form.Item label="session_id" name="session_id">
+            <Input />
+          </Form.Item>
+          <Form.Item label="user_id" name="user_id">
+            <Input />
+          </Form.Item>
+          <Form.Item label="source_channel" name="source_channel">
+            <Input />
+          </Form.Item>
+          <Form.Item label="agent_profile" name="agent_profile">
+            <Select allowClear getPopupContainer={getSelectPopupContainer} options={[{ value: "customer_support", label: "customer_support" }, { value: "employee_assistant", label: "employee_assistant" }]} />
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   );
 }

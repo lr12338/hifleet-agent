@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Button, Card, Col, List, Progress, Row, Space, Statistic, Tag, Typography } from "antd";
 import { useNavigate } from "react-router-dom";
 
-import { fetchDashboardSummary } from "../api/client";
+import { fetchDashboardSummary, fetchHealth } from "../api/client";
 import { ContextBar } from "../components/page/ContextBar";
 import { PageHeader } from "../components/page/PageHeader";
 import { EmptyState } from "../components/state/EmptyState";
@@ -37,16 +37,22 @@ export function DashboardPage() {
   const navigate = useNavigate();
   const { timeRange, customRange, environmentLabel } = useAdminShell();
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
+  const [serviceHealth, setServiceHealth] = useState("unknown");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const load = async () => {
     setLoading(true);
     setError("");
+    setServiceHealth("unknown");
     try {
       const params = new URLSearchParams(buildTimeRangeQuery(timeRange, customRange) as Record<string, string>);
-      const response = await fetchDashboardSummary(params);
-      setSummary(response);
+      const [summaryResult, healthResult] = await Promise.allSettled([fetchDashboardSummary(params), fetchHealth()]);
+      if (summaryResult.status !== "fulfilled") {
+        throw summaryResult.reason;
+      }
+      setSummary(summaryResult.value);
+      setServiceHealth(healthResult.status === "fulfilled" ? healthResult.value.status : "unknown");
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载总览失败");
     } finally {
@@ -59,6 +65,18 @@ export function DashboardPage() {
   }, [timeRange, customRange]);
 
   const trendData = useMemo(() => summary?.trends || [], [summary]);
+  const requestHealth = useMemo(() => {
+    if (!summary?.kpis.request_count) return "unknown";
+    if (summary.kpis.success_rate >= 95) return "healthy";
+    if (summary.kpis.success_rate >= 80) return "degraded";
+    return "unhealthy";
+  }, [summary]);
+  const latencyHealth = useMemo(() => {
+    if (!summary?.kpis.request_count) return "unknown";
+    if (summary.kpis.avg_latency_ms <= 3000) return "healthy";
+    if (summary.kpis.avg_latency_ms <= 10000) return "degraded";
+    return "unhealthy";
+  }, [summary]);
 
   return (
     <>
@@ -191,19 +209,19 @@ export function DashboardPage() {
               </Card>
             </Col>
             <Col xs={24} xl={6}>
-              <Card bordered={false} title="系统健康">
+              <Card bordered={false} title="服务与观测状态">
                 <List
                   dataSource={[
-                    { label: "服务状态", value: summary.health.service },
-                    { label: "模型状态", value: summary.health.model },
-                    { label: "依赖状态", value: summary.health.dependencies },
-                    { label: "最近版本", value: summary.health.version }
+                    { label: "服务探活", value: serviceHealth },
+                    { label: "请求健康", value: requestHealth },
+                    { label: "延迟状态", value: latencyHealth },
+                    { label: "最近版本", value: summary.health.version, plainText: true }
                   ]}
                   renderItem={(item) => (
                     <List.Item>
                       <Space style={{ width: "100%", justifyContent: "space-between" }}>
                         <Typography.Text>{item.label}</Typography.Text>
-                        <StatusTag status={item.value} />
+                        {item.plainText ? <Typography.Text code>{item.value}</Typography.Text> : <StatusTag status={item.value} />}
                       </Space>
                     </List.Item>
                   )}

@@ -437,7 +437,9 @@ def query_dashboard_summary(filters: LogListFilters) -> dict[str, Any]:
         )
         SELECT
             COUNT(*) AS request_count,
-            COUNT(*) FILTER (WHERE status <> 'error') AS success_count,
+            COUNT(*) FILTER (
+                WHERE status NOT IN ('error', 'timeout', 'cancelled', 'bad_request', 'bad_json')
+            ) AS success_count,
             COUNT(*) FILTER (WHERE status = 'error') AS error_count,
             ROUND(COALESCE(AVG(latency_ms), 0))::int AS avg_latency_ms,
             COALESCE((SELECT session_count FROM session_stats), 0) AS session_count,
