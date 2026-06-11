@@ -1,14 +1,13 @@
 import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 import { AppstoreOutlined, BugOutlined, DashboardOutlined, DatabaseOutlined, ExperimentOutlined, MenuFoldOutlined, MenuUnfoldOutlined, SettingOutlined } from "@ant-design/icons";
-import { Button, DatePicker, Dropdown, Input, Layout, Menu, Space, Tag, Typography } from "antd";
-import dayjs from "dayjs";
+import { Button, Dropdown, Grid, Layout, Menu, Space, Tag, Typography } from "antd";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { clearAdminApiKey, disableSkipLogin } from "../auth/adminAuth";
 import { DetailDrawer } from "../components/drawer/DetailDrawer";
 
 const { Header, Sider, Content } = Layout;
-const { RangePicker } = DatePicker;
+const { useBreakpoint } = Grid;
 
 export type TimeRangePreset = "1h" | "24h" | "7d" | "30d";
 
@@ -70,6 +69,8 @@ export function AdminShell() {
     subtitle: "",
     width: 640
   });
+  const screens = useBreakpoint();
+  const effectiveCollapsed = screens.lg ? collapsed : true;
 
   const contextValue = useMemo<AdminShellContextValue>(
     () => ({
@@ -93,21 +94,21 @@ export function AdminShell() {
 
   return (
     <AdminShellContext.Provider value={contextValue}>
-      <Layout style={{ minHeight: "100vh", background: "#f5f7fb" }}>
+      <Layout className="admin-shell-layout">
         <Sider
           collapsible
           trigger={null}
-          collapsed={collapsed}
+          collapsed={effectiveCollapsed}
           theme="light"
           width={240}
-          style={{ borderRight: "1px solid #e5e7eb", background: "#fff" }}
+          className="admin-shell-sider"
         >
-          <div style={{ height: 64, display: "flex", alignItems: "center", padding: collapsed ? "0 16px" : "0 20px", borderBottom: "1px solid #eef2f7" }}>
+          <div className="admin-shell-logo" style={{ padding: effectiveCollapsed ? "0 16px" : undefined }}>
             <Space direction="vertical" size={0}>
               <Typography.Text strong style={{ fontSize: 16 }}>
-                {collapsed ? "AI" : "Agent Ops Console"}
+                {effectiveCollapsed ? "AI" : "Agent Ops Console"}
               </Typography.Text>
-              {!collapsed ? (
+              {!effectiveCollapsed ? (
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                   商业化运营后台
                 </Typography.Text>
@@ -129,43 +130,19 @@ export function AdminShell() {
           />
         </Sider>
         <Layout>
-          <Header style={{ background: "#fff", borderBottom: "1px solid #e5e7eb", padding: "0 20px" }}>
-            <Space style={{ width: "100%", justifyContent: "space-between" }}>
-              <Space size={16}>
+          <Header className="admin-shell-header">
+            <div className="admin-shell-header-inner">
+              <div className="admin-shell-brand">
                 <Button
                   type="text"
-                  icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                  icon={effectiveCollapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
                   onClick={() => setCollapsed((prev) => !prev)}
                 />
                 <Typography.Text strong>HiFleet Agent 管理平台</Typography.Text>
                 <Tag color="blue">{contextValue.environmentLabel}</Tag>
                 <Tag>默认租户</Tag>
-              </Space>
-              <Space size={12}>
-                <Button.Group>
-                  {(["1h", "24h", "7d", "30d"] as TimeRangePreset[]).map((item) => (
-                    <Button key={item} type={timeRange === item ? "primary" : "default"} onClick={() => setTimeRange(item)}>
-                      {item}
-                    </Button>
-                  ))}
-                </Button.Group>
-                <RangePicker
-                  size="small"
-                  onChange={(values) => {
-                    if (!values?.[0] || !values?.[1]) {
-                      setCustomRange(null);
-                      return;
-                    }
-                    setCustomRange([values[0].toISOString(), values[1].toISOString()]);
-                  }}
-                  showTime
-                  value={
-                    customRange
-                      ? [dayjs(customRange[0]), dayjs(customRange[1])]
-                      : null
-                  }
-                />
-                <Input.Search placeholder="全局搜索 session / run_id" style={{ width: 240 }} />
+              </div>
+              <div className="admin-shell-controls">
                 <Dropdown
                   menu={{
                     items: [{ key: "logout", label: "退出登录", onClick: logout }]
@@ -173,10 +150,10 @@ export function AdminShell() {
                 >
                   <Button>用户菜单</Button>
                 </Dropdown>
-              </Space>
-            </Space>
+              </div>
+            </div>
           </Header>
-          <Content style={{ padding: 20 }}>
+          <Content className="admin-shell-content">
             <Outlet />
           </Content>
         </Layout>

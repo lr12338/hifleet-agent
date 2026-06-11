@@ -7,7 +7,7 @@ interface ContextBarProps {
 
 export function ContextBar({ children }: ContextBarProps) {
   return (
-    <Card size="small" style={{ marginBottom: 16, borderRadius: 12 }}>
+    <Card size="small" className="admin-context-bar">
       <Space wrap size={[12, 12]} style={{ width: "100%" }}>
         {children}
       </Space>

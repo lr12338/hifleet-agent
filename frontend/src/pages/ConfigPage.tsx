@@ -14,14 +14,14 @@ export function ConfigPage() {
         <Typography.Text type="secondary">当前版本先提供骨架入口，后续可扩展告警规则、分享权限、筛选视图与模板配置。</Typography.Text>
       </ContextBar>
       <Row gutter={[16, 16]}>
-        <Col span={12}>
+        <Col xs={24} md={12}>
           <Card title="环境配置" bordered={false}>
-            <Typography.Text type="secondary">支持展示环境标识、默认租户、Agent 基础参数与版本信息。</Typography.Text>
+            <Typography.Text type="secondary" className="admin-text-break">支持展示环境标识、默认租户、Agent 基础参数与版本信息。</Typography.Text>
           </Card>
         </Col>
-        <Col span={12}>
+        <Col xs={24} md={12}>
           <Card title="平台配置" bordered={false}>
-            <Typography.Text type="secondary">后续可扩展导出策略、分享权限、告警接收人和默认筛选视图。</Typography.Text>
+            <Typography.Text type="secondary" className="admin-text-break">后续可扩展导出策略、分享权限、告警接收人和默认筛选视图。</Typography.Text>
           </Card>
         </Col>
       </Row>
