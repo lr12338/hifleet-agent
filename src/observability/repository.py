@@ -257,16 +257,25 @@ def query_log_detail(run_id: str) -> dict[str, Any]:
             }
         )
     for tool in tools:
+        attempt = int(tool.get("attempt") or 0)
+        phase = ((tool.get("layer_trace") or {}).get("phase") if isinstance(tool.get("layer_trace"), dict) else None)
+        label_parts = [tool.get("tool_name") or "tool"]
+        if phase:
+            label_parts.append(str(phase))
+        if attempt:
+            label_parts.append(f"attempt {attempt}")
         trace.append(
             {
                 "type": "tool",
                 "created_at": tool.get("created_at"),
-                "label": tool.get("tool_name"),
+                "label": " · ".join(label_parts),
                 "payload": {
                     "request": tool.get("tool_args") or {},
                     "response": tool.get("tool_result") or {},
                     "status": tool.get("status"),
                     "message": tool.get("message"),
+                    "attempt": attempt,
+                    "layer_trace": tool.get("layer_trace") or {},
                 },
             }
         )

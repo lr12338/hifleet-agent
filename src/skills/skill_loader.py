@@ -112,7 +112,7 @@ class SkillLoader:
                 "update_ship_static_info",
             ],
             "knowledge_qa": ["smart_search"],
-            "employee_workspace": ["inspect_tabular_file", "run_sandboxed_python"],
+            "employee_workspace": ["download_public_file_to_artifact", "inspect_tabular_file", "run_sandboxed_python"],
         }
 
         if skill_name not in TOOL_MAP:

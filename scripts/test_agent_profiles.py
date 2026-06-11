@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from typing import Any
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
@@ -12,7 +13,7 @@ if SRC not in sys.path:
 from agents.profiles import get_profile, resolve_profile_id, set_current_agent_profile
 from coze_coding_utils.log.write_log import request_context
 from coze_coding_utils.runtime_ctx.context import new_context
-from skills.employee_workspace.tools import run_sandboxed_python
+from skills.employee_workspace import tools as employee_workspace_tools
 from skills.skill_loader import SkillLoader
 
 
@@ -43,12 +44,30 @@ def main() -> int:
 
     request_context.set(new_context(method="test_agent_profiles"))
     set_current_agent_profile("customer_support")
-    blocked = run_sandboxed_python.invoke({"code": "print(1 + 1)"})
+    blocked = employee_workspace_tools.run_sandboxed_python.invoke({"code": "print(1 + 1)"})
     assert "only available in employee_assistant" in blocked
 
     set_current_agent_profile("employee_assistant")
-    allowed = json.loads(run_sandboxed_python.invoke({"code": "print(1 + 1)"}))
-    assert allowed["returncode"] == 0
+    original_run_in_docker = employee_workspace_tools._run_in_docker
+
+    def fake_run_in_docker(_job_dir: Any, input_file_name: str = "") -> dict[str, Any]:
+        assert input_file_name == ""
+        return {
+            "exit_code": 0,
+            "stdout": "2\n",
+            "stderr": "",
+            "container_id": "test-container",
+            "image": "python:3.11-slim",
+            "elapsed_ms": 1,
+        }
+
+    employee_workspace_tools._run_in_docker = fake_run_in_docker
+    try:
+        allowed = json.loads(employee_workspace_tools.run_sandboxed_python.invoke({"code": "print(1 + 1)"}))
+    finally:
+        employee_workspace_tools._run_in_docker = original_run_in_docker
+
+    assert allowed["exit_code"] == 0
     assert allowed["stdout"].strip() == "2"
 
     print("agent profile smoke tests passed")

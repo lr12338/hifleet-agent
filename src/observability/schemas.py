@@ -22,6 +22,7 @@ class ApiCallCreate(BaseModel):
 
 class ToolInvocationCreate(BaseModel):
     run_id: str
+    session_id: str | None = None
     tool_name: str
     tool_args: dict[str, Any] | None = None
     tool_result: dict[str, Any] | None = None
@@ -29,6 +30,7 @@ class ToolInvocationCreate(BaseModel):
     code: str | None = None
     message: str | None = None
     retriable: bool = False
+    attempt: int = 0
     latency_ms: int = 0
     source: str | None = None
     layer_trace: dict[str, Any] | None = None
@@ -36,12 +38,14 @@ class ToolInvocationCreate(BaseModel):
 
 class AgentErrorCreate(BaseModel):
     run_id: str
+    session_id: str | None = None
     route: str | None = None
     error_code: str
     error_message: str | None = None
     stack_trace: str | None = None
     error_category: str | None = None
     node_name: str | None = None
+    attempt: int = 0
 
 
 class LogListFilters(BaseModel):

@@ -1,34 +1,17 @@
-"""
-Hifleet智能客服主Agent — Skills + 动态工具加载架构
-
-架构设计：
-- 路由Agent（本文件）：薄调度器，只负责意图识别和工具路由
-- Skills（src/skills/）：领域知识+工具的封装单元
-  - hifleet_ship_service: 船舶查询/更新/PSC
-  - knowledge_qa: 知识库检索+增强搜索+深度搜索
-- System Prompt: Base Prompt + 各Skill的SKILL.md动态拼接
-
-设计原则：
-1. 路由Agent是调度器，不承载业务逻辑
-2. 每个Skill是独立的能力单元，包含SKILL.md（知识）+ tools.py（工具）
-3. Prompt按需组装，避免22KB全量加载
-4. 工具按Skill注册，LLM只需4个工具中选择
-5. 写操作直接执行，无需确认
-6. 失败不得伪造成功
-"""
-import os
+"""Main agent assembly with employee_assistant execution loop."""
 import json
 import logging
+import os
 import re
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, Any, Literal, TypedDict
+
 from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from langgraph.graph import MessagesState
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
-from coze_coding_utils.runtime_ctx.context import default_headers
-from storage.memory.memory_saver import get_memory_saver
-from skills import SkillLoader
+
 from agents.profiles import (
     AgentProfile,
     PROFILE_HEADER,
@@ -36,46 +19,37 @@ from agents.profiles import (
     get_profile,
     read_profile_prompt,
 )
+from coze_coding_utils.runtime_ctx.context import default_headers
+from skills import SkillLoader
+from storage.memory.memory_saver import get_memory_saver
 
-# 配置文件路径
 LLM_CONFIG = "config/agent_llm_config.json"
 SYSTEM_PROMPT_BASE = "config/system_prompt_base.md"
-
-# 默认保留最近20轮对话（40条消息）
 MAX_MESSAGES = 40
 DEFAULT_SKILLS = {"hifleet_ship_service", "knowledge_qa"}
+EMPLOYEE_MAX_LOOPS = int(os.getenv("HIFLEET_EMPLOYEE_MAX_LOOPS", "4"))
+TABULAR_SUFFIXES = (".csv", ".xls", ".xlsx")
 
 logger = logging.getLogger(__name__)
 
 
 def _windowed_messages(old, new):
-    """
-    滑动窗口：只保留最近MAX_MESSAGES条消息
-    
-    去重策略：当AI消息同时包含content和tool_calls时，清除content。
-    原因：模型在调用工具时会生成一段文本(content)，工具执行完毕后
-    模型会再次生成相同或相似的文本，导致消息历史中出现重复回复。
-    清除带tool_calls消息的content，确保最终回复只在工具执行后出现一次。
-    """
     merged = add_messages(old, new)
-    
-    # 去重：AI消息同时有content和tool_calls时，清除content防止重复
     cleaned = []
     for msg in merged:
-        if isinstance(msg, AIMessage) and getattr(msg, 'tool_calls', None) and msg.content and isinstance(msg.content, str) and msg.content.strip():
-            cleaned.append(AIMessage(
-                content="",
-                tool_calls=msg.tool_calls,
-                id=msg.id,
-                name=msg.name if hasattr(msg, 'name') else None,
-                additional_kwargs=msg.additional_kwargs,
-            ))
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None) and msg.content and isinstance(msg.content, str) and msg.content.strip():
+            cleaned.append(
+                AIMessage(
+                    content="",
+                    tool_calls=msg.tool_calls,
+                    id=msg.id,
+                    name=msg.name if hasattr(msg, "name") else None,
+                    additional_kwargs=msg.additional_kwargs,
+                )
+            )
         else:
             cleaned.append(msg)
 
-    # 多模态历史清洗：
-    # - 仅保留“最近一条用户消息”的原始多模态内容
-    # - 其余历史用户消息中，移除 input_audio/image_url/video_url，避免过期URL导致后续纯文本轮次失败
     latest_user_idx = -1
     for i in range(len(cleaned) - 1, -1, -1):
         if isinstance(cleaned[i], HumanMessage):
@@ -114,12 +88,31 @@ def _windowed_messages(old, new):
         else:
             sanitized.append(msg)
 
-    return sanitized[-MAX_MESSAGES:]  # type: ignore
+    return sanitized[-MAX_MESSAGES:]
 
 
-class AgentState(MessagesState):
-    """Agent状态，包含消息历史和滑动窗口"""
+class AgentState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], _windowed_messages]
+
+
+class EmployeeAgentState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], _windowed_messages]
+    session_id: str
+    user_id: str
+    source_channel: str
+    agent_profile: str
+    intent_hint: str
+    status: str
+    loop_count: int
+    phase: Literal["route", "download", "plan", "act", "check", "loop", "done", "failed"]
+    task_goal: str
+    target_file_path: str
+    source_file_url: str
+    expected_artifact: str
+    file_schema: dict[str, Any]
+    generated_code: str
+    sandbox_result: dict[str, Any]
+    last_error: dict[str, Any]
 
 
 def _resolve_intent_hint(ctx=None, explicit_intent: str = "") -> str:
@@ -167,9 +160,8 @@ def classify_intent_fast(user_text: str, has_media: bool = False) -> str:
 
 
 def _build_system_prompt(workspace_path: str, profile: AgentProfile, intent_hint: str = "") -> str:
-    """Build system prompt from base prompt, active profile prompt, and allowed skill docs."""
     base_path = os.path.join(workspace_path, SYSTEM_PROMPT_BASE)
-    with open(base_path, 'r', encoding='utf-8') as f:
+    with open(base_path, "r", encoding="utf-8") as f:
         parts = [f.read()]
 
     profile_prompt = read_profile_prompt(profile)
@@ -185,7 +177,7 @@ def _build_system_prompt(workspace_path: str, profile: AgentProfile, intent_hint
             skill_path = os.path.join(skills_dir, skill_name)
             skill_md = os.path.join(skill_path, "SKILL.md")
             if os.path.isdir(skill_path) and os.path.exists(skill_md):
-                with open(skill_md, 'r', encoding='utf-8') as f:
+                with open(skill_md, "r", encoding="utf-8") as f:
                     skill_doc = f.read()
                 parts.append(f"\n\n---\n\n# Skill: {skill_name}\n\n{skill_doc}")
                 logger.info(f"[MainAgent] Loaded skill prompt: {skill_name} ({len(skill_doc)} chars)")
@@ -197,85 +189,316 @@ def _build_system_prompt(workspace_path: str, profile: AgentProfile, intent_hint
     )
     return full_prompt
 
+
 def _load_all_tools(profile: AgentProfile) -> list:
-    """Load tools allowed by the active profile."""
     all_tools = SkillLoader.get_tools_by_skill_names(list(profile.skills or DEFAULT_SKILLS))
     disabled = set(profile.disabled_tools or [])
     if disabled:
         all_tools = [tool for tool in all_tools if tool.name not in disabled]
-    logger.info(
-        f"[MainAgent] Tools for profile={profile.profile_id}: "
-        f"{[t.name for t in all_tools]}"
-    )
+    logger.info(f"[MainAgent] Tools for profile={profile.profile_id}: {[t.name for t in all_tools]}")
     return all_tools
 
-def build_agent(ctx=None, intent: str = ""):
-    """
-    构建并返回Hifleet智能客服主Agent
-    
-    架构说明：
-    - Skills动态加载：工具和Prompt从Skill目录自动加载
-    - Base Prompt + Skill SKILL.md：按需拼接，避免全量加载
-    - 工具从Skill注册：每个Skill定义自己的工具
-    
-    Args:
-        ctx: 请求上下文，用于链路追踪
-        
-    Returns:
-        Agent实例
-    """
-    logger.info("[MainAgent] Building Hifleet customer service agent (Skills architecture)...")
-    
-    # 1. 读取配置
-    workspace_path = os.getenv("COZE_WORKSPACE_PATH")
-    if not workspace_path:
-        workspace_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+
+def _load_llm_config(workspace_path: str) -> dict[str, Any]:
     config_path = os.path.join(workspace_path, LLM_CONFIG)
-    
-    with open(config_path, 'r', encoding='utf-8') as f:
-        cfg = json.load(f)
-    
-    intent_hint = _resolve_intent_hint(ctx, explicit_intent=intent)
-    profile = _resolve_agent_profile(ctx)
-    # 2. 动态组装System Prompt
-    system_prompt = _build_system_prompt(workspace_path, profile=profile, intent_hint=intent_hint)
-    
-    # 3. 初始化LLM
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
     base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
-    
-    llm = ChatOpenAI(
-        model=cfg['config'].get("model", "doubao-seed-2-0-lite-260215"),
+    return ChatOpenAI(
+        model=cfg["config"].get("model", "doubao-seed-2-0-lite-260215"),
         api_key=api_key,
         base_url=base_url,
-        temperature=cfg['config'].get('temperature', 0.7),
-        streaming=True,
-        timeout=cfg['config'].get('timeout', 600),
-        extra_body={
-            "thinking": {
-                "type": cfg['config'].get('thinking_type', 'disabled')
-            }
-        },
-        default_headers=default_headers(ctx) if ctx else {}
+        temperature=cfg["config"].get("temperature", 0.7),
+        streaming=streaming,
+        timeout=cfg["config"].get("timeout", 600),
+        extra_body={"thinking": {"type": cfg["config"].get("thinking_type", "disabled")}},
+        default_headers=default_headers(ctx) if ctx else {},
     )
-    
-    logger.info(f"[MainAgent] LLM initialized: {cfg['config'].get('model')}")
-    
-    # 4. 从Profile允许的Skills动态加载工具
+
+
+def _build_standard_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
+    logger.info("[MainAgent] Building standard agent graph")
+    system_prompt = _build_system_prompt(workspace_path, profile=profile, intent_hint=intent_hint)
+    llm = _build_llm(ctx, cfg, streaming=True)
     tools = _load_all_tools(profile)
-    
-    # 5. 创建Agent
-    agent = create_agent(
+    return create_agent(
         model=llm,
         system_prompt=system_prompt,
         tools=tools,
         checkpointer=get_memory_saver(),
         state_schema=AgentState,
     )
-    
-    logger.info(
-        f"[MainAgent] Agent built successfully (Profile architecture), "
-        f"profile={profile.profile_id}, intent_hint={intent_hint or 'none'}"
+
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = str(item.get("text", "")).strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+    return str(content or "").strip()
+
+
+def _latest_user_text(messages: list[AnyMessage]) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return _content_to_text(msg.content)
+        if isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user":
+            return _content_to_text(msg.get("content", ""))
+    return ""
+
+
+def _extract_local_file_path(text: str) -> str:
+    candidates = re.findall(r"(?:[A-Za-z]:\\[^\\s'\"]+|/[^\\s'\"]+|[\\w./-]+)", text or "")
+    for candidate in candidates:
+        normalized = candidate.strip().strip('"').strip("'")
+        lowered = normalized.lower()
+        if lowered.startswith(("http://", "https://")):
+            continue
+        if lowered.endswith(TABULAR_SUFFIXES):
+            return normalized
+    return ""
+
+
+def _extract_public_file_url(text: str) -> str:
+    candidates = re.findall(r'https?://[^\s\)\]\>\"\']+', text or "")
+    for candidate in candidates:
+        lowered = candidate.lower().rstrip('.,;')
+        if lowered.endswith(TABULAR_SUFFIXES):
+            return candidate.rstrip('.,;')
+    return ""
+
+
+def _extract_expected_artifact(text: str, source_file: str) -> str:
+    candidates = re.findall(r"[\w./-]+\.(?:xlsx|xls|csv)", text or "", flags=re.IGNORECASE)
+    source_name = Path(source_file).name if source_file else ""
+    for candidate in reversed(candidates):
+        if Path(candidate).name != source_name:
+            return candidate
+    return ""
+
+
+def _detect_workspace_task(profile: AgentProfile, messages: list[AnyMessage]) -> bool:
+    if profile.profile_id != "employee_assistant":
+        return False
+    text = _latest_user_text(messages)
+    if not text:
+        return False
+    has_tabular_input = bool(_extract_local_file_path(text) or _extract_public_file_url(text))
+    if not has_tabular_input:
+        return False
+    keywords = ["分析", "表格", "csv", "excel", "xlsx", "报价", "统计", "数据", "生成", "python", "下载", "链接"]
+    lowered = text.lower()
+    return has_tabular_input and any(keyword.lower() in lowered for keyword in keywords)
+
+
+def _extract_python_code(text: str) -> str:
+    match = re.search(r"```python\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"```\s*(.*?)```", text, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+
+def _result_summary_message(state: EmployeeAgentState) -> str:
+    result = state.get("sandbox_result") or {}
+    artifacts = result.get("artifacts") or []
+    stdout = str(result.get("stdout", "")).strip()
+    lines = ["已完成受控数据任务。"]
+    if artifacts:
+        lines.append("产物：" + ", ".join(str(item) for item in artifacts[:5]))
+    if stdout:
+        lines.append("执行日志：\n" + stdout[-2000:])
+    return "\n\n".join(lines)
+
+
+def _failure_summary_message(state: EmployeeAgentState) -> str:
+    last_error = state.get("last_error") or {}
+    stderr = str(last_error.get("stderr", "")).strip()
+    artifact_check = last_error.get("artifact_check") or {}
+    lines = [f"自动修复已达到上限（{state.get('loop_count', 0)}/{EMPLOYEE_MAX_LOOPS}），任务未完成。"]
+    if stderr:
+        lines.append("最后一次错误：\n" + stderr[-2000:])
+    elif artifact_check and not artifact_check.get("ok", True):
+        lines.append("产物校验失败：" + json.dumps(artifact_check, ensure_ascii=False))
+    return "\n\n".join(lines)
+
+
+def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
+    standard_agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+    codegen_llm = _build_llm(ctx, cfg, streaming=False)
+
+    from skills.employee_workspace.tools import (
+        download_public_file_to_artifact,
+        inspect_tabular_file,
+        run_sandboxed_python,
     )
-    
+
+    async def route_node(state: EmployeeAgentState) -> dict[str, Any]:
+        user_text = _latest_user_text(state.get("messages", []))
+        target_file_path = _extract_local_file_path(user_text)
+        source_file_url = _extract_public_file_url(user_text)
+        expected_artifact = _extract_expected_artifact(user_text, target_file_path or source_file_url)
+        return {
+            "phase": "route",
+            "task_goal": user_text,
+            "target_file_path": target_file_path,
+            "source_file_url": source_file_url,
+            "expected_artifact": expected_artifact,
+            "loop_count": int(state.get("loop_count") or 0),
+        }
+
+    async def delegate_node(state: EmployeeAgentState) -> dict[str, Any]:
+        payload = {
+            "messages": state.get("messages", []),
+            "session_id": state.get("session_id", ""),
+            "user_id": state.get("user_id", ""),
+            "source_channel": state.get("source_channel", ""),
+            "agent_profile": state.get("agent_profile", profile.profile_id),
+            "intent_hint": state.get("intent_hint", intent_hint),
+        }
+        return await standard_agent.ainvoke(payload, context=ctx)
+
+    async def plan_node(state: EmployeeAgentState) -> dict[str, Any]:
+        target_file_path = state.get("target_file_path") or _extract_local_file_path(state.get("task_goal", ""))
+        source_file_url = state.get("source_file_url") or _extract_public_file_url(state.get("task_goal", ""))
+        if not target_file_path and source_file_url:
+            download_raw = download_public_file_to_artifact.invoke({"file_url": source_file_url})
+            download_payload = json.loads(download_raw)
+            target_file_path = str(download_payload.get("local_path", "")).strip()
+        raw = inspect_tabular_file.invoke({"file_path": target_file_path, "max_rows": 5})
+        try:
+            schema = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"inspect_tabular_file returned non-JSON payload: {raw}") from exc
+        if schema.get("file") is None:
+            raise RuntimeError(f"inspect_tabular_file failed: {raw}")
+        return {"phase": "act", "file_schema": schema, "target_file_path": target_file_path, "source_file_url": source_file_url}
+
+    async def act_node(state: EmployeeAgentState) -> dict[str, Any]:
+        prompt = f"""
+你是 HiFleet employee_assistant 的受控 Python 执行器。
+目标：{state.get('task_goal', '')}
+原始文件：{state.get('target_file_path', '')}
+原始链接：{state.get('source_file_url', '') or '无'}
+期望产物：{state.get('expected_artifact', '') or '未指定'}
+当前 loop 次数：{state.get('loop_count', 0)} / {EMPLOYEE_MAX_LOOPS}
+
+文件 Schema（严禁臆造列名）：
+{json.dumps(state.get('file_schema', {}), ensure_ascii=False, indent=2)}
+
+上一轮失败信息：
+{json.dumps(state.get('last_error', {}), ensure_ascii=False, indent=2)}
+
+执行约束：
+1. 只返回 Python 代码，不要解释。
+2. 必须显式打印关键步骤与最终结果。
+3. 代码必须只基于上面的 Schema 使用真实列名。
+4. 输入文件必须通过 `Path(os.environ['INPUT_FILE'])` 读取，不要直接读取宿主机原始路径。
+5. 生成文件时必须写入 `Path(os.environ['ARTIFACT_DIR'])` 目录。
+6. 不要使用 eval/exec/compile/getattr/setattr，也不要访问任何双下划线属性。
+"""
+        response = await codegen_llm.ainvoke([
+            SystemMessage(content="Return only executable Python code."),
+            HumanMessage(content=prompt),
+        ])
+        code = _extract_python_code(_content_to_text(getattr(response, "content", response)))
+        if not code:
+            raise RuntimeError("LLM returned empty python code")
+        return {"phase": "check", "generated_code": code}
+
+    async def check_node(state: EmployeeAgentState) -> dict[str, Any]:
+        attempt = int(state.get("loop_count") or 0) + 1
+        raw = run_sandboxed_python.invoke(
+            {
+                "code": state.get("generated_code", ""),
+                "expected_artifact": state.get("expected_artifact", ""),
+                "attempt": attempt,
+                "input_file_path": state.get("target_file_path", ""),
+            }
+        )
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            result = {"exit_code": 1, "stderr": raw, "artifact_check": {"ok": False, "reason": "non_json_tool_response"}}
+        ok = result.get("exit_code") == 0 and (result.get("artifact_check") or {}).get("ok", True)
+        if ok:
+            return {"phase": "done", "status": "success", "sandbox_result": result}
+        return {
+            "phase": "loop",
+            "sandbox_result": result,
+            "last_error": {
+                "stderr": result.get("stderr", ""),
+                "exit_code": result.get("exit_code"),
+                "artifact_check": result.get("artifact_check", {}),
+            },
+        }
+
+    async def loop_node(state: EmployeeAgentState) -> dict[str, Any]:
+        return {"phase": "act", "loop_count": int(state.get("loop_count") or 0) + 1}
+
+    async def finalize_node(state: EmployeeAgentState) -> dict[str, Any]:
+        return {"phase": "done", "status": "success", "messages": [AIMessage(content=_result_summary_message(state))]}
+
+    async def fail_node(state: EmployeeAgentState) -> dict[str, Any]:
+        return {"phase": "failed", "status": "error", "messages": [AIMessage(content=_failure_summary_message(state))]}
+
+    def route_after_entry(state: EmployeeAgentState) -> str:
+        if _detect_workspace_task(profile, state.get("messages", [])):
+            return "plan"
+        return "delegate"
+
+    def route_after_check(state: EmployeeAgentState) -> str:
+        if state.get("phase") == "done":
+            return "finalize"
+        if int(state.get("loop_count") or 0) >= EMPLOYEE_MAX_LOOPS:
+            return "fail"
+        return "loop"
+
+    graph = StateGraph(EmployeeAgentState)
+    graph.add_node("route", route_node)
+    graph.add_node("delegate", delegate_node)
+    graph.add_node("plan", plan_node)
+    graph.add_node("act", act_node)
+    graph.add_node("check", check_node)
+    graph.add_node("loop", loop_node)
+    graph.add_node("finalize", finalize_node)
+    graph.add_node("fail", fail_node)
+    graph.add_edge(START, "route")
+    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "plan": "plan"})
+    graph.add_edge("delegate", END)
+    graph.add_edge("plan", "act")
+    graph.add_edge("act", "check")
+    graph.add_conditional_edges("check", route_after_check, {"finalize": "finalize", "loop": "loop", "fail": "fail"})
+    graph.add_edge("loop", "act")
+    graph.add_edge("finalize", END)
+    graph.add_edge("fail", END)
+    return graph.compile(checkpointer=get_memory_saver())
+
+
+def build_agent(ctx=None, intent: str = ""):
+    logger.info("[MainAgent] Building Hifleet agent graph")
+    workspace_path = os.getenv("COZE_WORKSPACE_PATH")
+    if not workspace_path:
+        workspace_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    cfg = _load_llm_config(workspace_path)
+    intent_hint = _resolve_intent_hint(ctx, explicit_intent=intent)
+    profile = _resolve_agent_profile(ctx)
+    if profile.profile_id == "employee_assistant":
+        agent = _build_employee_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+        logger.info("[MainAgent] Employee loop graph built successfully")
+        return agent
+    agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+    logger.info("[MainAgent] Standard agent built successfully")
     return agent

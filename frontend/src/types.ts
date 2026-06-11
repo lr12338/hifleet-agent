@@ -18,10 +18,12 @@ export interface ApiCallItem {
 export interface ToolInvocationItem {
   id: number;
   run_id: string;
+  session_id?: string;
   tool_name: string;
   status: string;
   code?: string;
   message?: string;
+  attempt?: number;
   latency_ms: number;
   source?: string;
   tool_args?: Record<string, unknown>;

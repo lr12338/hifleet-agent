@@ -30,6 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_obs_api_calls_status_created
 CREATE TABLE IF NOT EXISTS observability.tool_invocations (
     id BIGSERIAL PRIMARY KEY,
     run_id VARCHAR(255) NOT NULL,
+    session_id VARCHAR(255),
     tool_name VARCHAR(128) NOT NULL,
     tool_args JSONB,
     tool_result JSONB,
@@ -37,26 +38,41 @@ CREATE TABLE IF NOT EXISTS observability.tool_invocations (
     code VARCHAR(128),
     message TEXT,
     retriable BOOLEAN DEFAULT FALSE,
+    attempt INTEGER DEFAULT 0,
     latency_ms INTEGER DEFAULT 0,
     source VARCHAR(128),
     layer_trace JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE observability.tool_invocations
+    ADD COLUMN IF NOT EXISTS session_id VARCHAR(255);
+ALTER TABLE observability.tool_invocations
+    ADD COLUMN IF NOT EXISTS attempt INTEGER DEFAULT 0;
+
+ALTER TABLE observability.agent_errors
+    ADD COLUMN IF NOT EXISTS session_id VARCHAR(255);
+ALTER TABLE observability.agent_errors
+    ADD COLUMN IF NOT EXISTS attempt INTEGER DEFAULT 0;
+
 CREATE INDEX IF NOT EXISTS idx_obs_tool_invocations_run
     ON observability.tool_invocations (run_id);
+CREATE INDEX IF NOT EXISTS idx_obs_tool_invocations_session_created
+    ON observability.tool_invocations (session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_obs_tool_invocations_tool_created
     ON observability.tool_invocations (tool_name, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS observability.agent_errors (
     id BIGSERIAL PRIMARY KEY,
     run_id VARCHAR(255) NOT NULL,
+    session_id VARCHAR(255),
     route VARCHAR(128),
     error_code VARCHAR(128) NOT NULL,
     error_message TEXT,
     stack_trace TEXT,
     error_category VARCHAR(128),
     node_name VARCHAR(128),
+    attempt INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

@@ -1,0 +1,36 @@
+# 使用华为云国内镜像源的Python 3.11 slim（ECS极速拉取，无超时）
+FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/python:3.11-slim
+
+# 沙箱环境优化配置（必须设置）
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/usr/local/bin:$PATH"
+
+# 安装系统依赖（pandas/openpyxl运行必需）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 预安装沙箱允许的Python依赖（精确版本，避免版本漂移）
+RUN pip install --upgrade pip==24.0 && \
+    pip install \
+    pandas==2.2.2 \
+    numpy==1.26.4 \
+    openpyxl==3.1.2 \
+    python-dateutil==2.9.0.post0 \
+    pytz==2024.1
+
+# 创建沙箱用户（安全要求，禁止root运行代码）
+RUN useradd -m -u 1001 sandbox-user
+
+# 切换到沙箱用户
+USER sandbox-user
+
+# 设置工作目录
+WORKDIR /sandbox
+
+# 健康检查（验证镜像可用性）
+CMD ["python", "--version"]

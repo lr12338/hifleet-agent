@@ -125,6 +125,7 @@ flowchart TD
 数字员工 Agent 面向内部场景：
 
 - 继承客服知识问答与 HiFleet 业务工具能力。
+- 支持公开 CSV/XLS/XLSX 文件链接预下载：`download_public_file_to_artifact`。
 - 支持 CSV/XLS/XLSX 文件检查：`inspect_tabular_file`。
 - 支持短脚本 Python 分析：`run_sandboxed_python`。
 - 生成报价表、统计结果、临时 artifact 时写入 `HIFLEET_AGENT_ARTIFACT_DIR`。
@@ -163,21 +164,52 @@ flowchart LR
 3. 再应用 `disabled_tools` 做最终过滤。
 4. 工具结果通过 `ToolResult` 统一写入 observability。
 
-## 5. 数字员工 Python 沙盒
+## 5. 数字员工执行闭环与 Docker 沙盒
 
-当前沙盒是进程级隔离方案，适用于内部低风险数据分析任务，不等价于强安全容器。实现文件：`src/skills/employee_workspace/tools.py`。
+当前 `employee_assistant` 已从“工具增强问答 Agent”升级为显式的执行闭环，核心实现位于 `src/agents/agent.py` 和 `src/skills/employee_workspace/tools.py`。
 
-安全控制：
+### 5.1 LangGraph 闭环
 
-- 仅 `employee_assistant` profile 可调用。
-- 使用 `python3 -I` 隔离用户 site-packages。
-- 每次执行创建 `/tmp/hifleet_py_*` 临时目录。
-- artifact 仅写入 `HIFLEET_AGENT_ARTIFACT_DIR`，默认 `/tmp/hifleet_agent_artifacts`。
-- 限制代码长度：`HIFLEET_PY_SANDBOX_MAX_CODE_CHARS`，默认 `12000`。
-- 限制执行时长：`HIFLEET_PY_SANDBOX_TIMEOUT_SEC`，默认 `20` 秒。
-- 阻断明显危险模式：`os.system`、`subprocess.*`、`socket.*`、删除根目录、读取系统敏感路径等。
+```mermaid
+flowchart TD
+    Route[route] -->|表格分析/产物任务| Plan[plan]
+    Route -->|普通内部问答| Delegate[delegate]
+    Plan --> Act[act]
+    Act --> Check[check]
+    Check -->|exit_code=0 且产物校验通过| Finalize[finalize]
+    Check -->|失败且 loop_count < max| Loop[loop]
+    Loop --> Act
+    Check -->|失败且达到上限| Fail[fail]
+```
 
-后续如需处理不可信用户上传文件，应升级为容器/微 VM 沙盒：独立用户、只读根文件系统、CPU/内存限制、网络禁用、artifact 白名单挂载。
+执行规则：
+
+- `plan`：如果输入是公开 URL，先调用 `download_public_file_to_artifact`；随后强制调用 `inspect_tabular_file`，把 `columns/dtypes/missing_values/preview/schema` 写入 Agent State。
+- `act`：LLM 只允许基于 `plan` 返回的真实 Schema 生成 Python 代码。
+- `check`：调用 `run_sandboxed_python`，检查 `exit_code`，并在给定 `expected_artifact` 时额外校验文件存在且大小大于 0。
+- `loop`：把上一轮 `stderr`、`artifact_check`、旧代码和 `loop_count` 回灌给模型继续修复。
+- 熔断：`HIFLEET_EMPLOYEE_MAX_LOOPS`，当前默认 `4`。
+
+### 5.2 Docker sibling container 沙盒
+
+当前 Python 执行不再落到宿主机 `subprocess.run`，而是通过 Docker SDK 动态拉起兄弟容器：
+
+- `network_mode="none"`：完全断网。
+- `read_only=True`：根文件系统只读。
+- `mem_limit=512m`、`cpu_quota=50000`：限制资源消耗。
+- `user="1000:1000"`：非 root 身份运行。
+- `tmpfs=/tmp`：容器内临时目录隔离。
+- 共享卷：通过 `HIFLEET_PY_SANDBOX_VOLUME` 挂载 artifacts 目录。
+- 输入文件：调用前复制到 job 目录，并通过 `INPUT_FILE` 传入容器，避免脚本直接访问宿主机路径。
+
+### 5.3 AST 前置守门
+
+在正式起容器前，`run_sandboxed_python` 会先执行 AST 静态扫描：
+
+- 允许 import：`pandas`、`numpy`、`openpyxl`、`json`、`datetime`、`math` 等白名单。
+- 禁止高危内置：`eval`、`exec`、`compile`、`getattr`、`setattr`、`__import__`。
+- 禁止任何双下划线属性与变量访问。
+- 命中后直接返回 `ERR_SANDBOX_SECURITY`，并写入 `observability.agent_errors`。
 
 ## 6. Harness 与 Loop 工程策略
 
@@ -302,6 +334,18 @@ ark_websearch_api_key=...
 HIFLEET_AGENT_ARTIFACT_DIR=/tmp/hifleet_agent_artifacts
 HIFLEET_PY_SANDBOX_TIMEOUT_SEC=20
 HIFLEET_PY_SANDBOX_MAX_CODE_CHARS=12000
+HIFLEET_PY_SANDBOX_STDIO_CHARS=8000
+HIFLEET_PY_SANDBOX_IMAGE=python:3.11-slim
+HIFLEET_PY_SANDBOX_IMAGE_CANDIDATES=python:3.11-slim
+HIFLEET_PY_SANDBOX_AUTO_PULL=1
+HIFLEET_PY_SANDBOX_VOLUME=coze_ai_shared-artifacts
+HIFLEET_PY_SANDBOX_VOLUME_MOUNT=/workspace/artifacts
+HIFLEET_PY_SANDBOX_MEM_LIMIT=512m
+HIFLEET_PY_SANDBOX_CPU_QUOTA=50000
+HIFLEET_PY_SANDBOX_USER=1000:1000
+HIFLEET_EMPLOYEE_MAX_LOOPS=4
+HIFLEET_PUBLIC_FILE_TIMEOUT_SEC=30
+HIFLEET_PUBLIC_FILE_MAX_MB=100
 ```
 
 ### 9.2 启动
@@ -321,6 +365,21 @@ sudo journalctl -u hifleet-agent.service -f
 ```
 
 服务端口固定为 `10123`，对外访问前需要放通主机防火墙、云安全组和反向代理。
+
+### 9.3 Docker Compose 开发编排
+
+当前仓库已新增 `docker-compose.dev.yml`，用于本地或测试环境验证 employee sandbox：
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
+关键挂载：
+
+- `/var/run/docker.sock:/var/run/docker.sock`
+- `coze_ai_shared-artifacts:/workspace/artifacts`
+
+如果 `run_sandboxed_python` 返回 `Permission denied` 或 `Error while fetching server API version`，优先检查主服务容器/当前用户是否有权访问 Docker socket。
 
 ## 10. 测试与发布前检查
 
@@ -343,6 +402,14 @@ Profile smoke test：
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/test_agent_profiles.py
+```
+
+Employee workspace 与闭环 smoke test：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/test_employee_workspace.py
+PYTHONPATH=src .venv/bin/python scripts/test_employee_agent_loop.py
+bash scripts/prepare_employee_sandbox_image.sh
 ```
 
 前端构建：
