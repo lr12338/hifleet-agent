@@ -25,6 +25,8 @@
 - `source_channel`：来源渠道，用于 Profile 映射和后台筛选。
 - `agent_profile`：可选但推荐显式传入，取值为 `customer_support` 或 `employee_assistant`。
 
+兼容说明：`input`、`text`、`content.query.prompt` 仍可被服务端自动归一化为 `messages`，因此旧调用方可以平滑迁移，不需要一次性改完；但新接入和后续维护都应统一使用 `messages`。
+
 Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profile` -> `source_channel` 映射 -> 默认 `customer_support`。
 
 ## 3. Profile 选择

@@ -230,6 +230,8 @@ curl http://127.0.0.1:10123/health
 
 ### 8.2 同步调用 `/run`
 
+接口兼容说明：当前服务会把 `messages` 作为主格式，同时兼容 `input`、`text`、`content.query.prompt`。旧调用方可以继续使用原格式完成迁移，但新接入应统一改为 `messages`，这样便于后续维护、调试和多模态扩展。
+
 客服调用示例：
 
 ```json

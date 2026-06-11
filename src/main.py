@@ -82,6 +82,25 @@ TIMEOUT_SECONDS = 900  # 15分钟
 HEADER_X_INTENT_HINT = "x-intent-hint"
 
 
+def _ensure_context_headers(ctx: Optional[Context]) -> Dict[str, Any]:
+    """Return a mutable headers dict for the current context.
+
+    Some runtime contexts do not expose a headers attribute. In that case we
+    create one lazily so downstream code can keep using a dict-like contract.
+    """
+    if ctx is None:
+        return {}
+    headers = getattr(ctx, "headers", None)
+    if isinstance(headers, dict):
+        return headers
+    try:
+        headers = {}
+        setattr(ctx, "headers", headers)
+        return headers
+    except Exception:
+        return {}
+
+
 def is_feature_enabled(name: str, default: bool = False) -> bool:
     val = os.getenv(name)
     if val is None:
@@ -656,17 +675,17 @@ async def http_run(request: Request) -> Dict[str, Any]:
             logger.info(f"[Run] Set session context: session_id={session_id}, user_id={user_id}")
 
         intent_hint = classify_intent_hint(payload)
+        headers = _ensure_context_headers(ctx)
         agent_profile = resolve_profile_id(
             source_channel=source_channel,
             requested_profile=str(payload.get("agent_profile", "")).strip(),
-            headers=ctx.headers if isinstance(ctx.headers, dict) else {},
+            headers=headers,
         )
         payload["intent_hint"] = intent_hint
         payload["agent_profile"] = agent_profile
         set_current_agent_profile(agent_profile)
-        if hasattr(ctx, "headers") and isinstance(ctx.headers, dict):
-            ctx.headers[HEADER_X_INTENT_HINT] = intent_hint
-            ctx.headers[PROFILE_HEADER] = agent_profile
+        headers[HEADER_X_INTENT_HINT] = intent_hint
+        headers[PROFILE_HEADER] = agent_profile
         logger.info(
             f"Received request for /run: "
             f"run_id={run_id}, session_id={session_id}, "
@@ -903,17 +922,17 @@ async def http_stream_run(request: Request):
         logger.info(f"[StreamRun] Set session context: session_id={session_id}, user_id={user_id}")
     
     intent_hint = classify_intent_hint(payload)
+    headers = _ensure_context_headers(ctx)
     agent_profile = resolve_profile_id(
         source_channel=source_channel,
         requested_profile=str(payload.get("agent_profile", "")).strip(),
-        headers=ctx.headers if isinstance(ctx.headers, dict) else {},
+        headers=headers,
     )
     payload["intent_hint"] = intent_hint
     payload["agent_profile"] = agent_profile
     set_current_agent_profile(agent_profile)
-    if hasattr(ctx, "headers") and isinstance(ctx.headers, dict):
-        ctx.headers[HEADER_X_INTENT_HINT] = intent_hint
-        ctx.headers[PROFILE_HEADER] = agent_profile
+    headers[HEADER_X_INTENT_HINT] = intent_hint
+    headers[PROFILE_HEADER] = agent_profile
     logger.info(
         f"Received request for /stream_run: "
         f"run_id={run_id}, session_id={session_id}, "
