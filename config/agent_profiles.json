@@ -21,13 +21,10 @@
       "tool_policy": {
         "allow_file_tools": false,
         "allow_python": false,
-        "allow_write_actions": false,
+        "allow_write_actions": true,
         "prefer_search_before_answer": true
       },
-      "disabled_tools": [
-        "upload_ship_position",
-        "update_ship_static_info"
-      ]
+      "disabled_tools": []
     },
     "employee_assistant": {
       "description": "Internal digital employee assistant. Supports knowledge QA, file processing, data analysis, and controlled artifact generation.",

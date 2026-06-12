@@ -1,4 +1,7 @@
-# Agent 管理平台开发者总览
+# Agent 管理平台开发者总览（归档）
+
+> 归档说明：当前管理台使用与开发说明已合并到
+> `docs/ADMIN_BACKEND_SYSTEM_GUIDE.md`。本文保留为历史参考，不再作为主入口。
 
 本文面向接手后台管理系统和观测链路的开发人员。主 Agent 架构见 `docs/AGENT_TECHNICAL_DOCUMENTATION.md`，后台使用手册见 `docs/ADMIN_BACKEND_SYSTEM_GUIDE.md`。
 

@@ -1,4 +1,7 @@
-# Hifleet FAQ知识库导入报告
+# Hifleet FAQ知识库导入报告（归档）
+
+> 归档说明：这是 2026-04-03 的一次性导入报告。当前知识库使用与检索链路见
+> `docs/KNOWLEDGE_BASE_GUIDE.md`。
 
 ## 📊 导入概览
 

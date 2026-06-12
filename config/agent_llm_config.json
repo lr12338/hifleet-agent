@@ -22,9 +22,18 @@
     "get_psc_records",
     "get_area_traffic",
     "get_strait_traffic",
+    "get_ship_trajectory",
+    "get_ship_call_ports",
+    "get_ship_voyages",
+    "get_last_departure",
+    "get_current_stop",
+    "get_avoid_redsea_traffic",
+    "search_ports",
+    "get_port_detail",
     "upload_ship_position",
     "update_ship_static_info",
     "smart_search",
+    "download_public_file_to_artifact",
     "inspect_tabular_file",
     "run_sandboxed_python"
   ]

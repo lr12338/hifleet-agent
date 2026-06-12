@@ -1,12 +1,14 @@
 # 多用户接入与会话隔离指南
 
-本文指导外部服务或内部系统调用 HiFleet Agent API，重点解决三件事：
+本文指导外部服务或内部系统调用 HiFleet Agent API。文档入口见 `docs/README.md`，当前 Agent 架构见 `docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
+
+重点解决三件事：
 
 - 多用户、多会话不串话。
 - 正确选择客服或数字员工 Profile。
 - 出现慢请求、错误、工具异常时可在后台管理系统定位。
 
-主架构说明见 `docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
+注意：`customer_support` 当前先做确定性消息分类和工具 bundle 收缩，再执行工具或复杂 harness；调用方不需要也不应该直接指定底层工具。
 
 ## 1. 核心接口
 
@@ -40,6 +42,13 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 | 内部员工助手 | `employee_assistant` | `employee_api` / `internal_web` | 需要内部鉴权和访问控制 |
 
 安全要求：不要把 `employee_assistant` 暴露给未鉴权外部用户。该 Profile 可使用文件处理和受控 Python 分析能力。
+
+`customer_support` 能力边界：
+
+- 平台问题：优先 `smart_search`，按 KB -> 官网/搜索 -> deep fallback 退化。
+- 船舶问题：自动识别单步查询、复杂分析、区域/海峡统计、写操作。
+- 写操作：只在用户明确要求更新/上传/修改时进入 `ship_update`，缺必要字段会快速失败。
+- 不开放 Python、Docker、文件处理和通用浏览器能力。
 
 ## 4. session_id 生成规则
 

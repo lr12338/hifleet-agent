@@ -10,6 +10,7 @@ __pycache__/
 *.a
 /vendor
 *.egg-info/
+artifacts/
 /.env
 .env
 

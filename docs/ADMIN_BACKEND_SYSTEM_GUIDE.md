@@ -1,215 +1,142 @@
-# Agent 后台管理系统使用指南
+# 管理台与观测指南
 
-本文面向联调、验收和日常排障。系统架构和代码地图见 `docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
+本文合并原“后台使用指南”和“管理平台开发者总览”，覆盖管理台入口、核心页面、后端代码地图和排障方法。
 
-后台入口：
+## 1. 入口
 
 ```text
 http://127.0.0.1:10123/admin-ui
 ```
 
-如果配置了 `ADMIN_API_KEY`，所有 `/admin/*` 请求需要请求头：
+如果配置了 `ADMIN_API_KEY`，所有 `/admin/*` 请求需要：
 
 ```bash
 -H "x-admin-api-key: ${ADMIN_API_KEY}"
 ```
 
-## 1. 页面能力
+## 2. 管理台架构
+
+```mermaid
+flowchart LR
+    UI[React /admin-ui] --> Client[frontend/src/api/client.ts]
+    Client --> Router[src/admin_api/router.py]
+    Router --> Service[src/admin_api/service.py]
+    Service --> Repo[src/observability/repository.py]
+    Repo --> DB[(Postgres observability schema)]
+    Router --> Test[/admin/test/run]
+    Test --> Agent[/run or /stream_run]
+```
+
+管理台不单独部署服务，静态资源由 `src/main.py` 挂载在 `/admin-ui`，API 挂载在 `/admin/*`。
+
+## 3. 页面能力
 
 | 页面 | 用途 |
 | --- | --- |
-| 总览 Dashboard | 查看调用量、成功率、延迟、工具成功率、渠道/路由/Profile 分布、高风险会话 |
-| 会话 Sessions | 按时间、关键词、Profile 浏览会话，回放消息并跳转日志 |
-| 调试 Chat Debug | 多会话对话调试，支持附件、SSE、显式 `agent_profile`、案例保存 |
-| 日志追踪 Logs | 按 run_id/session_id/user_id/source_channel/agent_profile/status/keyword 检索 |
-| API 调试 Playground | 构造 `/run` 和 `/stream_run` 请求，可覆盖 Profile、渠道、模型等参数 |
-| 配置 Config | 配置中心骨架页，后续可接入 Profile/Skill 可视化管理 |
+| Dashboard | 调用量、成功率、延迟、工具成功率、渠道/Profile 分布、高风险会话 |
+| Sessions | 按用户、会话、Profile 回放消息 |
+| Chat Debug | 多会话调试，支持 `agent_profile`、附件、SSE、案例保存 |
+| Logs | 按 run_id/session_id/user_id/source_channel/profile/route/status 检索 |
+| API Playground | 构造 `/run`、`/stream_run` 请求 |
+| Config | 配置中心骨架页 |
 
-## 2. Dashboard
+## 4. 关键接口
 
-接口：
+| 接口 | 说明 |
+| --- | --- |
+| `GET /admin/dashboard/summary` | Dashboard 聚合 |
+| `GET /admin/logs` | 调用日志列表 |
+| `GET /admin/logs/{run_id}` | 单次调用详情 |
+| `GET /admin/sessions` | 会话列表 |
+| `GET /admin/sessions/{session_id}` | 会话详情 |
+| `POST /admin/test/run` | 代理调用 Agent |
+| `GET /admin/chat-debug/sessions` | Chat Debug 案例列表 |
+| `POST /admin/chat-debug/sessions` | 保存调试案例 |
 
-```text
-GET /admin/dashboard/summary
-```
-
-展示内容：
-
-- KPI：请求数、会话数、成功率、平均延迟、工具成功率、估算成本。
-- 趋势：按小时聚合请求、错误、平均延迟。
-- 分布：热门渠道、热门路由、Agent Profile。
-- 高风险会话：按错误数、延迟和最近活跃排序。
-
-示例：
-
-```bash
-curl "http://127.0.0.1:10123/admin/dashboard/summary" \
-  -H "x-admin-api-key: ${ADMIN_API_KEY}"
-```
-
-## 3. Logs
-
-接口：
-
-```text
-GET /admin/logs
-GET /admin/logs/{run_id}
-```
-
-列表参数：
-
-- `page`、`page_size`
-- `start_time`、`end_time`
-- `session_id`
-- `user_id`
-- `source_channel`
-- `agent_profile`
-- `route`
-- `status`
-- `keyword`
-
-示例：
+常用查询：
 
 ```bash
 curl "http://127.0.0.1:10123/admin/logs?page=1&page_size=20&agent_profile=customer_support&status=error" \
   -H "x-admin-api-key: ${ADMIN_API_KEY}"
 ```
 
-详情页包含：
+## 5. 代码地图
 
-- `api_call`：请求主记录，包含派生字段 `agent_profile`。
-- `tool_invocations`：工具调用链。
-- `errors`：错误明细。
-- `summary`：摘要字段。
-- `trace`：请求、工具、错误、响应时间线。
+后端：
 
-## 4. Sessions
+| 文件 | 说明 |
+| --- | --- |
+| `src/admin_api/router.py` | `/admin/*` HTTP 路由 |
+| `src/admin_api/schemas.py` | 请求/响应 schema |
+| `src/admin_api/service.py` | Dashboard、Logs、Sessions、测试代理聚合 |
+| `src/observability/repository.py` | 观测 SQL 查询 |
+| `src/observability/writer.py` | 异步写入 API 调用、工具调用、错误 |
+| `src/observability/sql/` | 数据库 schema 初始化 |
 
-接口：
+前端：
 
-```text
-GET /admin/sessions
-GET /admin/sessions/{session_id}
+| 文件 | 说明 |
+| --- | --- |
+| `frontend/src/App.tsx` | 页面路由 |
+| `frontend/src/layouts/AdminShell.tsx` | 管理台布局 |
+| `frontend/src/api/client.ts` | API client |
+| `frontend/src/pages/*` | Dashboard、Logs、Sessions、Chat Debug、Playground |
+
+## 6. 观测数据模型
+
+主要表：
+
+- `observability.api_calls`：请求主记录。
+- `observability.tool_invocations`：工具调用明细。
+- `observability.agent_errors`：运行错误。
+- `observability.chat_debug_sessions`：Chat Debug 案例。
+
+重要字段：
+
+- `run_id`：单次调用主键。
+- `session_id`：多轮会话主键。
+- `user_id`：用户定位。
+- `source_channel`：渠道。
+- `agent_profile`：从 request JSON 派生。
+- `route` / `task_type`：客服 routed graph 的分类结果。
+
+## 7. 排障流程
+
+```mermaid
+flowchart TD
+    Symptom[用户反馈/接口错误] --> Logs[Logs 按 session_id/run_id 查询]
+    Logs --> Detail[打开日志详情]
+    Detail --> Route[检查 profile/route/task_type/tool_bundle]
+    Route --> Tools[检查 tool_call_sequence 与 tool_invocations]
+    Tools --> Latency[定位 latency_hotspot]
+    Tools --> Error[检查 agent_errors]
+    Latency --> Fix[修复路由/工具/API/权限]
+    Error --> Fix
 ```
 
-列表参数：
+客服 Agent 重点检查：
 
-- `start_time`、`end_time`
-- `user_id`
-- `source_channel`
-- `agent_profile`
-- `status`
-- `keyword`
-- `page`、`page_size`
+- `route` 是否符合问题类型。
+- `tool_bundle` 是否收缩正确。
+- `entity_resolution` 是否抽到了 MMSI/IMO/船名/区域/日期。
+- `tool_call_sequence` 是否有不必要调用。
+- `fallback_reason` 是否暴露授权、无数据或校验失败。
 
-示例：
+## 8. 新增 Profile 或工具后的检查
+
+1. 更新 `config/agent_profiles.json`。
+2. 更新 `config/agent_llm_config.json` 工具列表。
+3. 跑：
 
 ```bash
-curl "http://127.0.0.1:10123/admin/sessions?agent_profile=employee_assistant&page=1&page_size=10" \
-  -H "x-admin-api-key: ${ADMIN_API_KEY}"
+.venv/bin/python - <<'PY'
+import sys
+sys.path.insert(0, 'src')
+from skills import SkillLoader
+print(SkillLoader.validate_registry_consistency())
+PY
 ```
 
-会话详情返回：
+4. 在 Chat Debug 中分别测试 `customer_support` 和 `employee_assistant`。
+5. 到 Logs 检查 profile、route、tool 调用是否正确落库。
 
-- `session_id`
-- `user_id`
-- `source_channel`
-- `agent_profile`
-- `summary`
-- `calls`
-
-## 5. Chat Debug
-
-用途：
-
-- 模拟客服或数字员工对话。
-- 在高级参数中设置 `session_id`、`user_id`、`source_channel`、`agent_profile`。
-- 上传图片、音频、视频附件到 OSS。
-- 保存调试案例，刷新后恢复。
-
-相关接口：
-
-- `POST /admin/test/run`
-- `GET /admin/chat-debug/sessions`
-- `PUT /admin/chat-debug/sessions/{session_key}`
-- `DELETE /admin/chat-debug/sessions/{session_key}`
-- `POST /admin/files/upload`
-
-## 6. API Playground
-
-接口：
-
-```text
-POST /admin/test/run
-```
-
-同步示例：
-
-```json
-{
-  "endpoint": "/run",
-  "payload": {
-    "messages": [{"role": "user", "content": "你好"}],
-    "session_id": "admin_test_s1",
-    "user_id": "admin_user",
-    "source_channel": "admin_panel",
-    "agent_profile": "employee_assistant"
-  }
-}
-```
-
-流式示例：
-
-```json
-{
-  "endpoint": "/stream_run",
-  "stream": true,
-  "payload": {
-    "messages": [{"role": "user", "content": "请流式回答"}],
-    "session_id": "admin_stream_s1",
-    "user_id": "admin_user",
-    "source_channel": "websdk",
-    "agent_profile": "customer_support"
-  }
-}
-```
-
-## 7. 启动与依赖
-
-一体化启动：
-
-```bash
-cd /home/ecs-user/coze_ai
-source .venv/bin/activate
-bash scripts/start_unified_stack.sh
-```
-
-前端本地开发：
-
-```bash
-cd /home/ecs-user/coze_ai/frontend
-npm install
-npm run dev
-```
-
-关键环境变量：
-
-```bash
-PGDATABASE_URL=postgresql://user:password@127.0.0.1:5432/postgres
-COZE_CHECKPOINTER_MODE=postgres
-ADMIN_API_KEY=your_admin_secret
-AGENT_BASE_URL=http://127.0.0.1:10123
-OSS_ACCESS_KEY_ID=...
-OSS_ACCESS_KEY_SECRET=...
-OSS_BUCKET_NAME=...
-OSS_ENDPOINT=...
-OSS_REGION=cn-beijing
-```
-
-## 8. 排障路径
-
-1. 先在 Dashboard 看是否集中在某个 Profile、渠道或路由。
-2. 到 Logs 按 `session_id`、`user_id`、`agent_profile` 筛选。
-3. 打开日志详情查看 request、response、tools、errors、trace。
-4. 到 Sessions 回放完整上下文，判断是否是会话串扰或用户表达不清。
-5. 用 Chat Debug 或 API Playground 复现，并保存案例。

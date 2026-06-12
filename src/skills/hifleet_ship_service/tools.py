@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import urllib.parse
+import urllib.request
 import time
 from typing import Optional
 from datetime import datetime
@@ -57,6 +58,48 @@ _get_strait_traffic_mod = None
 _upload_position = None
 _update_static_info = None
 _coord_utils = None
+
+
+def _api_base() -> str:
+    return (os.getenv("HIFLEET_API_BASE") or "https://api.hifleet.com").rstrip("/")
+
+
+def _api_key() -> str:
+    return (
+        os.getenv("HIFLEET_API_KEY")
+        or os.getenv("api_key")
+        or os.getenv("hifleet_key1")
+        or ""
+    ).strip()
+
+
+def _http_json(method: str, path: str, params: dict) -> dict:
+    key = _api_key()
+    if key:
+        params = {**params, "api_key": key, "usertoken": key}
+    url = _api_base() + path + "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
+    data = b"" if method.upper() == "POST" else None
+    req = urllib.request.Request(url, method=method.upper(), data=data)
+    if data is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _format_json_result(data: dict, title: str) -> str:
+    if not data:
+        return f"未找到{title}数据。"
+    code = data.get("code")
+    if code is not None:
+        try:
+            if int(code) >= 4000:
+                message = str(data.get("message") or data.get("msg") or "接口返回错误")
+                if "unauthor" in message.lower() or "token" in message.lower():
+                    return f"{title}接口授权不足，当前 token 无法访问该能力。原始错误：{message}"
+                return f"{title}接口返回错误（code={code}）：{message}"
+        except (TypeError, ValueError):
+            pass
+    return json.dumps(data, ensure_ascii=False, indent=2)[:6000]
 
 
 def _ensure_imports():
@@ -706,6 +749,181 @@ def get_strait_traffic(strait_name: str = "", oid: str = "",
             ctx if "ctx" in locals() else None,
             ToolResult(status="error", code="STRAIT_TRAFFIC_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"),
         )
+        return output
+
+
+@tool
+def get_ship_trajectory(mmsi: str, starttime: str = "", endtime: str = "", zoom: str = "7") -> str:
+    """查询单船历史轨迹点。
+
+    Args:
+        mmsi: 船舶MMSI编号
+        starttime: 开始时间，yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss
+        endtime: 结束时间，yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss
+        zoom: 轨迹压缩级别，默认7
+    """
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_ship_trajectory")
+    try:
+        if not mmsi:
+            output = "请提供MMSI以查询历史轨迹。"
+            _emit_result("get_ship_trajectory", ctx, ToolResult(status="error", code="TRAJECTORY_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
+            return output
+        if starttime and len(starttime) == 10:
+            starttime += " 00:00:00"
+        if endtime and len(endtime) == 10:
+            endtime += " 23:59:59"
+        data = _http_json("GET", "/position/trajectory/token", {"mmsi": mmsi, "starttime": starttime, "endtime": endtime, "zoom": zoom or "7"})
+        output = _format_json_result(data, "历史轨迹")
+        _emit_result("get_ship_trajectory", ctx, ToolResult(status="ok", code="TRAJECTORY_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"历史轨迹查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_ship_trajectory", ctx, ToolResult(status="error", code="TRAJECTORY_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_ship_call_ports(mmsi: str, starttime: str = "", endtime: str = "", accuracyval: str = "6") -> str:
+    """查询单船历史挂靠记录。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_ship_call_ports")
+    try:
+        if not mmsi:
+            output = "请提供MMSI以查询历史挂靠。"
+            _emit_result("get_ship_call_ports", ctx, ToolResult(status="error", code="CALL_PORTS_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
+            return output
+        if starttime and len(starttime) == 10:
+            starttime += " 00:00:00"
+        if endtime and len(endtime) == 10:
+            endtime += " 23:59:59"
+        data = _http_json("GET", "/position/getcallport/token", {"mmsi": mmsi, "starttime": starttime, "endtime": endtime, "accuracyval": accuracyval or "6"})
+        output = _format_json_result(data, "历史挂靠")
+        _emit_result("get_ship_call_ports", ctx, ToolResult(status="ok", code="CALL_PORTS_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"历史挂靠查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_ship_call_ports", ctx, ToolResult(status="error", code="CALL_PORTS_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_ship_voyages(mmsi: str, starttime: str = "", endtime: str = "") -> str:
+    """查询单船历史航次。未提供时间范围时使用简版航次接口。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_ship_voyages")
+    try:
+        if not mmsi:
+            output = "请提供MMSI以查询历史航次。"
+            _emit_result("get_ship_voyages", ctx, ToolResult(status="error", code="VOYAGES_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
+            return output
+        if starttime and endtime:
+            if len(starttime) == 10:
+                starttime += " 00:00:00"
+            if len(endtime) == 10:
+                endtime += " 23:59:59"
+            data = _http_json("GET", "/portofcall/getvoyages", {"mmsi": mmsi, "starttime": starttime, "endtime": endtime})
+        else:
+            data = _http_json("GET", "/position/getvoyagelist/token", {"mmsi": mmsi})
+        output = _format_json_result(data, "历史航次")
+        _emit_result("get_ship_voyages", ctx, ToolResult(status="ok", code="VOYAGES_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"历史航次查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_ship_voyages", ctx, ToolResult(status="error", code="VOYAGES_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_last_departure(mmsi: str) -> str:
+    """查询船舶最近一次离港港口与离港时间。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_last_departure")
+    try:
+        if not mmsi:
+            output = "请提供MMSI以查询上一离港。"
+            _emit_result("get_last_departure", ctx, ToolResult(status="error", code="LAST_DEPARTURE_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
+            return output
+        data = _http_json("GET", "/position/lastdeparture/token", {"mmsi": mmsi})
+        output = _format_json_result(data, "上一离港")
+        _emit_result("get_last_departure", ctx, ToolResult(status="ok", code="LAST_DEPARTURE_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"上一离港查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_last_departure", ctx, ToolResult(status="error", code="LAST_DEPARTURE_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_current_stop(mmsi: str) -> str:
+    """查询船舶当前停船/到港位置与停船时长。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_current_stop")
+    try:
+        if not mmsi:
+            output = "请提供MMSI以查询当前停船。"
+            _emit_result("get_current_stop", ctx, ToolResult(status="error", code="CURRENT_STOP_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
+            return output
+        data = _http_json("GET", "/position/getstop/token", {"mmsi": mmsi})
+        output = _format_json_result(data, "当前停船")
+        _emit_result("get_current_stop", ctx, ToolResult(status="ok", code="CURRENT_STOP_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"当前停船查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_current_stop", ctx, ToolResult(status="error", code="CURRENT_STOP_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_avoid_redsea_traffic(startdate: str = "", enddate: str = "", i18n: str = "zh") -> str:
+    """查询红海绕航每日统计。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_avoid_redsea_traffic")
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        data = _http_json("POST", "/routerisk/getAvoidRedSeaDetail/token", {"starttime": startdate or today, "endtime": enddate or startdate or today, "i18n": i18n or "zh"})
+        output = _format_json_result(data, "红海绕航")
+        _emit_result("get_avoid_redsea_traffic", ctx, ToolResult(status="ok", code="AVOID_REDSEA_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"红海绕航统计查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_avoid_redsea_traffic", ctx, ToolResult(status="error", code="AVOID_REDSEA_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def search_ports(port_name: str = "", port_code: str = "") -> str:
+    """检索港口列表。详情查询需使用返回项中的 piuid 作为 port_id。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="search_ports")
+    try:
+        data = _http_json("GET", "/portguide/getPort/token", {"portName": port_name, "portCode": port_code})
+        output = _format_json_result(data, "港口列表")
+        _emit_result("search_ports", ctx, ToolResult(status="ok", code="PORT_SEARCH_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"港口检索失败: {str(e)}。该接口可能缺少 portguide 授权。"
+        _emit_result("search_ports", ctx, ToolResult(status="error", code="PORT_SEARCH_ERROR", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_port_detail(port_id: str) -> str:
+    """查询单港详情，port_id 应来自 search_ports 返回项 piuid。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_port_detail")
+    try:
+        if not str(port_id).strip().isdigit():
+            output = "请提供 search_ports 返回的 piuid 作为 port_id。"
+            _emit_result("get_port_detail", ctx, ToolResult(status="error", code="PORT_DETAIL_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
+            return output
+        data = _http_json("GET", "/portguide/getPortDetail/token", {"portId": str(port_id).strip()})
+        output = _format_json_result(data, "港口详情")
+        _emit_result("get_port_detail", ctx, ToolResult(status="ok", code="PORT_DETAIL_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"港口详情查询失败: {str(e)}。该接口可能缺少 portguide 授权。"
+        _emit_result("get_port_detail", ctx, ToolResult(status="error", code="PORT_DETAIL_ERROR", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
         return output
 
 

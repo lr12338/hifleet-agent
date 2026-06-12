@@ -108,6 +108,14 @@ class SkillLoader:
                 "get_psc_records",
                 "get_area_traffic",
                 "get_strait_traffic",
+                "get_ship_trajectory",
+                "get_ship_call_ports",
+                "get_ship_voyages",
+                "get_last_departure",
+                "get_current_stop",
+                "get_avoid_redsea_traffic",
+                "search_ports",
+                "get_port_detail",
                 "upload_ship_position",
                 "update_ship_static_info",
             ],
@@ -209,6 +217,22 @@ class SkillLoader:
                     all_tools.append(tool)
                     seen.add(tool.name)
         return all_tools
+
+    @classmethod
+    def get_tools_by_names(cls, tool_names: List[str]) -> List[BaseTool]:
+        """Return tools by explicit name, preserving order and avoiding extras."""
+        wanted = list(tool_names or [])
+        if not wanted:
+            return []
+        registry = {tool.name: tool for tool in cls.get_all_tools()}
+        tools = []
+        for name in wanted:
+            tool = registry.get(name)
+            if tool is not None:
+                tools.append(tool)
+            else:
+                logger.warning(f"Requested tool '{name}' is not registered")
+        return tools
 
     @classmethod
     def get_tools_by_intent(cls, intent: str) -> List[BaseTool]:

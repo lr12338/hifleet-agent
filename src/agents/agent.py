@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -18,6 +19,24 @@ from agents.profiles import (
     get_current_agent_profile_id,
     get_profile,
     read_profile_prompt,
+)
+from agents.customer_support_router import (
+    BROWSER_FALLBACK_BUNDLE,
+    KNOWLEDGE_BUNDLE,
+    SHIP_QUERY_BUNDLE,
+    SHIP_STATS_BUNDLE,
+    SHIP_UPDATE_BUNDLE,
+    SHIP_VOYAGE_BUNDLE,
+    RouteDecision,
+    classify_message,
+    execute_complex_ship_chain,
+    execute_knowledge_chain,
+    execute_simple_ship_chain,
+    execute_stats_chain,
+    execute_update_chain,
+    extract_entities,
+    latest_user_text as latest_customer_user_text,
+    make_trace,
 )
 from coze_coding_utils.runtime_ctx.context import default_headers
 from llm_config import load_llm_config
@@ -117,6 +136,21 @@ class EmployeeAgentState(TypedDict, total=False):
     generated_code: str
     sandbox_result: dict[str, Any]
     last_error: dict[str, Any]
+
+
+class CustomerSupportState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], _windowed_messages]
+    session_id: str
+    user_id: str
+    source_channel: str
+    agent_profile: str
+    intent_hint: str
+    route: str
+    task_type: str
+    tool_bundle: list[str]
+    entities: dict[str, Any]
+    route_trace: dict[str, Any]
+    fallback_reason: str
 
 
 def _resolve_intent_hint(ctx=None, explicit_intent: str = "") -> str:
@@ -542,6 +576,108 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     return graph.compile(checkpointer=get_memory_saver())
 
 
+def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
+    logger.info("[MainAgent] Building customer_support routed graph")
+    fallback_agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+    allowed_write = bool((profile.tool_policy or {}).get("allow_write_actions", False))
+
+    bundle_names = set(KNOWLEDGE_BUNDLE + SHIP_QUERY_BUNDLE + SHIP_STATS_BUNDLE + SHIP_VOYAGE_BUNDLE + BROWSER_FALLBACK_BUNDLE)
+    if allowed_write:
+        bundle_names.update(SHIP_UPDATE_BUNDLE)
+    tools = SkillLoader.get_tools_by_names(sorted(bundle_names))
+    tool_map = {tool.name: tool for tool in tools}
+
+    async def route_node(state: CustomerSupportState) -> dict[str, Any]:
+        text = latest_customer_user_text(state.get("messages", []))
+        entities = extract_entities(text)
+        decision = classify_message(text, entities)
+        trace = make_trace(decision, entities, session_id=str(state.get("session_id", "")))
+        logger.info(
+            "[CustomerSupportRoute] run_id=%s session_id=%s route=%s task_type=%s bundle=%s entities=%s reason=%s",
+            trace.run_id,
+            trace.session_id,
+            decision.route,
+            decision.task_type,
+            decision.tool_bundle,
+            trace.entity_resolution,
+            decision.reason,
+        )
+        return {
+            "route": decision.route,
+            "task_type": decision.task_type,
+            "tool_bundle": decision.tool_bundle,
+            "entities": trace.entity_resolution,
+            "route_trace": asdict(trace),
+        }
+
+    async def execute_node(state: CustomerSupportState) -> dict[str, Any]:
+        text = latest_customer_user_text(state.get("messages", []))
+        entities = extract_entities(text)
+        decision = classify_message(text, entities)
+        trace = make_trace(decision, entities, session_id=str(state.get("session_id", "")))
+        t0 = time.time()
+        try:
+            if decision.route == "knowledge":
+                answer = execute_knowledge_chain(text, decision, tool_map, trace)
+            elif decision.route == "ship_single":
+                answer = execute_simple_ship_chain(text, decision, entities, tool_map, trace)
+            elif decision.route == "ship_stats":
+                answer = execute_stats_chain(text, entities, tool_map, trace)
+            elif decision.route == "ship_complex":
+                answer = execute_complex_ship_chain(text, entities, tool_map, trace, max_loops=2)
+            elif decision.route == "ship_update":
+                if not allowed_write:
+                    trace.fallback_reason = "write action disabled by profile policy"
+                    trace.check_result = {"write_allowed": False}
+                    answer = "当前客服通道未开启船舶资料写操作。请联系人工客服处理：400-963-6899，微信客服：hifleetkhzs。"
+                else:
+                    answer = execute_update_chain(text, entities, tool_map, trace)
+            else:
+                trace.fallback_reason = "unsupported_route"
+                delegated = await fallback_agent.ainvoke(state, context=ctx)
+                delegated["route_trace"] = asdict(trace)
+                return delegated
+
+            trace.latency_hotspot["total"] = int((time.time() - t0) * 1000)
+            logger.info(
+                "[CustomerSupportTrace] run_id=%s session_id=%s route=%s task_type=%s sequence=%s loops=%s check=%s fallback=%s latency=%s confidence=%s",
+                trace.run_id,
+                trace.session_id,
+                trace.route,
+                trace.task_type,
+                trace.tool_call_sequence,
+                trace.loop_count,
+                trace.check_result,
+                trace.fallback_reason,
+                trace.latency_hotspot,
+                trace.answer_confidence,
+            )
+            return {
+                "messages": [AIMessage(content=answer)],
+                "route": trace.route,
+                "task_type": trace.task_type,
+                "tool_bundle": trace.tool_bundle,
+                "entities": trace.entity_resolution,
+                "route_trace": asdict(trace),
+                "fallback_reason": trace.fallback_reason,
+            }
+        except Exception as exc:
+            logger.exception("[CustomerSupportTrace] routed execution failed, fallback to standard agent: %s", exc)
+            trace.fallback_reason = f"routed_execution_error:{type(exc).__name__}"
+            delegated = await fallback_agent.ainvoke(state, context=ctx)
+            delegated["route_trace"] = asdict(trace)
+            delegated["fallback_reason"] = trace.fallback_reason
+            return delegated
+
+    graph = StateGraph(CustomerSupportState)
+    graph.add_node("route", route_node)
+    graph.add_node("execute", execute_node)
+    graph.add_edge(START, "route")
+    graph.add_edge("route", "execute")
+    graph.add_edge("execute", END)
+    return graph.compile(checkpointer=get_memory_saver())
+
+
 def build_agent(ctx=None, intent: str = ""):
     logger.info("[MainAgent] Building Hifleet agent graph")
     workspace_path = os.getenv("COZE_WORKSPACE_PATH")
@@ -553,6 +689,10 @@ def build_agent(ctx=None, intent: str = ""):
     if profile.profile_id == "employee_assistant":
         agent = _build_employee_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
         logger.info("[MainAgent] Employee loop graph built successfully")
+        return agent
+    if profile.profile_id == "customer_support":
+        agent = _build_customer_support_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+        logger.info("[MainAgent] Customer support routed graph built successfully")
         return agent
     agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
     logger.info("[MainAgent] Standard agent built successfully")
