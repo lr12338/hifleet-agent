@@ -551,7 +551,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         run_sandboxed_python,
     )
 
-    async def route_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def route_node(state: EmployeeAgentState) -> dict[str, Any]:
         user_text = _latest_user_text(state.get("messages", []))
         if is_sensitive_internal_request(user_text):
             return {
@@ -577,7 +577,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             "loop_count": int(state.get("loop_count") or 0),
         }
 
-    async def delegate_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def delegate_node(state: EmployeeAgentState) -> dict[str, Any]:
         if state.get("phase") == "done" and state.get("messages"):
             return dict(state)
         payload = {
@@ -588,14 +588,14 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             "agent_profile": state.get("agent_profile", profile.profile_id),
             "intent_hint": state.get("intent_hint", intent_hint),
         }
-        delegated = await standard_agent.ainvoke(payload, context=ctx)
+        delegated = standard_agent.invoke(payload, context=ctx)
         delegated["phase"] = "delegated"
         delegated["status"] = delegated.get("status", "delegated")
         delegated["phase_history"] = list(state.get("phase_history", [])) + ["delegated"]
         delegated["workspace_task"] = False
         return delegated
 
-    async def plan_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def plan_node(state: EmployeeAgentState) -> dict[str, Any]:
         target_file_path = state.get("target_file_path") or _extract_local_file_path(state.get("task_goal", ""))
         source_file_url = state.get("source_file_url") or _extract_public_file_url(state.get("task_goal", ""))
         phase_history = list(state.get("phase_history", []))
@@ -614,7 +614,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         phase_history.append("plan")
         return {"phase": "act", "phase_history": phase_history, "file_schema": schema, "target_file_path": target_file_path, "source_file_url": source_file_url}
 
-    async def act_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def act_node(state: EmployeeAgentState) -> dict[str, Any]:
         prompt = f"""
 你是 HiFleet employee_assistant 的受控 Python 执行器。
 目标：{state.get('task_goal', '')}
@@ -637,7 +637,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
 5. 生成文件时必须写入 `Path(os.environ['ARTIFACT_DIR'])` 目录。
 6. 不要使用 eval/exec/compile/getattr/setattr，也不要访问任何双下划线属性。
 """
-        response = await codegen_llm.ainvoke([
+        response = codegen_llm.invoke([
             SystemMessage(content="Return only executable Python code."),
             HumanMessage(content=prompt),
         ])
@@ -646,7 +646,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             raise RuntimeError("LLM returned empty python code")
         return {"phase": "check", "phase_history": list(state.get("phase_history", [])) + ["act"], "generated_code": code}
 
-    async def check_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def check_node(state: EmployeeAgentState) -> dict[str, Any]:
         attempt = int(state.get("loop_count") or 0) + 1
         raw = run_sandboxed_python.invoke(
             {
@@ -675,14 +675,14 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             },
         }
 
-    async def loop_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def loop_node(state: EmployeeAgentState) -> dict[str, Any]:
         return {
             "phase": "act",
             "phase_history": list(state.get("phase_history", [])) + ["loop"],
             "loop_count": int(state.get("loop_count") or 0) + 1,
         }
 
-    async def finalize_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def finalize_node(state: EmployeeAgentState) -> dict[str, Any]:
         return {
             "phase": "done",
             "status": "success",
@@ -690,7 +690,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             "messages": [AIMessage(content=_result_summary_message(state))],
         }
 
-    async def fail_node(state: EmployeeAgentState) -> dict[str, Any]:
+    def fail_node(state: EmployeeAgentState) -> dict[str, Any]:
         return {
             "phase": "failed",
             "status": "error",
@@ -748,7 +748,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             state_schema=AgentState,
         )
 
-    async def _classify_customer_support(messages: list[AnyMessage], entities: MessageEntities, context: ConversationContext) -> RouteDecision:
+    def _classify_customer_support(messages: list[AnyMessage], entities: MessageEntities, context: ConversationContext) -> RouteDecision:
         recent_questions = context.recent_user_questions[-6:]
         payload = {
             "latest_user_message": latest_customer_user_text(messages),
@@ -760,7 +760,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             },
             "intent_hint": intent_hint,
         }
-        result = await classifier_llm.ainvoke(
+        result = classifier_llm.invoke(
             [
                 SystemMessage(content=CUSTOMER_SUPPORT_INTENT_PROMPT),
                 HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
@@ -774,7 +774,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             decision.search_depth = "normal"
         return decision
 
-    async def route_node(state: CustomerSupportState) -> dict[str, Any]:
+    def route_node(state: CustomerSupportState) -> dict[str, Any]:
         messages = state.get("messages", [])
         text = latest_customer_user_text(messages)
         if is_sensitive_internal_request(text):
@@ -807,7 +807,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "loop_count": int(state.get("loop_count") or 0),
         }
 
-    async def delegate_node(state: CustomerSupportState) -> dict[str, Any]:
+    def delegate_node(state: CustomerSupportState) -> dict[str, Any]:
         if state.get("phase") == "done" and state.get("messages"):
             return dict(state)
         payload = {
@@ -818,19 +818,19 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "agent_profile": state.get("agent_profile", profile.profile_id),
             "intent_hint": state.get("intent_hint", intent_hint),
         }
-        delegated = await fallback_agent.ainvoke(payload, context=ctx)
+        delegated = fallback_agent.invoke(payload, context=ctx)
         delegated["phase"] = "delegated"
         delegated["status"] = delegated.get("status", "delegated")
         delegated["phase_history"] = list(state.get("phase_history", [])) + ["delegated"]
         delegated["support_task"] = False
         return delegated
 
-    async def plan_node(state: CustomerSupportState) -> dict[str, Any]:
+    def plan_node(state: CustomerSupportState) -> dict[str, Any]:
         messages = state.get("messages", [])
         text = state.get("task_goal", "") or latest_customer_user_text(messages)
         context = build_conversation_context(messages)
         entities = resolve_entities_with_context(extract_entities(text), context)
-        decision = await _classify_customer_support(messages, entities, context)
+        decision = _classify_customer_support(messages, entities, context)
         trace = make_trace(decision, entities, session_id=str(state.get("session_id", "")))
         logger.info(
             "[CustomerSupportRoute] run_id=%s session_id=%s route=%s task_type=%s bundle=%s entities=%s reason=%s",
@@ -852,7 +852,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "route_trace": asdict(trace),
         }
 
-    async def act_node(state: CustomerSupportState) -> dict[str, Any]:
+    def act_node(state: CustomerSupportState) -> dict[str, Any]:
         messages = state.get("messages", [])
         text = state.get("task_goal", "") or latest_customer_user_text(messages)
         context = build_conversation_context(messages)
@@ -863,7 +863,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 tool_calls: list[str] = []
             else:
                 tool_agent = _agent_for_bundle(list(state.get("tool_bundle", [])), entities, context)
-                tool_result = await tool_agent.ainvoke({"messages": messages}, context=ctx)
+                tool_result = tool_agent.invoke({"messages": messages}, context=ctx)
                 answer, tool_calls = _extract_final_ai_answer(tool_result)
             return {
                 "phase": "check",
@@ -880,7 +880,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 "fallback_reason": f"act_error:{type(exc).__name__}",
             }
 
-    async def check_node(state: CustomerSupportState) -> dict[str, Any]:
+    def check_node(state: CustomerSupportState) -> dict[str, Any]:
         raw_trace = dict(state.get("route_trace", {}) or {})
         trace = make_trace(
             RouteDecision(
@@ -931,14 +931,14 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "fallback_reason": trace.fallback_reason or "check_failed",
         }
 
-    async def loop_node(state: CustomerSupportState) -> dict[str, Any]:
+    def loop_node(state: CustomerSupportState) -> dict[str, Any]:
         return {
             "phase": "act",
             "phase_history": list(state.get("phase_history", [])) + ["loop"],
             "loop_count": int(state.get("loop_count") or 0) + 1,
         }
 
-    async def finalize_node(state: CustomerSupportState) -> dict[str, Any]:
+    def finalize_node(state: CustomerSupportState) -> dict[str, Any]:
         route_trace = dict(state.get("route_trace", {}) or {})
         started_at_ms = int(state.get("started_at_ms") or 0)
         if started_at_ms:
@@ -973,10 +973,10 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "fallback_reason": state.get("fallback_reason", ""),
         }
 
-    async def fail_node(state: CustomerSupportState) -> dict[str, Any]:
+    def fail_node(state: CustomerSupportState) -> dict[str, Any]:
         trace = dict(state.get("route_trace", {}) or {})
         trace["fallback_reason"] = state.get("fallback_reason", "") or "customer_support_fail"
-        delegated = await fallback_agent.ainvoke(
+        delegated = fallback_agent.invoke(
             {
                 "messages": state.get("messages", []),
                 "session_id": state.get("session_id", ""),
