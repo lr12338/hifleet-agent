@@ -164,6 +164,13 @@ def extract_entities(text: str) -> MessageEntities:
             bare_ship_match = re.search(r"(?:查询|查|search|where is)?\s*([A-Za-z][A-Za-z0-9 ._-]{2,40}?)(?:\s+|的|近期|最近|当前|历史){0,4}(?:船位|位置|档案|轨迹|挂靠|航次|psc)", normalized, flags=re.IGNORECASE)
             if bare_ship_match:
                 ship_name = bare_ship_match.group(1).strip()
+            else:
+                cn_ship_match = re.search(r"(?:查询|查)?\s*([\u4e00-\u9fffA-Za-z0-9·._-]{2,40}?)(?:的|近期|最近|当前|历史)?(?:船位|位置|档案|轨迹|挂靠|航次|psc)", normalized, flags=re.IGNORECASE)
+                if cn_ship_match:
+                    candidate = cn_ship_match.group(1).strip()
+                    stopwords = {"查询", "查", "船舶", "当前", "最近", "历史", "某船", "该船", "此船", "这艘船", "这个船"}
+                    if candidate and candidate not in stopwords:
+                        ship_name = candidate
 
     return MessageEntities(
         urls=urls,

@@ -105,6 +105,23 @@ def test_single_ship_position_resolves_bare_ship_name():
     assert "实时坐标" in output
 
 
+def test_single_ship_position_resolves_chinese_ship_name():
+    search = FakeTool("ship_search", lambda args: "育明 YU MING MMSI: 414726000 IMO: 9613886")
+    position = FakeTool("get_ship_position", lambda args: f"MMSI: {args['mmsi']}\n实时坐标：1,2")
+    text = "查询育明船位"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+
+    output = execute_simple_ship_chain(text, decision, entities, {"ship_search": search, "get_ship_position": position}, trace)
+
+    assert entities.ship_name == "育明"
+    assert decision.route == "ship_single"
+    assert search.calls == [{"keyword": "育明"}]
+    assert position.calls == [{"mmsi": "414726000"}]
+    assert "实时坐标" in output
+
+
 def test_stats_route_uses_stats_bundle():
     entities = extract_entities("查询曼德海峡 2026-06-01 到 2026-06-02 通航统计")
     decision = classify_message("查询曼德海峡 2026-06-01 到 2026-06-02 通航统计", entities)
