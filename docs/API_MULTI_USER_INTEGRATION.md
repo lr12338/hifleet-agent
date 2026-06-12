@@ -8,7 +8,7 @@
 - 正确选择客服或数字员工 Profile。
 - 出现慢请求、错误、工具异常时可在后台管理系统定位。
 
-注意：`customer_support` 当前先做确定性消息分类和工具 bundle 收缩，再执行工具或复杂 harness；调用方不需要也不应该直接指定底层工具。
+注意：`customer_support` 当前复用和 `employee_assistant` 同型的 phase graph，在 `plan` 阶段由 agent 判意图并收缩工具集；调用方不需要也不应该直接指定底层工具。
 
 ## 1. 核心接口
 

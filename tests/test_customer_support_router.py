@@ -8,14 +8,18 @@ from agents.customer_support_router import (
     SHIP_QUERY_BUNDLE,
     SHIP_STATS_BUNDLE,
     SHIP_VOYAGE_BUNDLE,
+    answer_conversation_memory,
+    build_conversation_context,
     classify_message,
     execute_complex_ship_chain,
     execute_knowledge_chain,
     execute_simple_ship_chain,
     extract_entities,
     make_trace,
+    resolve_entities_with_context,
     validate_links,
 )
+from langchain_core.messages import AIMessage, HumanMessage
 
 
 class FakeTool:
@@ -170,3 +174,77 @@ def test_complex_ship_fallback_when_identifier_missing():
 
     assert "需要先确定唯一 MMSI" in output
     assert trace.fallback_reason == "complex_ship_missing_mmsi"
+
+
+def test_context_memory_summary_does_not_route_to_search():
+    messages = [
+        HumanMessage(content="查询育明船位"),
+        AIMessage(content="YU MING\nMMSI: 414726000 | IMO: 9613886"),
+        HumanMessage(content="为什么更新这么慢"),
+        AIMessage(content="船位更新慢通常和 AIS 上报频率、岸基接收、卫星覆盖有关。"),
+        HumanMessage(content="上面我问了哪些问题，总结"),
+    ]
+    context = build_conversation_context(messages)
+    text = "上面我问了哪些问题，总结"
+    entities = resolve_entities_with_context(extract_entities(text), context)
+    decision = classify_message(text, entities, context)
+    output = answer_conversation_memory(text, context)
+
+    assert decision.route == "conversation"
+    assert "查询育明船位" in output
+    assert "为什么更新这么慢" in output
+
+
+def test_context_followup_reuses_last_ship_identity():
+    messages = [
+        HumanMessage(content="查询育明船位"),
+        AIMessage(content="YU MING\nMMSI: 414726000 | IMO: 9613886"),
+        HumanMessage(content="这艘船历史轨迹有哪些"),
+    ]
+    context = build_conversation_context(messages)
+    text = "这艘船历史轨迹有哪些"
+    entities = resolve_entities_with_context(extract_entities(text), context)
+    decision = classify_message(text, entities, context)
+
+    assert entities.mmsi == "414726000"
+    assert entities.imo == "9613886"
+    assert decision.route in {"ship_context", "ship_complex"}
+
+
+def test_platform_troubleshooting_followup_beats_ship_update():
+    messages = [
+        HumanMessage(content="hifleet船位更新很慢"),
+        HumanMessage(content="为什么更新这么慢"),
+    ]
+    context = build_conversation_context(messages)
+    text = "为什么更新这么慢"
+    entities = resolve_entities_with_context(extract_entities(text), context)
+    decision = classify_message(text, entities, context)
+
+    assert decision.route == "knowledge"
+    assert decision.task_type == "platform_troubleshooting"
+
+
+def test_ai_troubleshooting_reply_does_not_pollute_ship_context():
+    messages = [
+        HumanMessage(content="hifleet船位更新很慢"),
+        AIMessage(content="AIS 数据依赖岸基和卫星接收，远海会有延迟。"),
+        HumanMessage(content="为什么更新这么慢"),
+    ]
+    context = build_conversation_context(messages)
+    text = "为什么更新这么慢"
+    entities = resolve_entities_with_context(extract_entities(text), context)
+    decision = classify_message(text, entities, context)
+
+    assert context.last_ship_name == ""
+    assert entities.ship_name == ""
+    assert decision.task_type == "platform_troubleshooting"
+
+
+def test_platform_troubleshooting_phrase_is_not_misclassified_as_write():
+    text = "hifleet船位更新很慢"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+
+    assert decision.route == "knowledge"
+    assert decision.task_type == "platform_troubleshooting"

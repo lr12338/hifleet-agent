@@ -172,7 +172,7 @@ curl "http://127.0.0.1:10123/admin/logs?page=1&page_size=20&agent_profile=custom
 - `user_id`：用户定位。
 - `source_channel`：渠道。
 - `agent_profile`：从 request JSON 派生。
-- `route` / `task_type`：客服 routed graph 的分类结果。
+- `route` / `task_type`：客服 phase graph 在 `plan` 阶段的意图结果。
 
 ## 8. 排障流程
 
@@ -180,7 +180,7 @@ curl "http://127.0.0.1:10123/admin/logs?page=1&page_size=20&agent_profile=custom
 flowchart TD
     Symptom[用户反馈/接口错误] --> Logs[Logs 按 session_id/run_id 查询]
     Logs --> Detail[打开日志详情]
-    Detail --> Route[检查 profile/route/task_type/tool_bundle]
+    Detail --> Route[检查 profile/phase/route/task_type/tool_bundle]
     Route --> Tools[检查 tool_call_sequence 与 tool_invocations]
     Tools --> Latency[定位 latency_hotspot]
     Tools --> Error[检查 agent_errors]
@@ -190,6 +190,7 @@ flowchart TD
 
 客服 Agent 重点检查：
 
+- `phase_history` 是否按预期经过 `route -> plan -> act -> check`。
 - `route` 是否符合问题类型。
 - `tool_bundle` 是否收缩正确。
 - `entity_resolution` 是否抽到了 MMSI/IMO/船名/区域/日期。

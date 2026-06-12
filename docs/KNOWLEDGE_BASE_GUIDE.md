@@ -8,12 +8,12 @@
 
 ## 1. 当前检索链路
 
-`customer_support` 的平台问题只暴露 `knowledge bundle`，即 `smart_search`。
+`customer_support` 的平台问题在 `plan` 阶段被判定为 `knowledge` 后，只暴露 `knowledge bundle`，即 `smart_search`。
 
 ```mermaid
 flowchart TD
-    Q[用户平台问题] --> Route[customer_support_router 分类]
-    Route --> Smart[smart_search]
+    Q[用户平台问题] --> Plan[customer_support plan<br/>agent intent decision]
+    Plan --> Smart[smart_search]
     Smart --> L1[术语速查]
     L1 -->|命中| Done[返回标准解释]
     L1 -->|未命中| L2[FAQ/标准回复 KB]
@@ -82,10 +82,10 @@ https://www.hifleet.com/helpcenter/?i18n=zh
 - `task_type=platform_troubleshooting`
 - `tool_bundle=["smart_search"]`
 
-若误入 `ship_complex`，检查：
+若误入船舶链路，检查：
 
-- `src/agents/customer_support_router.py` 中平台故障词是否优先于 voyage markers。
-- 用户消息是否包含明确 MMSI/IMO/船名。
+- `src/agents/agent.py` 中客服意图判定 prompt 是否被近期修改。
+- 会话上下文是否错误继承了上一个船舶实体。
 
 ### 5.2 搜索太慢
 
@@ -136,4 +136,3 @@ SMART_SEARCH_DEEP_VARIANTS_MAX=3
 2. 用典型用户问法跑 `smart_search(depth="quick")`。
 3. 弱命中时补充关键词、标准问题或答案片段。
 4. 跑客服回归，确认没有触发不必要 `deep`。
-

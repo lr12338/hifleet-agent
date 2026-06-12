@@ -1,18 +1,18 @@
 # Customer Support Agent Regression
 
 This document describes the production-oriented regression workflow for the
-HiFleet `customer_support` routed agent.
+HiFleet `customer_support` phase-graph agent.
 
 ## Scope
 
 The regression validates the main production chain:
 
 1. Message normalization and entity extraction.
-2. Task classification.
+2. Intent classification in `plan`.
 3. Tool bundle shrinking.
 4. Fast knowledge path and search fallback.
 5. Single-step ship query.
-6. Multi-step ship analysis with plan/act/check/fallback.
+6. Multi-step ship analysis with `plan -> act -> check -> loop/fallback`.
 7. Ship statistics and area queries.
 8. Write-operation gating and explicit real write test.
 
@@ -132,6 +132,7 @@ The customer support chain is considered healthy when:
 
 - Platform fast-path questions stay within `knowledge` and do not expose ship tools.
 - Platform troubleshooting starts at `smart_search(depth="normal")`; quick KB can still be used for glossary/simple questions.
+- `phase_history` should normally include `route -> plan -> act -> check -> done` for successful客服请求。
 - Single-step ship queries use only the ship query bundle.
 - Complex ship questions use the voyage bundle and produce a trace with entity resolution, tool sequence, loop count, check result, fallback reason, latency, and confidence.
 - Write operations route only to `ship_update`; missing fields fail fast without mutation.

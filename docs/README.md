@@ -19,12 +19,9 @@
 flowchart LR
     Client[渠道/调用方] --> API[src/main.py]
     API --> Profile[profile 解析]
-    Profile --> CS{customer_support?}
-    CS -- yes --> Router[确定性消息路由]
-    Router --> Bundle[工具 bundle 收缩]
-    Bundle --> Harness[快路径或复杂 harness]
-    Harness --> Answer[校验后回复]
-    CS -- no --> Employee[employee_assistant loop]
+    Profile --> Graph[统一 phase graph]
+    Graph --> CS[customer_support<br/>route -> plan -> act -> check -> loop/finalize]
+    Graph --> Employee[employee_assistant<br/>route -> plan -> act -> check -> loop/finalize]
     API --> Obs[observability]
 ```
 
@@ -34,4 +31,3 @@ flowchart LR
 - 新增客服回归场景先更新 `scripts/hifleet_agent_regression.py`，再更新 `CUSTOMER_SUPPORT_AGENT_REGRESSION.md`。
 - 一次性导入报告、过期方案和历史记录放入 `docs/archive/`，不要作为主入口。
 - 文档中不要写入 API key、token、数据库密码或真实用户隐私数据。
-
