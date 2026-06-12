@@ -20,6 +20,8 @@ import json
 import urllib.request
 import urllib.parse
 
+from auth import public_api_key
+
 # 内置区域 ID 映射表
 AREA_ID_MAP = {
     "红海": "1", "Red Sea": "1", "redsea": "1",
@@ -75,16 +77,18 @@ def get_area_traffic(area_id: str = "", bbox: str = "", polygon: str = "") -> di
         API 原始响应字典
     """
     base = os.getenv("HIFLEET_API_BASE", "https://api.hifleet.com")
-    key = os.getenv("HIFLEET_API_KEY", "")
-    encoded_key = urllib.parse.quote(key, safe="")
-    parts = [f"usertoken={encoded_key}"]
+    key = public_api_key()
+    parts = []
+    if key:
+        parts.append(("api_key", key))
+        parts.append(("usertoken", key))
     if area_id:
-        parts.append(f"areaId={urllib.parse.quote(area_id, safe='')}")
+        parts.append(("areaId", area_id))
     if bbox:
-        parts.append(f"bbox={urllib.parse.quote(bbox, safe='')}")
+        parts.append(("bbox", bbox))
     if polygon:
-        parts.append(f"polygon={urllib.parse.quote(polygon, safe='')}")
-    url = f"{base}/position/gettraffic/token?{'&'.join(parts)}"
+        parts.append(("polygon", polygon))
+    url = f"{base}/position/gettraffic/token?{urllib.parse.urlencode(parts)}"
     with urllib.request.urlopen(url, timeout=10) as resp:
         return json.loads(resp.read().decode())
 

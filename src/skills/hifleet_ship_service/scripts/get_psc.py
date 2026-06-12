@@ -16,6 +16,8 @@ import json
 import urllib.request
 import urllib.parse
 
+from auth import psc_api_key
+
 
 def get_psc(imo: str) -> dict:
     """按 IMO 查询 PSC 检查记录。
@@ -27,9 +29,12 @@ def get_psc(imo: str) -> dict:
         API 原始响应字典
     """
     base = os.getenv("HIFLEET_API_BASE", "https://api.hifleet.com")
-    key = os.getenv("HIFLEET_API_KEY", "")
-    encoded_key = urllib.parse.quote(key, safe="")
-    url = f"{base}/pscapi/get?imo={urllib.parse.quote(imo, safe='')}&usertoken={encoded_key}"
+    key = psc_api_key()
+    params = {"imo": imo}
+    if key:
+        params["api_key"] = key
+        params["usertoken"] = key
+    url = f"{base}/pscapi/get?{urllib.parse.urlencode(params)}"
     with urllib.request.urlopen(url, timeout=10) as resp:
         return json.loads(resp.read().decode())
 

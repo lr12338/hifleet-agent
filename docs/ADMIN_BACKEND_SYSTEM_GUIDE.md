@@ -14,7 +14,81 @@ http://127.0.0.1:10123/admin-ui
 -H "x-admin-api-key: ${ADMIN_API_KEY}"
 ```
 
-## 2. 管理台架构
+## 2. 启动、停止与状态检查
+
+### 2.1 启动
+
+推荐使用统一启动脚本：
+
+```bash
+cd /home/ecs-user/coze_ai
+nohup scripts/start_system_service.sh > /tmp/coze_ai_10123.log 2>&1 &
+```
+
+脚本会：
+
+- 设置 `COZE_WORKSPACE_PATH`
+- 优先使用 `.venv`
+- 由 `src/main.py` 加载 `.env`
+- 固定监听 `10123`
+- 在需要时构建后台管理前端
+
+### 2.2 停止
+
+```bash
+pgrep -af 'src/main.py -m http -p 10123'
+kill <pid>
+```
+
+如果存在父子多进程，先杀父进程；必要时再检查端口是否释放。
+
+### 2.3 重启
+
+```bash
+cd /home/ecs-user/coze_ai
+pkill -f 'src/main.py -m http -p 10123' || true
+sleep 3
+nohup scripts/start_system_service.sh > /tmp/coze_ai_10123.log 2>&1 &
+```
+
+注意：不要同时启动多个 10123 实例，否则 worker 会报 `Address already in use`。
+
+### 2.4 健康检查
+
+本机环境可能配置 HTTP 代理，检查本地服务时建议绕过代理：
+
+```bash
+curl --noproxy '*' -i http://127.0.0.1:10123/health
+```
+
+期望：
+
+```json
+{"status":"ok","message":"Service is running"}
+```
+
+### 2.5 端口占用检查
+
+```bash
+ss -ltnp | grep ':10123'
+pgrep -af 'src/main.py -m http -p 10123'
+```
+
+### 2.6 日志
+
+启动日志：
+
+```bash
+tail -f /tmp/coze_ai_10123.log
+```
+
+应用日志默认位置：
+
+```text
+/tmp/app/work/logs/bypass/app.log
+```
+
+## 3. 管理台架构
 
 ```mermaid
 flowchart LR
@@ -29,7 +103,7 @@ flowchart LR
 
 管理台不单独部署服务，静态资源由 `src/main.py` 挂载在 `/admin-ui`，API 挂载在 `/admin/*`。
 
-## 3. 页面能力
+## 4. 页面能力
 
 | 页面 | 用途 |
 | --- | --- |
@@ -40,7 +114,7 @@ flowchart LR
 | API Playground | 构造 `/run`、`/stream_run` 请求 |
 | Config | 配置中心骨架页 |
 
-## 4. 关键接口
+## 5. 关键接口
 
 | 接口 | 说明 |
 | --- | --- |
@@ -60,7 +134,7 @@ curl "http://127.0.0.1:10123/admin/logs?page=1&page_size=20&agent_profile=custom
   -H "x-admin-api-key: ${ADMIN_API_KEY}"
 ```
 
-## 5. 代码地图
+## 6. 代码地图
 
 后端：
 
@@ -82,7 +156,7 @@ curl "http://127.0.0.1:10123/admin/logs?page=1&page_size=20&agent_profile=custom
 | `frontend/src/api/client.ts` | API client |
 | `frontend/src/pages/*` | Dashboard、Logs、Sessions、Chat Debug、Playground |
 
-## 6. 观测数据模型
+## 7. 观测数据模型
 
 主要表：
 
@@ -100,7 +174,7 @@ curl "http://127.0.0.1:10123/admin/logs?page=1&page_size=20&agent_profile=custom
 - `agent_profile`：从 request JSON 派生。
 - `route` / `task_type`：客服 routed graph 的分类结果。
 
-## 7. 排障流程
+## 8. 排障流程
 
 ```mermaid
 flowchart TD
@@ -122,7 +196,7 @@ flowchart TD
 - `tool_call_sequence` 是否有不必要调用。
 - `fallback_reason` 是否暴露授权、无数据或校验失败。
 
-## 8. 新增 Profile 或工具后的检查
+## 9. 新增 Profile 或工具后的检查
 
 1. 更新 `config/agent_profiles.json`。
 2. 更新 `config/agent_llm_config.json` 工具列表。
@@ -139,4 +213,3 @@ PY
 
 4. 在 Chat Debug 中分别测试 `customer_support` 和 `employee_assistant`。
 5. 到 Logs 检查 profile、route、tool 调用是否正确落库。
-

@@ -22,6 +22,8 @@ import json
 import urllib.request
 import urllib.parse
 
+from auth import public_api_key
+
 # 海峡 OID 映射表
 STRAIT_OID_MAP = {
     "霍尔木兹海峡": "24480", "Hormuz": "24480", "hormuz": "24480",
@@ -71,17 +73,12 @@ def get_strait_traffic(oid: str, startdate: str, enddate: str, i18n: str = "zh")
         API 原始响应字典
     """
     base = os.getenv("HIFLEET_API_BASE", "https://api.hifleet.com")
-    key = os.getenv("HIFLEET_API_KEY", "")
-    parts = [
-        f"oid={urllib.parse.quote(oid, safe='')}",
-        f"startdate={urllib.parse.quote(startdate, safe='')}",
-        f"enddate={urllib.parse.quote(enddate, safe='')}",
-        f"i18n={urllib.parse.quote(i18n, safe='')}",
-    ]
+    key = public_api_key()
+    parts = [("oid", oid), ("startdate", startdate), ("enddate", enddate), ("i18n", i18n)]
     if key:
-        encoded_key = urllib.parse.quote(key, safe="")
-        parts.append(f"usertoken={encoded_key}")
-    url = f"{base}/position/statisticzonetraffic?{'&'.join(parts)}"
+        parts.append(("api_key", key))
+        parts.append(("usertoken", key))
+    url = f"{base}/position/statisticzonetraffic?{urllib.parse.urlencode(parts)}"
     req = urllib.request.Request(url, method="POST", data=b"")
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())

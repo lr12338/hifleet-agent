@@ -38,6 +38,29 @@ flowchart TD
 
 配置文件：`config/agent_profiles.json`。
 
+## 2.1 船舶接口鉴权映射
+
+船舶工具不能统一使用单一 token。当前实现按接口选择 key，代码入口：
+
+- `src/skills/hifleet_ship_service/scripts/auth.py`
+- `src/skills/hifleet_ship_service/tools.py`
+
+| 能力 | 主要接口 | 首选环境变量 | 传参方式 |
+| --- | --- | --- | --- |
+| 船舶搜索 | `ttseapi /position/shipSearchText` | `hifleet_key2` | Query `usertoken` |
+| 船位/档案 | `/position/position/get/token`、`/shiparchive/getShipArchiveWithEnginAndCompany` | `api_key` | Query `api_key` + `usertoken` |
+| 航程 | `/position/trajectory/token`、`/position/getcallport/token`、`/position/getvoyagelist/token`、`/portofcall/getvoyages`、`/position/lastdeparture/token`、`/position/getstop/token` | `api_key` | Query `api_key` + `usertoken` |
+| 区域/海峡/红海绕航 | `/position/gettraffic/token`、`/position/statisticzonetraffic`、`/routerisk/getAvoidRedSeaDetail/token` | `api_key` | Query `api_key` + `usertoken` |
+| PSC | `/pscapi/get`、`/pscapi/openclaw/*` | `hifleet_key1` | Query `api_key` + `usertoken` |
+| 港口指南 | `/portguide/getPort/token`、`/portguide/getPortDetail/token` | 待授权 | Query `api_key` |
+| 内部写操作 | `ttseapi /updateShipAisInfo`、`/updateShipAisStaticInfo` | `hifleet_key2` | Query `usertoken` |
+
+兼容别名：
+
+- `HIFLEET_API_KEY` 应与 `api_key` 保持一致。
+- `HIFLEET_TTSE_KEY` 应与 `hifleet_key2` 保持一致。
+- 不要在日志、文档或回归报告中输出 key 值。
+
 ## 3. customer_support 消息处理链
 
 `customer_support` 不再默认把全部工具交给模型自由选择，而是先走确定性路由。
@@ -230,4 +253,3 @@ flowchart TD
 4. 为分类、bundle、harness 或 fallback 增加测试。
 5. 将真实 API 场景加入 `scripts/hifleet_agent_regression.py`。
 6. 更新本文档和回归文档。
-

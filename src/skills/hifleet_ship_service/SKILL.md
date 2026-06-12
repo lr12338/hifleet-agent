@@ -3,7 +3,7 @@ name: hifleet-ship-service
 version: 1.0.0
 description: >
   HiFleet 船舶智能服务：船舶搜索/船位查询/档案查询/PSC检查/区域船舶/海峡通航统计/船位上传/静态信息更新。
-  需配置 HIFLEET_API_KEY（api.hifleet.com 通用）和 HIFLEET_TTSE_KEY（ttseapi.hifleet.com 搜索服务）。
+  需按接口配置 api_key、hifleet_key1、hifleet_key2；兼容别名 HIFLEET_API_KEY=api_key、HIFLEET_TTSE_KEY=hifleet_key2。
   执行前须 read_file 对应分册。勿伪造数据。
 metadata:
   openclaw:
@@ -20,14 +20,14 @@ metadata:
 
 | 路由 | 能力 | 工具名 | API 端点 | 需 Token | 方法 |
 |------|------|--------|---------|----------|------|
-| A | 船舶搜索 | ship_search | `/position/shipSearchText` | HIFLEET_TTSE_KEY | GET |
-| B | 船位查询 | get_ship_position | `/position/position/get/token` | HIFLEET_API_KEY | GET |
-| C | 船舶档案 | get_ship_archive | `/shiparchive/getShipArchiveWithEnginAndCompany` | HIFLEET_API_KEY | GET |
-| D | PSC 检查记录 | get_psc_records | `/pscapi/get` | HIFLEET_API_KEY | GET |
-| E | 区域船舶数量 | get_area_traffic | `/position/gettraffic/token` | HIFLEET_API_KEY | GET |
-| F | 海峡通航统计 | get_strait_traffic | `/position/statisticzonetraffic` | 可选 | POST |
-| G | 船位上传 | upload_ship_position | `/position/updateShipAisInfo` | 无 | POST |
-| H | 静态信息更新 | update_ship_static_info | `/position/updateShipAisStaticInfo` | 无 | POST |
+| A | 船舶搜索 | ship_search | `/position/shipSearchText` | hifleet_key2 | GET |
+| B | 船位查询 | get_ship_position | `/position/position/get/token` | api_key | GET |
+| C | 船舶档案 | get_ship_archive | `/shiparchive/getShipArchiveWithEnginAndCompany` | api_key | GET |
+| D | PSC 检查记录 | get_psc_records | `/pscapi/get` | hifleet_key1 | GET |
+| E | 区域船舶数量 | get_area_traffic | `/position/gettraffic/token` | api_key | GET |
+| F | 海峡通航统计 | get_strait_traffic | `/position/statisticzonetraffic` | api_key | POST |
+| G | 船位上传 | upload_ship_position | `/position/updateShipAisInfo` | hifleet_key2 | POST |
+| H | 静态信息更新 | update_ship_static_info | `/position/updateShipAisStaticInfo` | hifleet_key2 | POST |
 
 ## 必读分册
 

@@ -64,17 +64,33 @@ def _api_base() -> str:
     return (os.getenv("HIFLEET_API_BASE") or "https://api.hifleet.com").rstrip("/")
 
 
-def _api_key() -> str:
-    return (
-        os.getenv("HIFLEET_API_KEY")
-        or os.getenv("api_key")
-        or os.getenv("hifleet_key1")
-        or ""
-    ).strip()
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
 
 
-def _http_json(method: str, path: str, params: dict) -> dict:
-    key = _api_key()
+def _public_api_key() -> str:
+    return _first_env("api_key", "HIFLEET_API_KEY", "hifleet_key1")
+
+
+def _psc_api_key() -> str:
+    return _first_env("hifleet_key1", "HIFLEET_API_KEY", "api_key")
+
+
+def _ttse_key() -> str:
+    return _first_env("hifleet_key2", "HIFLEET_TTSE_KEY", "HIFLEET_API_KEY")
+
+
+def _http_json(method: str, path: str, params: dict, auth_scope: str = "public") -> dict:
+    if auth_scope == "psc":
+        key = _psc_api_key()
+    elif auth_scope == "none":
+        key = ""
+    else:
+        key = _public_api_key()
     if key:
         params = {**params, "api_key": key, "usertoken": key}
     url = _api_base() + path + "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
@@ -296,6 +312,17 @@ def _format_psc_result(data: dict) -> str:
     """
     if not data:
         return "未找到PSC检查记录。"
+
+    code = data.get("code")
+    if code is not None:
+        try:
+            if int(code) >= 4000:
+                message = str(data.get("message") or data.get("msg") or "接口返回错误")
+                if "unauthor" in message.lower() or "token" in message.lower():
+                    return f"PSC接口授权不足，当前 token 无法访问该能力。原始错误：{message}"
+                return f"PSC接口返回错误（code={code}）：{message}"
+        except (TypeError, ValueError):
+            pass
 
     status = str(data.get("status", "-1"))
     if status not in ("0", "1"):
@@ -1088,9 +1115,8 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
         # 如果返回"群组未绑定账号"，尝试带token重试
         if isinstance(result, str) and "群组未绑定账号" in result:
             logger.info("[UploadPosition] Retrying with usertoken...")
-            api_key = os.getenv("HIFLEET_API_KEY", "")
-            ttse_key = os.getenv("HIFLEET_TTSE_KEY", "")
-            for key_name, key_val in [("API_KEY", api_key), ("TTSE_KEY", ttse_key)]:
+            ttse_key = _ttse_key()
+            for key_name, key_val in [("TTSE_KEY", ttse_key)]:
                 if not key_val:
                     continue
                 try:
@@ -1269,9 +1295,8 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
         # 如果返回"群组未绑定账号"，尝试带token重试
         if isinstance(result, str) and "群组未绑定账号" in result:
             logger.info("[UpdateStatic] Retrying with usertoken...")
-            api_key = os.getenv("HIFLEET_API_KEY", "")
-            ttse_key = os.getenv("HIFLEET_TTSE_KEY", "")
-            for key_name, key_val in [("API_KEY", api_key), ("TTSE_KEY", ttse_key)]:
+            ttse_key = _ttse_key()
+            for key_name, key_val in [("TTSE_KEY", ttse_key)]:
                 if not key_val:
                     continue
                 try:

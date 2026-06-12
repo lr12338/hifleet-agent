@@ -179,6 +179,13 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             "max_latency_ms": 20000,
         },
         {
+            "id": "ship_psc_imo",
+            "query": "查询 IMO 9613886 PSC 检查记录",
+            "expected_route": "ship_single",
+            "required_substrings": ["PSC", "检查"],
+            "max_latency_ms": 20000,
+        },
+        {
             "id": "ship_complex_last_port_voyage",
             "query": (
                 f"查询 MMSI {args.query_mmsi} 目的港是什么，"
@@ -216,7 +223,7 @@ def build_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
             "id": "avoid_redsea_daily",
             "query": f"查询红海绕航 {start_7d.strftime('%Y-%m-%d')} 到 {today} 每日统计",
             "expected_route": "ship_stats",
-            "required_substrings": ["红海", "授权"],
+            "required_substrings": ["获取数据成功"],
             "max_latency_ms": 20000,
         },
         {

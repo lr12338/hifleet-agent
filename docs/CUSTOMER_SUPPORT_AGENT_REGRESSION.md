@@ -62,6 +62,13 @@ reference scripts can execute the same API families.
 
 Do not print token values in logs or reports.
 
+Key routing:
+
+- Public ship APIs, voyage APIs, area/strait/redsea: prefer `api_key`.
+- PSC APIs: prefer `hifleet_key1`.
+- TTSE ship search and write APIs: prefer `hifleet_key2`.
+- Compatibility aliases should be kept aligned: `HIFLEET_API_KEY=api_key`, `HIFLEET_TTSE_KEY=hifleet_key2`.
+
 ## Scenario Matrix
 
 | ID | Purpose | Expected route | Expected tools |
@@ -70,6 +77,7 @@ Do not print token values in logs or reports.
 | `ship_position_mmsi` | Direct MMSI position | `ship_single` | `get_ship_position` |
 | `ship_position_name` | Bare ship-name resolution | `ship_single` | `ship_search`, `get_ship_position` |
 | `ship_archive_mmsi` | Archive by MMSI | `ship_single` | `get_ship_archive` |
+| `ship_psc_imo` | PSC records by IMO | `ship_single` | `get_psc_records` |
 | `ship_complex_last_port_voyage` | Destination / recent call / voyage consistency | `ship_complex` | archive, position, call ports, last departure, voyages |
 | `ship_complex_track_last_port` | Track history and last port by bare ship name | `ship_complex` | search, archive, position, trajectory, call ports, last departure |
 | `strait_traffic_mandeb` | Strait traffic statistics | `ship_stats` | `get_strait_traffic` |
@@ -83,7 +91,7 @@ Do not print token values in logs or reports.
 Safe read + guarded write validation:
 
 - Command: `.venv/bin/python scripts/hifleet_agent_regression.py`
-- Result: `10/10` passed
+- Result: `11/11` passed
 - Report: `artifacts/hifleet_agent_regression_report.json`
 
 Explicit write regression:
@@ -96,14 +104,15 @@ Explicit write regression:
 Observed latency in the latest successful run:
 
 - Glossary fast path: about `4 ms`
-- Direct ship position: about `290 ms`
-- Ship-name position with search: about `504 ms`
-- Ship archive: about `201 ms`
-- Complex voyage analysis: about `4.9 s`
-- Complex track/last-port analysis: about `1.5 s`
-- Strait traffic: about `1.2 s`
-- Area traffic bbox: about `607 ms`
-- Red Sea diversion auth failure: about `217 ms`
+- Direct ship position: about `320 ms`
+- Ship-name position with search: about `663 ms`
+- Ship archive: about `265 ms`
+- PSC by IMO: about `317 ms`
+- Complex voyage analysis: about `4.6 s`
+- Complex track/last-port analysis: about `2.3 s`
+- Strait traffic: about `1.4 s`
+- Area traffic bbox: about `649 ms`
+- Red Sea diversion: about `1.7 s`
 - Real write update: about `367 ms`
 
 ## Fixes From Regression
@@ -131,8 +140,6 @@ The customer support chain is considered healthy when:
 
 ## Known Remaining Risks
 
-- `routerisk/getAvoidRedSeaDetail/token` currently returns authorization error with the configured token. The agent handles this safely, but the capability remains unavailable until the token scope is expanded.
-- Port guide may also return authorization errors in this environment.
+- Port guide may return authorization errors in this environment until a `portguide` scoped key is issued.
 - Ship type can differ across APIs. The harness now reports this and treats archive as the stronger static source, but upstream data should be reconciled if this becomes user-facing noise.
 - `pytest` is not installed in the current virtual environment; unit tests are currently executable through the lightweight direct runner used in this work.
-

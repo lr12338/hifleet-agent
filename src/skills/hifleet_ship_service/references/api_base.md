@@ -4,36 +4,40 @@
 
 | 域名 | 用途 | 环境变量 |
 |------|------|---------|
-| `https://api.hifleet.com` | 通用 API（船位/档案/PSC/区域/海峡） | `HIFLEET_API_BASE`（可选，默认 api.hifleet.com） |
+| `https://api.hifleet.com` | 通用 API（船位/档案/PSC/区域/海峡/航程/红海绕航） | `HIFLEET_API_BASE`（可选，默认 api.hifleet.com） |
 | `http://ttseapi.hifleet.com` | 搜索服务（shipSearchText）+ 上传服务 | `HIFLEET_TTSE_BASE`（可选，默认 ttseapi.hifleet.com） |
 
 ## 认证
 
 | 环境变量 | 必填 | 适用域名 | 说明 |
 |---------|------|---------|------|
-| `HIFLEET_API_KEY` | 是 | api.hifleet.com | 通用 API 授权 |
-| `HIFLEET_TTSE_KEY` | 是 | ttseapi.hifleet.com | 搜索服务授权 |
+| `api_key` | 是 | api.hifleet.com | 船位、档案、航程、区域、海峡、红海绕航 |
+| `hifleet_key1` | 是 | api.hifleet.com | PSC 全系 |
+| `hifleet_key2` | 是 | ttseapi.hifleet.com | 文本搜船、船位上传、静态信息更新 |
+| `HIFLEET_API_KEY` | 兼容 | api.hifleet.com | 应与 `api_key` 保持一致 |
+| `HIFLEET_TTSE_KEY` | 兼容 | ttseapi.hifleet.com | 应与 `hifleet_key2` 保持一致 |
 
 ### 参数名规则
 
-- **api.hifleet.com**：当前使用 `usertoken` 参数名（值取 `HIFLEET_API_KEY`）
-- **ttseapi.hifleet.com**：使用 `usertoken` 参数名（值取 `HIFLEET_TTSE_KEY`）
-- **海峡通航**：同时支持 `usertoken` 和 `api_key`，甚至可不带 token
-- **注意**：Skills 仓库文档标准为 `api_key`，但当前服务端大部分 API 仅接受 `usertoken`
+- **api.hifleet.com 公开查询**：同时传 `api_key` 和 `usertoken`，值取 `api_key`。
+- **PSC**：同时传 `api_key` 和 `usertoken`，值取 `hifleet_key1`。
+- **ttseapi.hifleet.com**：传 `usertoken`，值取 `hifleet_key2`。
+- 不要把三类 key 混用；授权错误通常表现为 `code=4001`。
 
 ### 认证方式汇总
 
 | API | 域名 | 参数名 | 传递方式 |
 |-----|------|--------|---------|
-| shipSearchText | ttseapi | usertoken | Query 参数 |
-| position/get | api | usertoken | Query 参数 |
-| shiparchive | api | usertoken | Query 参数 |
-| pscapi/get | api | usertoken | Query 参数 |
-| areas | api | usertoken | Query 参数 |
-| gettraffic | api | usertoken | Query 参数 |
-| statisticzonetraffic | api | usertoken / api_key | Query 参数 |
-| updateShipAisInfo | ttseapi | 无 | POST JSON Body |
-| updateShipAisStaticInfo | ttseapi | 无 | POST JSON Body |
+| shipSearchText | ttseapi | usertoken=`hifleet_key2` | Query 参数 |
+| position/get | api | api_key/usertoken=`api_key` | Query 参数 |
+| shiparchive | api | api_key/usertoken=`api_key` | Query 参数 |
+| trajectory/callport/voyage/lastdeparture/getstop | api | api_key/usertoken=`api_key` | Query 参数 |
+| pscapi/get | api | api_key/usertoken=`hifleet_key1` | Query 参数 |
+| gettraffic / areas | api | api_key/usertoken=`api_key` | Query 参数 |
+| statisticzonetraffic | api | api_key/usertoken=`api_key` | Query 参数 |
+| getAvoidRedSeaDetail | api | api_key/usertoken=`api_key` | Query 参数 |
+| updateShipAisInfo | ttseapi | usertoken=`hifleet_key2` | Query 参数 + JSON Body |
+| updateShipAisStaticInfo | ttseapi | usertoken=`hifleet_key2` | Query 参数 + JSON Body |
 
 ## 错误码
 
@@ -41,7 +45,7 @@
 |------|---------|------|------|
 | 0 | - | 请求成功 | - |
 | 4001 | unauthoried | Token 无权限访问该 API | 检查 Token 权限或联系 HiFleet |
-| 4005 | token is empty | 未传 Token 或参数名错误 | 确认使用 `usertoken` 参数名 |
+| 4005 | token is empty | 未传 Token 或参数名错误 | 确认按接口传 `api_key/usertoken` |
 | 500 | - | 服务端错误 | 稍后重试 |
 
 ## 请求格式

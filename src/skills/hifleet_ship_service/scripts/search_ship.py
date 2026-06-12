@@ -17,6 +17,8 @@ import json
 import urllib.request
 import urllib.parse
 
+from auth import ttse_key
+
 
 def search_ship(keyword: str) -> str:
     """按关键字搜索船舶。
@@ -28,7 +30,7 @@ def search_ship(keyword: str) -> str:
         API 原始响应文本（纯文本格式，非JSON）
     """
     base = os.getenv("HIFLEET_TTSE_BASE", "http://ttseapi.hifleet.com")
-    key = os.getenv("HIFLEET_TTSE_KEY", "")
+    key = ttse_key()
     # 注意: usertoken含特殊字符(/+等)，不能用urlencode，需手动quote
     encoded_keyword = urllib.parse.quote(keyword, safe="")
     encoded_key = urllib.parse.quote(key, safe="")

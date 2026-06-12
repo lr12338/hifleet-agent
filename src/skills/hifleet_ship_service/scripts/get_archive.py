@@ -18,6 +18,8 @@ import json
 import urllib.request
 import urllib.parse
 
+from auth import public_api_key
+
 
 def get_archive(mmsi: str = "", imo: str = "") -> dict:
     """按 MMSI 或 IMO 查询船舶档案。
@@ -30,14 +32,16 @@ def get_archive(mmsi: str = "", imo: str = "") -> dict:
         API 原始响应字典
     """
     base = os.getenv("HIFLEET_API_BASE", "https://api.hifleet.com")
-    key = os.getenv("HIFLEET_API_KEY", "")
-    encoded_key = urllib.parse.quote(key, safe="")
-    parts = [f"usertoken={encoded_key}"]
+    key = public_api_key()
+    parts = []
+    if key:
+        parts.append(("api_key", key))
+        parts.append(("usertoken", key))
     if mmsi:
-        parts.append(f"mmsi={urllib.parse.quote(mmsi, safe='')}")
+        parts.append(("mmsi", mmsi))
     if imo:
-        parts.append(f"imo={urllib.parse.quote(imo, safe='')}")
-    url = f"{base}/shiparchive/getShipArchiveWithEnginAndCompany?{'&'.join(parts)}"
+        parts.append(("imo", imo))
+    url = f"{base}/shiparchive/getShipArchiveWithEnginAndCompany?{urllib.parse.urlencode(parts)}"
     with urllib.request.urlopen(url, timeout=10) as resp:
         return json.loads(resp.read().decode())
 

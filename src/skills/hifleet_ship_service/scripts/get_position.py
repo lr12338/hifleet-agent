@@ -18,6 +18,8 @@ import json
 import urllib.request
 import urllib.parse
 
+from auth import public_api_key
+
 
 def get_position(mmsi: str) -> dict:
     """按 MMSI 查询船舶实时位置。
@@ -29,10 +31,12 @@ def get_position(mmsi: str) -> dict:
         API 原始响应字典
     """
     base = os.getenv("HIFLEET_API_BASE", "https://api.hifleet.com")
-    key = os.getenv("HIFLEET_API_KEY", "")
-    # 注意: usertoken含特殊字符(/+等)，不能用urlencode，需手动quote
-    encoded_key = urllib.parse.quote(key, safe="")
-    url = f"{base}/position/position/get/token?mmsi={urllib.parse.quote(mmsi, safe='')}&usertoken={encoded_key}"
+    key = public_api_key()
+    params = {"mmsi": mmsi}
+    if key:
+        params["api_key"] = key
+        params["usertoken"] = key
+    url = f"{base}/position/position/get/token?{urllib.parse.urlencode(params)}"
     with urllib.request.urlopen(url, timeout=10) as resp:
         return json.loads(resp.read().decode())
 
