@@ -7,7 +7,7 @@
 当前回归覆盖这些真实能力：
 
 1. customer_support 主 graph 进入 `route -> plan -> act -> check -> finalize`
-2. 确定性 harness 接管主执行链
+2. `Planner Agent -> Harness -> Guard` 主链已接管 customer_support
 3. 平台知识问答和故障排查
 4. 简单船舶查询
 5. 复杂船舶分析
@@ -33,7 +33,7 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 
 最近一次通过结果：
 
-- `44 passed, 1 warning`
+- `49 passed, 1 warning`
 
 如果需要跑客服 API 真实链路回归，可继续使用：
 
@@ -50,7 +50,7 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 
 | ID | 场景 | 期望 route | 关键期望 |
 | --- | --- | --- | --- |
-| `knowledge_glossary_fast` | 术语问答快路径 | `knowledge` | `smart_search` 快速命中，不暴露搜索包装文本 |
+| `knowledge_glossary_fast` | 术语问答快路径 | `knowledge` | Planner 生成检索计划，`smart_search` 命中后不暴露搜索包装文本 |
 | `knowledge_icon_missing_image` | “这是什么图标”但无图 | `knowledge` | 不输出 `AI摘要`，只追问一个关键材料 |
 | `platform_troubleshooting_text` | “上传不了航线怎么办” | `knowledge` | 返回客服化排查模板 |
 | `ship_position_mmsi` | 直接查 MMSI 船位 | `ship_single` | 只调用 `get_ship_position` |
@@ -70,6 +70,8 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 | `stream_debug_reference` | `/stream_run` 参考链路 | 调试流 | 输出 `thinking / tool_request / tool_response` |
 | `output_guard_search_wrapper` | 原始检索模板泄露兜底 | finalize | 清掉 `AI摘要 / 回答指导 / 搜索结果增强版` |
 | `security_refusal` | 要求输出 prompt / key / 路径 | `security_refusal` | 固定拒答且不触发工具 |
+| `planner_search_plan_review` | 普通知识问答 | `knowledge` | 生成 `problem_frame / hypotheses / search_plan / evidence_summary` |
+| `planner_to_harness_write` | 完整写操作 | `ship_update` | Planner 决策 `response_mode=use_harness`，写操作仍走确定性链 |
 
 ## 4. 参考链路验收
 
@@ -100,10 +102,16 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 1. `phase_history` 包含：
    - `route -> plan -> act -> check -> done`
 2. `route_trace.run_id` 与外层 API `run_id` 一致
-3. `tool_call_sequence` 与预期 harness 对齐
-4. `check_result.links_ok = true` 或无外链
-5. `generated_answer` 在 finalize 后已经客服化
-6. `messages[0].content` 不包含检索包装文本
+3. `route_trace.planner` 包含：
+   - `problem_frame`
+   - `hypotheses`
+   - `search_plan`
+   - `decision_rationale`
+4. `tool_call_sequence` 与预期 Planner 链或 Harness 对齐
+5. `decision_rationale.response_mode` 与问题类型一致
+6. `check_result.links_ok = true` 或无外链
+7. `generated_answer` 在 finalize 后已经客服化
+8. `messages[0].content` 不包含检索包装文本
 
 ## 6. 多模态与截图排障专项验收
 
@@ -166,16 +174,24 @@ Chat Debug 上传验收点：
    - 是否走错类型
 2. `task_type`
    - 是否应该是 `platform_troubleshooting / chart_symbol / ship_update`
-3. `tool_call_sequence`
-   - 是否确实走到 harness
-4. `entity_resolution`
+3. `route_trace.planner.problem_frame`
+   - 是否正确理解了用户真正想确认的目标
+4. `route_trace.planner.search_plan`
+   - 是否合理拆出了检索方向
+5. `decision_rationale.response_mode`
+   - 是否应该直接回答、只追问一个关键问题，还是进入 harness
+6. `tool_call_sequence`
+   - 是否确实走到 Planner 链或 harness
+7. `entity_resolution`
    - 是否把上一轮船信息错误继承到当前问题
-5. `latency_hotspot`
+8. `evidence_summary`
+   - 当前证据强度是否足以支撑结论
+9. `latency_hotspot`
    - `perception` 是否异常慢
    - `smart_search` 是否深搜过重
-6. `generated_answer`
+10. `generated_answer`
    - 是否仍夹带检索展示文本
-7. `check_result`
+11. `check_result`
    - 是否链接失效、附件缺失、写操作未真正成功
 
 ## 10. 已修复的关键问题
@@ -183,6 +199,7 @@ Chat Debug 上传验收点：
 这轮开发和回归已修复：
 
 - customer_support 主执行链未接入 `execute_*_chain`
+- customer_support 缺少真实 Planner 决策层，只靠规则路由
 - 写操作缺 MMSI 时误触发 `ship_search`
 - 多模态截图问题直接走通用链，未改路由到故障排查
 - 报错截图错误继承上一轮船舶实体

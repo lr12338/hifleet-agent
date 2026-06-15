@@ -25,6 +25,7 @@ from agents.customer_support_router import (
     BROWSER_FALLBACK_BUNDLE,
     ConversationContext,
     Attachment,
+    HARNESSED_ROUTES,
     BROWSER_VERIFY_BUNDLE,
     FILE_BUNDLE,
     KNOWLEDGE_BUNDLE,
@@ -32,6 +33,7 @@ from agents.customer_support_router import (
     MULTIMODAL_BUNDLE,
     SHIP_QUERY_BUNDLE,
     answer_conversation_memory,
+    build_customer_support_plan,
     build_multimodal_search_query,
     build_conversation_context,
     classify_multimodal_message,
@@ -46,6 +48,8 @@ from agents.customer_support_router import (
     execute_file_chain,
     execute_knowledge_chain,
     execute_multimodal_chain,
+    execute_planned_knowledge_chain,
+    execute_planned_multimodal_chain,
     execute_simple_ship_chain,
     execute_stats_chain,
     execute_update_chain,
@@ -244,6 +248,61 @@ def _execute_customer_support_harness(
     return answer, asdict(trace)
 
 
+def _execute_customer_support_planner(
+    question: str,
+    route: str,
+    task_type: str,
+    tool_bundle: list[str],
+    entities: MessageEntities,
+    context: ConversationContext,
+    search_plan: list[dict[str, Any]] | None = None,
+    attachments: list[Attachment] | None = None,
+    perception: dict[str, Any] | None = None,
+    session_id: str = "",
+    run_id: str = "",
+) -> tuple[str, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    decision = RouteDecision(
+        route=route,
+        task_type=task_type,
+        tool_bundle=list(tool_bundle or []),
+        complexity="complex" if route in {"chart_symbol", "multimodal_understanding", "browser_verify"} else "simple",
+        search_depth="normal" if task_type == "platform_troubleshooting" else "quick",
+    )
+    trace = make_trace(decision, entities, session_id=session_id, run_id=run_id)
+    tool_map = {tool.name: tool for tool in SkillLoader.get_tools_by_names(decision.tool_bundle)}
+
+    if route == "conversation":
+        answer = answer_conversation_memory(question, context)
+        trace.check_result = {"conversation_context_used": True}
+        trace.answer_confidence = "high"
+        return answer, asdict(trace), [], {"confidence": "high", "can_answer_directly": True}
+
+    if route == "knowledge":
+        answer, evidence_items, evidence_summary = execute_planned_knowledge_chain(
+            question=question,
+            decision=decision,
+            search_plan=list(search_plan or []),
+            tool_map=tool_map,
+            trace=trace,
+        )
+        return answer, asdict(trace), evidence_items, evidence_summary
+
+    if route in {"chart_symbol", "multimodal_understanding"}:
+        answer, evidence_items, evidence_summary = execute_planned_multimodal_chain(
+            question=question,
+            attachments=list(attachments or []),
+            perception=dict(perception or {}),
+            decision=decision,
+            search_plan=list(search_plan or []),
+            tool_map=tool_map,
+            trace=trace,
+        )
+        return answer, asdict(trace), evidence_items, evidence_summary
+
+    trace.fallback_reason = "unsupported_planner_route"
+    return "", asdict(trace), [], {"confidence": "low", "can_answer_directly": False}
+
+
 def _heuristic_image_perception(attachments: list[Attachment], text: str = "") -> dict[str, Any]:
     """Best-effort local perception fallback for deterministic support tests and local uploads."""
     image = next((item for item in attachments if item.type == "image"), None)
@@ -388,6 +447,15 @@ class CustomerSupportState(TypedDict, total=False):
     entities: dict[str, Any]
     attachments: list[dict[str, Any]]
     perception_result: dict[str, Any]
+    problem_frame: dict[str, Any]
+    hypotheses: list[dict[str, Any]]
+    search_plan: list[dict[str, Any]]
+    evidence_items: list[dict[str, Any]]
+    evidence_summary: dict[str, Any]
+    decision_rationale: dict[str, Any]
+    missing_slot: dict[str, Any]
+    reasoning_public_trace: list[dict[str, Any]]
+    final_confidence: str
     evidence_pack: dict[str, Any]
     artifact_links: list[str]
     route_trace: dict[str, Any]
@@ -1000,6 +1068,14 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         )
         if perception_ms:
             trace.latency_hotspot["perception"] = perception_ms
+        planner_pack = build_customer_support_plan(
+            text=text,
+            decision=decision,
+            entities=entities,
+            context=context,
+            attachments=attachments,
+            perception=perception,
+        )
         evidence_pack: dict[str, Any] = {}
         if attachments:
             evidence_pack["augmented_text"] = build_multimodal_search_query(
@@ -1008,13 +1084,22 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 decision.route,
                 attachments[-1].type,
             )
+        trace_payload = asdict(trace)
+        trace_payload["planner"] = {
+            "problem_frame": dict(planner_pack.get("problem_frame", {}) or {}),
+            "hypotheses": list(planner_pack.get("hypotheses", []) or []),
+            "search_plan": list(planner_pack.get("search_plan", []) or []),
+            "decision_rationale": dict(planner_pack.get("decision_rationale", {}) or {}),
+            "reasoning_public_trace": list(planner_pack.get("reasoning_public_trace", []) or []),
+        }
         logger.info(
-            "[CustomerSupportRoute] run_id=%s session_id=%s route=%s task_type=%s bundle=%s entities=%s reason=%s",
+            "[CustomerSupportPlanner] run_id=%s session_id=%s route=%s task_type=%s bundle=%s response_mode=%s entities=%s reason=%s",
             trace.run_id,
             trace.session_id,
             decision.route,
             decision.task_type,
             decision.tool_bundle,
+            planner_pack.get("decision_rationale", {}).get("response_mode", ""),
             trace.entity_resolution,
             decision.reason,
         )
@@ -1027,33 +1112,70 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "entities": trace.entity_resolution,
             "attachments": [asdict(item) for item in attachments],
             "perception_result": perception,
+            "problem_frame": dict(planner_pack.get("problem_frame", {}) or {}),
+            "hypotheses": list(planner_pack.get("hypotheses", []) or []),
+            "search_plan": list(planner_pack.get("search_plan", []) or []),
+            "decision_rationale": dict(planner_pack.get("decision_rationale", {}) or {}),
+            "missing_slot": dict(planner_pack.get("missing_slot", {}) or {}),
+            "reasoning_public_trace": list(planner_pack.get("reasoning_public_trace", []) or []),
             "evidence_pack": evidence_pack,
-            "route_trace": asdict(trace),
+            "route_trace": trace_payload,
         }
 
     def act_node(state: CustomerSupportState) -> dict[str, Any]:
         messages = state.get("messages", [])
-        text = str((state.get("evidence_pack", {}) or {}).get("augmented_text") or state.get("task_goal", "") or latest_customer_user_text(messages))
+        question = str(state.get("task_goal", "") or latest_customer_user_text(messages))
+        text = str((state.get("evidence_pack", {}) or {}).get("augmented_text") or question)
         context = build_conversation_context(messages)
         entities = resolve_entities_with_context(
-            extract_entities(state.get("task_goal", "") or latest_customer_user_text(messages)),
+            extract_entities(question),
             context,
             allow_ship_context=should_use_ship_context(str(state.get("route", ""))),
         )
         attachments = [Attachment(**item) for item in list(state.get("attachments", []) or [])]
         try:
-            answer, route_trace = _execute_customer_support_harness(
-                text=text,
-                route=str(state.get("route", "")),
-                task_type=str(state.get("task_type", "")),
-                tool_bundle=list(state.get("tool_bundle", []) or []),
-                entities=entities,
-                context=context,
-                attachments=attachments,
-                perception=dict(state.get("perception_result", {}) or {}),
-                session_id=str(state.get("session_id", "")),
-                run_id=str((state.get("route_trace", {}) or {}).get("run_id", "")),
-            )
+            response_mode = str((state.get("decision_rationale", {}) or {}).get("response_mode", ""))
+            missing_slot = dict(state.get("missing_slot", {}) or {})
+            evidence_items: list[dict[str, Any]] = []
+            evidence_summary: dict[str, Any] = {}
+            base_route_trace = dict(state.get("route_trace", {}) or {})
+            if response_mode == "ask_one_question" and missing_slot.get("question"):
+                route_trace = dict(base_route_trace)
+                route_trace["check_result"] = {"ask_one_question": True, "missing_slot": missing_slot.get("field", "")}
+                route_trace["answer_confidence"] = "medium"
+                answer = str(missing_slot.get("question", "")).strip()
+            elif str(state.get("route", "")) in HARNESSED_ROUTES:
+                answer, route_trace = _execute_customer_support_harness(
+                    text=text,
+                    route=str(state.get("route", "")),
+                    task_type=str(state.get("task_type", "")),
+                    tool_bundle=list(state.get("tool_bundle", []) or []),
+                    entities=entities,
+                    context=context,
+                    attachments=attachments,
+                    perception=dict(state.get("perception_result", {}) or {}),
+                    session_id=str(state.get("session_id", "")),
+                    run_id=str((state.get("route_trace", {}) or {}).get("run_id", "")),
+                )
+                evidence_summary = {"confidence": str(route_trace.get("answer_confidence", "medium"))}
+            else:
+                answer, route_trace, evidence_items, evidence_summary = _execute_customer_support_planner(
+                    question=question,
+                    route=str(state.get("route", "")),
+                    task_type=str(state.get("task_type", "")),
+                    tool_bundle=list(state.get("tool_bundle", []) or []),
+                    entities=entities,
+                    context=context,
+                    search_plan=list(state.get("search_plan", []) or []),
+                    attachments=attachments,
+                    perception=dict(state.get("perception_result", {}) or {}),
+                    session_id=str(state.get("session_id", "")),
+                    run_id=str((state.get("route_trace", {}) or {}).get("run_id", "")),
+                )
+            if base_route_trace.get("planner"):
+                route_trace["planner"] = dict(base_route_trace.get("planner", {}) or {})
+            if evidence_summary:
+                route_trace["evidence_summary"] = dict(evidence_summary)
             if not answer:
                 raise RuntimeError(route_trace.get("fallback_reason") or "empty_harness_answer")
             return {
@@ -1063,6 +1185,9 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 "generated_tool_calls": list(route_trace.get("tool_call_sequence", []) or []),
                 "route_trace": route_trace,
                 "check_result": dict(route_trace.get("check_result", {}) or {}),
+                "evidence_items": evidence_items,
+                "evidence_summary": evidence_summary,
+                "final_confidence": str(evidence_summary.get("confidence") or route_trace.get("answer_confidence", "medium")),
             }
         except Exception as exc:
             logger.exception("[CustomerSupportTrace] act failed: %s", exc)
@@ -1100,16 +1225,17 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             links_ok, invalid_links = validate_links(answer)
             ok = ok and links_ok
             check_result = {
-                "harness_driven": True,
+                "harness_driven": str((state.get("decision_rationale", {}) or {}).get("response_mode", "")) == "use_harness",
                 "has_answer": bool(answer),
                 "links_ok": links_ok,
                 "invalid_links": invalid_links,
+                "evidence_count": len(list(state.get("evidence_items", []) or [])),
                 **dict(state.get("check_result", {}) or {}),
             }
             if invalid_links:
                 trace.fallback_reason = trace.fallback_reason or "invalid_links"
         trace.check_result = check_result
-        trace.answer_confidence = "high" if ok else "medium"
+        trace.answer_confidence = str(state.get("final_confidence", "") or ("high" if ok else "medium"))
         if ok:
             return {
                 "phase": "done",
@@ -1171,6 +1297,15 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "entities": dict(state.get("entities", {}) or {}),
             "attachments": list(state.get("attachments", []) or []),
             "perception_result": dict(state.get("perception_result", {}) or {}),
+            "problem_frame": dict(state.get("problem_frame", {}) or {}),
+            "hypotheses": list(state.get("hypotheses", []) or []),
+            "search_plan": list(state.get("search_plan", []) or []),
+            "evidence_items": list(state.get("evidence_items", []) or []),
+            "evidence_summary": dict(state.get("evidence_summary", {}) or {}),
+            "decision_rationale": dict(state.get("decision_rationale", {}) or {}),
+            "missing_slot": dict(state.get("missing_slot", {}) or {}),
+            "reasoning_public_trace": list(state.get("reasoning_public_trace", []) or []),
+            "final_confidence": str(state.get("final_confidence", "") or route_trace.get("answer_confidence", "medium")),
             "evidence_pack": dict(state.get("evidence_pack", {}) or {}),
             "artifact_links": list(state.get("artifact_links", []) or []),
             "route_trace": route_trace,

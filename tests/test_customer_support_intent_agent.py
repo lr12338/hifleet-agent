@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agents.agent import (
     _customer_support_route_for_intent,
     _execute_customer_support_harness,
+    _execute_customer_support_planner,
     _heuristic_image_perception,
     is_sensitive_internal_request,
 )
@@ -185,3 +186,30 @@ def test_reference_03_harness_returns_customer_style_anchor_area_answer(monkeypa
     assert "不是单船目标" in answer
     assert "放大后再截一张图" in answer
     assert trace["tool_call_sequence"] == ["inspect_media_attachment", "smart_search"]
+
+
+def test_customer_support_planner_handles_knowledge_without_harness(monkeypatch):
+    smart_search = FakeTool(
+        "smart_search",
+        lambda args: "【优先匹配 - FAQ/标准回复】\nHiFleet 绿点表示船位状态正常。\nhttps://www.hifleet.com/helpcenter/?i18n=zh",
+    )
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [smart_search])
+    text = "HiFleet 绿点是什么意思"
+    messages = [HumanMessage(content=text)]
+
+    answer, trace, evidence_items, evidence_summary = _execute_customer_support_planner(
+        question=text,
+        route="knowledge",
+        task_type="platform_knowledge",
+        tool_bundle=KNOWLEDGE_BUNDLE,
+        entities=extract_entities(text),
+        context=build_conversation_context(messages),
+        search_plan=[{"query": text, "depth": "quick", "hypothesis_id": "H1"}],
+        session_id="s1",
+        run_id="r1",
+    )
+
+    assert "绿点" in answer
+    assert trace["tool_call_sequence"] == ["smart_search"]
+    assert evidence_items
+    assert evidence_summary["confidence"] in {"medium", "high"}

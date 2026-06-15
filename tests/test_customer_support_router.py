@@ -14,12 +14,14 @@ from agents.customer_support_router import (
     SHIP_VOYAGE_BUNDLE,
     answer_conversation_memory,
     build_conversation_context,
+    build_customer_support_plan,
     classify_message,
     classify_multimodal_message,
     execute_complex_ship_chain,
     execute_browser_verify_chain,
     execute_file_chain,
     execute_knowledge_chain,
+    execute_planned_knowledge_chain,
     execute_multimodal_chain,
     execute_simple_ship_chain,
     execute_update_chain,
@@ -27,6 +29,7 @@ from agents.customer_support_router import (
     extract_entities,
     make_trace,
     refine_multimodal_route_with_perception,
+    review_evidence_items,
     resolve_entities_with_context,
     should_use_ship_context,
     validate_links,
@@ -307,6 +310,63 @@ def test_multimodal_chart_symbol_routes_to_chart_symbol():
     assert decision.task_type == "chart_symbol"
     assert decision.tool_bundle == MULTIMODAL_BUNDLE
     assert decision.search_depth == "deep"
+
+
+def test_customer_support_plan_uses_harness_for_ship_update():
+    text = "请更新船位 MMSI 414726000 经度 121.4737 纬度 31.2304"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    context = build_conversation_context([HumanMessage(content=text)])
+
+    plan = build_customer_support_plan(text, decision, entities, context, [], {})
+
+    assert plan["problem_frame"]["question_type"] == "ship_update"
+    assert plan["decision_rationale"]["response_mode"] == "use_harness"
+    assert plan["decision_rationale"]["need_harness"] is True
+
+
+def test_customer_support_plan_creates_multi_query_troubleshooting_search_plan():
+    text = "hifleet平台上传不了航线怎么办"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    context = build_conversation_context([HumanMessage(content=text)])
+
+    plan = build_customer_support_plan(text, decision, entities, context, [], {})
+
+    assert plan["problem_frame"]["question_type"] == "troubleshooting"
+    assert len(plan["search_plan"]) >= 2
+    assert any("上传航线" in item["query"] for item in plan["search_plan"])
+
+
+def test_execute_planned_knowledge_chain_records_evidence_review():
+    smart_search = FakeTool(
+        "smart_search",
+        lambda args: "【优先匹配 - FAQ/标准回复】\n标准答案\nhttps://www.hifleet.com/helpcenter/?i18n=zh",
+    )
+    text = "HiFleet 绿点是什么意思"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+    plan = build_customer_support_plan(text, decision, entities, build_conversation_context([HumanMessage(content=text)]), [], {})
+
+    output, evidence_items, evidence_summary = execute_planned_knowledge_chain(text, decision, plan["search_plan"], {"smart_search": smart_search}, trace)
+
+    assert "官方资料" in output or "标准答案" in output
+    assert evidence_items
+    assert evidence_summary["support_count"] >= 1
+    assert trace.check_result["evidence_count"] >= 1
+
+
+def test_review_evidence_items_prefers_official_sources():
+    summary = review_evidence_items(
+        [
+            {"source_type": "official_site", "supports": ["H1"]},
+            {"source_type": "public_web", "supports": ["H1"]},
+        ]
+    )
+
+    assert summary["official_support_count"] == 1
+    assert summary["confidence"] == "high"
 
 
 def test_file_attachment_routes_to_file_task():

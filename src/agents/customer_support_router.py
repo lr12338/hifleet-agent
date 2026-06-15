@@ -61,6 +61,9 @@ HIGH_COST_CAPABILITIES_BY_TASK = {
     "unsupported": [],
 }
 
+HARNESSED_ROUTES = {"ship_single", "ship_complex", "ship_context", "ship_stats", "ship_update", "file_task", "browser_verify"}
+PLANNER_DIRECT_ROUTES = {"knowledge", "chart_symbol", "multimodal_understanding", "conversation"}
+
 GENERIC_SHIP_NAME_STOPWORDS = {
     "查询",
     "查",
@@ -356,7 +359,7 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
         return RouteDecision("conversation", "conversation_memory", [], "simple", fallback_allowed=False, reason="conversation memory question")
 
     write_markers = ["更新", "上传", "修改", "补录", "update"]
-    troubleshooting_markers = ["异常", "失败", "无法", "不显示", "不刷新", "更新慢", "更新很慢", "更新这么慢", "这么慢", "太慢", "延迟", "收不到", "报错", "告警", "报警", "加载失败"]
+    troubleshooting_markers = ["异常", "失败", "无法", "上传不了", "上传失败", "不显示", "不刷新", "更新慢", "更新很慢", "更新这么慢", "这么慢", "太慢", "延迟", "收不到", "报错", "告警", "报警", "加载失败"]
     platform_markers = ["hifleet", "船队在线", "平台", "功能", "教程", "怎么", "如何", "规则", "配置", "帮助", "绿点", "岸基值班"]
     explicit_write_context = any(m in lower for m in ["上传", "补录", "修改", "更新静态", "更新船位"]) or bool(entities.mmsi and re.search(r"(经度|纬度|lon|lat|speed|heading|course|ship_name|船名|呼号|更新时间)", q, flags=re.IGNORECASE))
     is_troubleshooting = any(m in lower for m in troubleshooting_markers)
@@ -415,6 +418,180 @@ def classify_multimodal_message(text: str, attachments: list[Attachment], base_d
     if has_image:
         return RouteDecision("multimodal_understanding", "image_understanding", MULTIMODAL_BUNDLE, "complex", reason="image attachment")
     return base_decision
+
+
+def _planner_question_type(decision: RouteDecision) -> str:
+    if decision.route in {"ship_single", "ship_complex", "ship_context"}:
+        return "ship_query"
+    if decision.route == "ship_update":
+        return "ship_update"
+    if decision.route == "ship_stats":
+        return "ship_stats"
+    if decision.route == "file_task":
+        return "file_task"
+    if decision.task_type == "platform_troubleshooting":
+        return "troubleshooting"
+    if decision.route == "browser_verify":
+        return "verification"
+    if decision.route in {"chart_symbol", "multimodal_understanding"}:
+        return "multimodal"
+    if decision.route == "conversation":
+        return "conversation"
+    return "definition"
+
+
+def _planner_missing_slot(
+    decision: RouteDecision,
+    entities: MessageEntities,
+    attachments: list[Attachment],
+    perception: dict[str, Any],
+) -> dict[str, str]:
+    if decision.route in {"ship_single", "ship_complex", "ship_context"} and not (entities.mmsi or entities.imo or entities.ship_name):
+        return {
+            "field": "ship_identifier",
+            "question": "请提供 9 位 MMSI、IMO 或唯一船名，我再继续帮您查询。",
+        }
+    if decision.route == "ship_update" and not entities.mmsi:
+        return {
+            "field": "mmsi",
+            "question": "请提供 9 位 MMSI，我再为您继续处理更新。",
+        }
+    if decision.route in {"chart_symbol", "multimodal_understanding"} and attachments:
+        confidence = str((perception or {}).get("confidence", "")).lower()
+        if confidence in {"low", "very_low"}:
+            return {
+                "field": "clear_attachment",
+                "question": "请补一张更清晰的截图，最好把您想确认的位置圈出来，我再继续为您判断。",
+            }
+    if decision.route == "browser_verify" and not entities.urls:
+        return {
+            "field": "public_url",
+            "question": "请提供需要核验的公开网页链接，我再继续帮您确认。",
+        }
+    return {}
+
+
+def _planner_hypotheses(
+    decision: RouteDecision,
+    perception: dict[str, Any],
+) -> list[dict[str, Any]]:
+    suspected = normalize_message_text(str((perception or {}).get("suspected_symbol") or (perception or {}).get("suspected_issue") or ""))
+    observations = normalize_message_text(str((perception or {}).get("summary") or ""))
+    if decision.route == "chart_symbol":
+        if "安全水域" in suspected or ("红色" in observations and "黑点" in observations):
+            return [
+                {"id": "H1", "label": "安全水域浮标", "reason": "截图特征接近安全水域浮标常见表达。", "confidence": "medium", "status": "active"},
+                {"id": "H2", "label": "普通航标或图层标注", "reason": "仍需结合 HiFleet 图层资料排除简化图形。", "confidence": "low", "status": "active"},
+            ]
+        if "锚" in suspected or any(marker in observations for marker in ["小圈", "空心圆"]):
+            return [
+                {"id": "H1", "label": "锚地或锚泊区域范围标识", "reason": "截图中出现多个小圈，符合区域图层标识特征。", "confidence": "medium", "status": "active"},
+                {"id": "H2", "label": "普通图层标注点", "reason": "需排除非锚地的区域图层。", "confidence": "low", "status": "active"},
+            ]
+        return [{"id": "H1", "label": suspected or "海图符号识别", "reason": "需要结合截图和官方资料确认符号含义。", "confidence": "low", "status": "active"}]
+    if decision.task_type == "platform_troubleshooting":
+        return [
+            {"id": "H1", "label": "文件格式或字段内容异常", "reason": "故障排查优先检查文件和字段。", "confidence": "medium", "status": "active"},
+            {"id": "H2", "label": "浏览器/网络/缓存问题", "reason": "弱网、缓存和浏览器兼容性是常见原因。", "confidence": "low", "status": "active"},
+            {"id": "H3", "label": "账号权限或平台状态异常", "reason": "权限和平台状态也需要保留为候选原因。", "confidence": "low", "status": "active"},
+        ]
+    if decision.route in {"knowledge", "browser_verify"}:
+        return [{"id": "H1", "label": "官方资料可直接回答", "reason": "优先查本地知识库和 HiFleet 官方资料。", "confidence": "medium", "status": "active"}]
+    if decision.route == "multimodal_understanding":
+        return [{"id": "H1", "label": suspected or "附件内容识别", "reason": "先基于感知结果理解用户要确认的对象或异常。", "confidence": "medium", "status": "active"}]
+    return []
+
+
+def _planner_search_plan(
+    text: str,
+    decision: RouteDecision,
+    perception: dict[str, Any],
+    attachments: list[Attachment],
+    hypotheses: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    source_priority = ["local_kb", "official_site", "official_community", "public_web"]
+    if decision.route == "conversation":
+        return []
+    if decision.task_type == "platform_troubleshooting":
+        if "上传" in text and "航线" in text:
+            return [
+                {"hypothesis_id": "H1", "query": "HiFleet 上传航线 失败 文件格式 要求", "depth": "normal", "source_priority": source_priority, "purpose": "确认常见上传失败原因"},
+                {"hypothesis_id": "H1", "query": "HiFleet 计划航线 上传 经纬度 模板", "depth": "normal", "source_priority": source_priority, "purpose": "确认字段与模板要求"},
+                {"hypothesis_id": "H2", "query": "HiFleet 上传航线 浏览器 网络 权限", "depth": "deep", "source_priority": source_priority, "purpose": "补充浏览器、网络和权限排查"},
+            ]
+        return [
+            {"hypothesis_id": "H1", "query": text, "depth": decision.search_depth or "normal", "source_priority": source_priority, "purpose": "确认平台故障排查建议"},
+            {"hypothesis_id": "H2", "query": f"HiFleet {text} 浏览器 网络 缓存", "depth": "deep", "source_priority": source_priority, "purpose": "补充网络与缓存排查"},
+        ]
+    if decision.route == "chart_symbol":
+        attachment_type = attachments[-1].type if attachments else "image"
+        query = build_multimodal_search_query(text, perception, decision.route, attachment_type)
+        primary_id = hypotheses[0]["id"] if hypotheses else "H1"
+        return [
+            {"hypothesis_id": primary_id, "query": query, "depth": "deep", "source_priority": source_priority, "purpose": "结合截图特征确认海图符号含义"},
+            {"hypothesis_id": primary_id, "query": f"HiFleet 海图 {normalize_message_text(str((perception or {}).get('suspected_symbol') or '符号'))}", "depth": "normal", "source_priority": source_priority, "purpose": "用疑似名称二次核验"},
+        ]
+    if decision.route == "multimodal_understanding":
+        attachment_type = attachments[-1].type if attachments else "attachment"
+        return [
+            {"hypothesis_id": "H1", "query": build_multimodal_search_query(text, perception, decision.route, attachment_type), "depth": "normal", "source_priority": source_priority, "purpose": "结合附件感知结果补足检索"},
+        ]
+    if decision.route == "browser_verify":
+        return [{"hypothesis_id": "H1", "query": text, "depth": decision.search_depth or "normal", "source_priority": source_priority, "purpose": "核验官方网页与公开信息"}]
+    if decision.route == "knowledge":
+        return [{"hypothesis_id": "H1", "query": text, "depth": decision.search_depth or "quick", "source_priority": source_priority, "purpose": "优先从知识库和官方资料回答"}]
+    return []
+
+
+def build_customer_support_plan(
+    text: str,
+    decision: RouteDecision,
+    entities: MessageEntities,
+    context: ConversationContext,
+    attachments: list[Attachment],
+    perception: dict[str, Any],
+) -> dict[str, Any]:
+    missing_slot = _planner_missing_slot(decision, entities, attachments, perception)
+    question_type = _planner_question_type(decision)
+    hypotheses = _planner_hypotheses(decision, perception)
+    search_plan = _planner_search_plan(text, decision, perception, attachments, hypotheses)
+    response_mode = "use_harness" if decision.route in HARNESSED_ROUTES else "direct_answer"
+    if missing_slot and decision.route in PLANNER_DIRECT_ROUTES:
+        response_mode = "ask_one_question"
+    problem_frame = {
+        "user_goal": text or context.latest_user_text or "回答当前客服问题",
+        "question_type": question_type,
+        "needs_context": bool(context.previous_user_text),
+        "needs_attachment": decision.route in {"chart_symbol", "multimodal_understanding", "file_task"},
+        "needs_search": decision.route in {"knowledge", "chart_symbol", "multimodal_understanding", "browser_verify"},
+        "ambiguity_level": "high" if missing_slot else ("medium" if len(hypotheses) > 1 else "low"),
+        "critical_unknown": missing_slot.get("field", ""),
+    }
+    decision_rationale = {
+        "chosen_route": decision.route,
+        "why_not_other_routes": [
+            "不直接暴露内部执行细节，统一按客服话术收口。",
+            "高风险船舶、写操作、文件和核验任务仍走确定性执行链。",
+        ],
+        "need_harness": response_mode == "use_harness",
+        "response_mode": response_mode,
+    }
+    reasoning_public_trace = [
+        {"phase": "understand", "text": f"已识别当前问题类型：{question_type}。"},
+        {"phase": "hypothesis", "text": f"已形成 {len(hypotheses) or 1} 个候选解释，并优先保留最相关方向。"},
+    ]
+    if search_plan:
+        reasoning_public_trace.append({"phase": "search_plan", "text": f"已规划 {len(search_plan)} 条检索方向，优先本地知识库和 HiFleet 官方资料。"})
+    if missing_slot:
+        reasoning_public_trace.append({"phase": "missing_slot", "text": f"当前最关键的缺失信息是：{missing_slot['field']}。"})
+    return {
+        "problem_frame": problem_frame,
+        "hypotheses": hypotheses,
+        "search_plan": search_plan,
+        "missing_slot": missing_slot,
+        "decision_rationale": decision_rationale,
+        "reasoning_public_trace": reasoning_public_trace,
+    }
 
 
 def _multimodal_troubleshooting_markers() -> tuple[str, ...]:
@@ -749,6 +926,64 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
     return _format_general_knowledge_answer(text, output)
 
 
+def execute_planned_knowledge_chain(
+    question: str,
+    decision: RouteDecision,
+    search_plan: list[dict[str, Any]],
+    tool_map: dict[str, Any],
+    trace: HarnessTrace,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    queries = search_plan or [{"query": question, "depth": decision.search_depth or "quick", "hypothesis_id": "H1", "purpose": "回答当前问题"}]
+    outputs: list[str] = []
+    evidence_items: list[dict[str, Any]] = []
+    for item in queries:
+        query = str(item.get("query", "")).strip() or question
+        depth = str(item.get("depth", "")).strip() or decision.search_depth or "quick"
+        output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
+        outputs.append(output)
+        evidence_items.append(
+            {
+                "source_type": _guess_evidence_source_type(output),
+                "source_name": "smart_search",
+                "url": HELP_CENTER_URL if "helpcenter" in output.lower() else "",
+                "snippet": _extract_search_answer(output)[0][:240],
+                "supports": [str(item.get("hypothesis_id", "H1"))],
+                "conflicts": [],
+                "authority": 0.95 if "hifleet.com" in output.lower() else 0.75,
+                "relevance": 0.9 if not is_no_hit_text(output) else 0.4,
+                "query": query,
+                "depth": depth,
+                "purpose": str(item.get("purpose", "")),
+            }
+        )
+        if not is_no_hit_text(output) and _guess_evidence_source_type(output) in {"local_kb", "official_site", "official_community"}:
+            break
+    output = outputs[-1] if outputs else ""
+    if outputs and all(is_no_hit_text(item) for item in outputs) and decision.task_type == "platform_troubleshooting":
+        trace.fallback_reason = trace.fallback_reason or "normal_search_empty"
+    ok, invalid = validate_links(output)
+    if invalid:
+        cleaned = output
+        for url in invalid:
+            cleaned = cleaned.replace(url, "")
+        output = cleaned.strip() + f"\n\n可访问的官方帮助中心：{HELP_CENTER_URL}"
+        trace.fallback_reason = trace.fallback_reason or "invalid_links_removed"
+    evidence_summary = review_evidence_items(evidence_items)
+    trace.check_result = {
+        "links_ok": ok,
+        "invalid_links": invalid,
+        "planned_queries": [item.get("query", "") for item in queries],
+        "evidence_count": len(evidence_items),
+        "official_support_count": evidence_summary["official_support_count"],
+    }
+    trace.answer_confidence = evidence_summary["confidence"]
+    if "上传" in question and "航线" in question and any(marker in question for marker in ["不了", "失败", "怎么办", "无法"]):
+        return _format_route_upload_troubleshooting(output), evidence_items, evidence_summary
+    if decision.task_type == "platform_troubleshooting":
+        return _format_platform_troubleshooting_answer(question, output), evidence_items, evidence_summary
+    return _format_general_knowledge_answer(question, output), evidence_items, evidence_summary
+
+
 def _format_platform_troubleshooting_answer(question: str, search_output: str) -> str:
     q = normalize_message_text(question).lower()
     if any(marker in q for marker in ["error", "报错", "异常", "加载失败", "打不开", "不显示"]):
@@ -811,6 +1046,37 @@ def build_multimodal_search_query(text: str, perception: dict[str, Any], route: 
     if route == "chart_symbol":
         return " ".join(part for part in ["HiFleet 全球海图 海图符号", suspected, visible_text, observations, text] if part)
     return " ".join(part for part in [text, suspected, visible_text, observations] if part) or f"HiFleet {attachment_type} 附件问题"
+
+
+def _guess_evidence_source_type(output: str) -> str:
+    lowered = (output or "").lower()
+    if "helpcenter" in lowered or "www.hifleet.com" in lowered:
+        return "official_site"
+    if "wp/communities" in lowered:
+        return "official_community"
+    if "faq" in lowered or "标准回复" in lowered or "smart_search_l1_hit" in lowered:
+        return "local_kb"
+    return "public_web"
+
+
+def review_evidence_items(evidence_items: list[dict[str, Any]]) -> dict[str, Any]:
+    support_count = len(evidence_items)
+    official_support_count = sum(1 for item in evidence_items if item.get("source_type") in {"official_site", "official_community"})
+    conflict_count = sum(1 for item in evidence_items if item.get("conflicts"))
+    if support_count >= 2 and official_support_count >= 1 and conflict_count == 0:
+        confidence = "high"
+    elif support_count >= 1:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    return {
+        "best_hypothesis": (evidence_items[0].get("supports") or ["H1"])[0] if evidence_items else "",
+        "support_count": support_count,
+        "official_support_count": official_support_count,
+        "conflict_count": conflict_count,
+        "confidence": confidence,
+        "can_answer_directly": support_count > 0,
+    }
 
 
 def _format_multimodal_troubleshooting_answer(
@@ -895,6 +1161,77 @@ def execute_multimodal_chain(
     if is_multimodal_troubleshooting_signal(text, perception):
         return _format_multimodal_troubleshooting_answer(observations, visible_text, suspected, search)
     return format_customer_answer("\n\n".join(evidence), heading="结论需要结合截图识别和资料检索判断：")
+
+
+def execute_planned_multimodal_chain(
+    question: str,
+    attachments: list[Attachment],
+    perception: dict[str, Any],
+    decision: RouteDecision,
+    search_plan: list[dict[str, Any]],
+    tool_map: dict[str, Any],
+    trace: HarnessTrace,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    if not attachments:
+        trace.fallback_reason = "missing_attachment"
+        trace.check_result = {"attachment_present": False}
+        return "请上传需要分析的截图、语音、视频或文件，我会结合内容继续判断。", [], review_evidence_items([])
+
+    attachment = attachments[-1]
+    metadata = ""
+    if "inspect_media_attachment" in tool_map:
+        metadata = _invoke_tool(tool_map, trace, "inspect_media_attachment", {"file_url": attachment.url, "declared_type": attachment.type})
+
+    confidence = str(perception.get("confidence", "")).lower()
+    observations = normalize_message_text(str(perception.get("summary") or perception.get("observations") or ""))
+    visible_text = normalize_message_text(str(perception.get("visible_text") or ""))
+    suspected = normalize_message_text(str(perception.get("suspected_issue") or perception.get("suspected_symbol") or ""))
+    if confidence in {"low", "very_low"} and not observations and not visible_text and not suspected:
+        trace.fallback_reason = "low_multimodal_confidence"
+        trace.check_result = {"attachment_present": True, "confidence": confidence or "low"}
+        return "这张截图/附件里的关键信息不够清晰。请补充截图中想确认的具体位置或重新上传更清晰的图片。", [], review_evidence_items([])
+
+    queries = search_plan or [{"query": build_multimodal_search_query(question, perception, decision.route, attachment.type), "depth": decision.search_depth or "deep", "hypothesis_id": "H1"}]
+    outputs: list[str] = []
+    evidence_items: list[dict[str, Any]] = []
+    if "smart_search" in tool_map:
+        for item in queries:
+            query = str(item.get("query", "")).strip()
+            depth = str(item.get("depth", "")).strip() or decision.search_depth or "deep"
+            output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
+            outputs.append(output)
+            evidence_items.append(
+                {
+                    "source_type": _guess_evidence_source_type(output),
+                    "source_name": "smart_search",
+                    "url": HELP_CENTER_URL if "helpcenter" in output.lower() else "",
+                    "snippet": _extract_search_answer(output)[0][:240],
+                    "supports": [str(item.get("hypothesis_id", "H1"))],
+                    "conflicts": [],
+                    "authority": 0.95 if "hifleet.com" in output.lower() else 0.75,
+                    "relevance": 0.9 if not is_no_hit_text(output) else 0.4,
+                    "query": query,
+                    "depth": depth,
+                }
+            )
+            if not is_no_hit_text(output) and _guess_evidence_source_type(output) in {"local_kb", "official_site", "official_community"}:
+                break
+    search = outputs[-1] if outputs else ""
+    evidence_summary = review_evidence_items(evidence_items)
+    trace.check_result = {
+        "attachment_present": True,
+        "attachment_type": attachment.type,
+        "confidence": confidence or "medium",
+        "metadata_checked": bool(metadata),
+        "planned_queries": [item.get("query", "") for item in queries],
+        "evidence_count": len(evidence_items),
+    }
+    trace.answer_confidence = evidence_summary["confidence"]
+    if decision.route == "chart_symbol":
+        return _format_chart_symbol_answer(suspected=suspected, observations=observations, search_output=search), evidence_items, evidence_summary
+    if is_multimodal_troubleshooting_signal(question, perception):
+        return _format_multimodal_troubleshooting_answer(observations, visible_text, suspected, search), evidence_items, evidence_summary
+    return format_customer_answer("\n\n".join(part for part in [observations, visible_text, suspected, search] if part), heading="结论需要结合附件识别和资料检索判断："), evidence_items, evidence_summary
 
 
 def _format_chart_symbol_answer(suspected: str, observations: str, search_output: str) -> str:
