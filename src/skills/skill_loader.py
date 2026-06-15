@@ -50,6 +50,9 @@ class SkillLoader:
         "knowledge": "knowledge_qa",
         "ship": "hifleet_ship_service",
         "employee": "employee_workspace",
+        "multimodal": "multimodal_support",
+        "customer_file": "customer_workspace",
+        "browser": "browser_verify",
     }
 
     # 缓存
@@ -121,6 +124,9 @@ class SkillLoader:
             ],
             "knowledge_qa": ["smart_search"],
             "employee_workspace": ["download_public_file_to_artifact", "inspect_tabular_file", "run_sandboxed_python"],
+            "multimodal_support": ["inspect_media_attachment"],
+            "customer_workspace": ["inspect_customer_file", "upload_customer_artifact"],
+            "browser_verify": ["verify_public_page"],
         }
 
         if skill_name not in TOOL_MAP:

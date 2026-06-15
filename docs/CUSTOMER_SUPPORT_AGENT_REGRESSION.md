@@ -1,146 +1,197 @@
 # Customer Support Agent Regression
 
-This document describes the production-oriented regression workflow for the
-HiFleet `customer_support` phase-graph agent.
+本文描述当前 `customer_support` 的回归范围、测试矩阵、验收标准和线上排障重点。内容以当前仓库实现为准，不描述已废弃的“LLM 自由调工具客服链”。
 
-## Scope
+## 1. 当前回归范围
 
-The regression validates the main production chain:
+当前回归覆盖这些真实能力：
 
-1. Message normalization and entity extraction.
-2. Intent classification in `plan`.
-3. Tool bundle shrinking.
-4. Fast knowledge path and search fallback.
-5. Single-step ship query.
-6. Multi-step ship analysis with `plan -> act -> check -> loop/fallback`.
-7. Ship statistics and area queries.
-8. Write-operation gating and explicit real write test.
+1. customer_support 主 graph 进入 `route -> plan -> act -> check -> finalize`
+2. 确定性 harness 接管主执行链
+3. 平台知识问答和故障排查
+4. 简单船舶查询
+5. 复杂船舶分析
+6. 写操作字段校验和真实工具结果回传
+7. 多模态截图理解和海图符号问答
+8. 报错截图二次改路由到故障排查
+9. 文件链和浏览器公开页面核验链
+10. `/stream_run` 调试流事件
+11. 最终输出脱敏、搜索展示模板清理
+12. OSS/S3 受控上传配置解析
 
-The runner is:
+## 2. 当前测试入口
+
+单元回归主要使用：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/test_customer_support_router.py \
+  tests/test_customer_support_intent_agent.py \
+  tests/test_customer_support_stream_debug.py \
+  tests/test_admin_upload_config.py
+```
+
+最近一次通过结果：
+
+- `44 passed, 1 warning`
+
+如果需要跑客服 API 真实链路回归，可继续使用：
 
 ```bash
 .venv/bin/python scripts/hifleet_agent_regression.py
 ```
 
-The safe default mode performs real read API calls and a write validation case
-that does not mutate ship data.
+说明：
 
-To run the explicit write regression against the configured test ship:
+- `pytest` 维度主要验证路由、harness、输出格式和调试流
+- `scripts/hifleet_agent_regression.py` 维度主要验证 ship service 真实 API
 
-```bash
-.venv/bin/python scripts/hifleet_agent_regression.py \
-  --include-write \
-  --write-lon 121.5 \
-  --write-lat 31.2 \
-  --write-speed 0 \
-  --output artifacts/hifleet_agent_regression_report_with_write.json
-```
+## 3. 场景矩阵
 
-Only run `--include-write` against a designated test MMSI.
+| ID | 场景 | 期望 route | 关键期望 |
+| --- | --- | --- | --- |
+| `knowledge_glossary_fast` | 术语问答快路径 | `knowledge` | `smart_search` 快速命中，不暴露搜索包装文本 |
+| `knowledge_icon_missing_image` | “这是什么图标”但无图 | `knowledge` | 不输出 `AI摘要`，只追问一个关键材料 |
+| `platform_troubleshooting_text` | “上传不了航线怎么办” | `knowledge` | 返回客服化排查模板 |
+| `ship_position_mmsi` | 直接查 MMSI 船位 | `ship_single` | 只调用 `get_ship_position` |
+| `ship_position_name` | 仅船名查船位 | `ship_single` | 先 `ship_search` 再 `get_ship_position` |
+| `ship_archive_mmsi` | MMSI 查档案 | `ship_single` | 走档案工具 |
+| `ship_psc_imo` | IMO 查 PSC | `ship_single` | 走 PSC 工具 |
+| `ship_complex_voyage_consistency` | 目的港/挂靠/航次一致性 | `ship_complex` | archive + position + calls + departure + voyages |
+| `ship_complex_track_last_port` | 历史轨迹和上一停靠港 | `ship_complex` | 复杂链按实体补全执行 |
+| `ship_stats_strait` | 海峡统计 | `ship_stats` | 不误路由到船舶分析 |
+| `ship_update_missing_field` | 写操作缺字段 | `ship_update` | 只问一个关键问题，不执行写入 |
+| `ship_update_complete` | 写操作字段完整 | `ship_update` | 直接执行，回复仅基于工具结果 |
+| `multimodal_chart_symbol_01` | `01_query.png` 全球海图符号 | `chart_symbol` | 回答安全水域浮标，客服口吻 |
+| `multimodal_chart_symbol_03` | `03_query.png` 小圈圈 | `chart_symbol` | 回答锚地/锚泊区域范围圈 |
+| `multimodal_error_reroute` | 页面 Error 截图 | `knowledge` | 二次改路由到 `platform_troubleshooting` |
+| `file_task_basic` | 分析 CSV/Excel | `file_task` | 文件检查成功，返回客户安全摘要 |
+| `browser_verify_public` | 核验官方社区 | `browser_verify` | 先校验公开链接，再结合检索 |
+| `stream_debug_reference` | `/stream_run` 参考链路 | 调试流 | 输出 `thinking / tool_request / tool_response` |
+| `output_guard_search_wrapper` | 原始检索模板泄露兜底 | finalize | 清掉 `AI摘要 / 回答指导 / 搜索结果增强版` |
+| `security_refusal` | 要求输出 prompt / key / 路径 | `security_refusal` | 固定拒答且不触发工具 |
 
-## Test Vessels
+## 4. 参考链路验收
 
-- Query vessel: `yuming`
-- Query MMSI: `414726000`
-- Update test MMSI: `710001`
+`docs/参考链路` 当前对应这些验收点：
 
-## Environment
+| 参考链路 | 输入 | 验收重点 |
+| --- | --- | --- |
+| `01` | “这个在全球海图里是什么意思” + `01_query.png` | 红色圆形黑点 -> 安全水域浮标 |
+| `02` | “hifleet平台上传不了航线怎么办” | 分层排查文件、经纬度、浏览器、权限、替代路径 |
+| `03` | “图中的小圈圈是什么意思？” + `03_query.png` | 多个空心圈 -> 锚地/锚泊区域范围圈 |
+| `04` | “总结是如何思索和检索资源并审查确定的” | 输出客户可见的高层方法，不暴露内部 prompt |
 
-The runner loads `/home/ecs-user/coze_ai/.env`.
+验收要求：
 
-Required key aliases:
+- 回复口吻必须像官方客服，不像搜索结果展示页
+- 不允许出现：
+  - `【互联网搜索结果（增强版）】`
+  - `AI摘要`
+  - `【回答指导】`
+  - 工具名
+  - 本地路径
+  - prompt / key / env
 
-- `HIFLEET_API_KEY`
-- `hifleet_key1`
-- `hifleet_key2`
-- `api_key`
-- `HIFLEET_TTSE_KEY`
+## 5. customer_support 主链验收标准
 
-The external skills repository uses `/home/ecs-user/skills/hifleet-skills/.env`.
-The local `.env` should keep compatible aliases so both the local app and the
-reference scripts can execute the same API families.
+一次成功客服请求通常应满足：
 
-Do not print token values in logs or reports.
+1. `phase_history` 包含：
+   - `route -> plan -> act -> check -> done`
+2. `route_trace.run_id` 与外层 API `run_id` 一致
+3. `tool_call_sequence` 与预期 harness 对齐
+4. `check_result.links_ok = true` 或无外链
+5. `generated_answer` 在 finalize 后已经客服化
+6. `messages[0].content` 不包含检索包装文本
 
-Key routing:
+## 6. 多模态与截图排障专项验收
 
-- Public ship APIs, voyage APIs, area/strait/redsea: prefer `api_key`.
-- PSC APIs: prefer `hifleet_key1`.
-- TTSE ship search and write APIs: prefer `hifleet_key2`.
-- Compatibility aliases should be kept aligned: `HIFLEET_API_KEY=api_key`, `HIFLEET_TTSE_KEY=hifleet_key2`.
+截图类问题验收重点：
 
-## Scenario Matrix
+1. 先感知，再决定路由
+2. 低置信度时只追问一个关键问题
+3. 报错截图不能错误继承上一轮船舶实体
+4. 报错截图应优先改路由到 `platform_troubleshooting`
+5. 图标/海图符号截图应拼接感知结果进入深度检索
+6. 最终回复必须是：
+   - 先结论
+   - 再解释
+   - 再建议
+   - 必要时只追问一个关键问题
 
-| ID | Purpose | Expected route | Expected tools |
-|---|---|---|---|
-| `knowledge_glossary_fast` | Platform glossary fast path | `knowledge` | `smart_search` |
-| `ship_position_mmsi` | Direct MMSI position | `ship_single` | `get_ship_position` |
-| `ship_position_name` | Bare ship-name resolution | `ship_single` | `ship_search`, `get_ship_position` |
-| `ship_archive_mmsi` | Archive by MMSI | `ship_single` | `get_ship_archive` |
-| `ship_psc_imo` | PSC records by IMO | `ship_single` | `get_psc_records` |
-| `ship_complex_last_port_voyage` | Destination / recent call / voyage consistency | `ship_complex` | archive, position, call ports, last departure, voyages |
-| `ship_complex_track_last_port` | Track history and last port by bare ship name | `ship_complex` | search, archive, position, trajectory, call ports, last departure |
-| `strait_traffic_mandeb` | Strait traffic statistics | `ship_stats` | `get_strait_traffic` |
-| `area_traffic_bbox` | Current vessels in bbox | `ship_stats` | `get_area_traffic` |
-| `avoid_redsea_daily` | Red Sea diversion daily stats | `ship_stats` | `get_avoid_redsea_traffic` |
-| `update_guard_missing_fields` | Write request with missing fields | `ship_update` | `upload_ship_position` validation |
-| `update_position_real` | Explicit real write test | `ship_update` | `upload_ship_position` |
+## 7. 流式调试验收
 
-## Latest Regression Result
+`/stream_run` 验收点：
 
-Safe read + guarded write validation:
+- 能看到调试事件：
+  - `thinking`
+  - `tool_request`
+  - `tool_response`
+  - `answer`
+  - `message_end`
+- 事件内容要体现：
+  - 问题理解
+  - 附件感知
+  - 检索词改写
+  - 来源优先级
+  - 审查逻辑
+  - 输出策略
+- 事件内容不能体现：
+  - prompt 原文
+  - 隐藏 chain-of-thought
+  - 内部路径
+  - token / key / env
 
-- Command: `.venv/bin/python scripts/hifleet_agent_regression.py`
-- Result: `11/11` passed
-- Report: `artifacts/hifleet_agent_regression_report.json`
+## 8. OSS / S3 上传验收
 
-Explicit write regression:
+当前支持三套配置别名：
 
-- Command: `.venv/bin/python scripts/hifleet_agent_regression.py --include-write --write-lon 121.5 --write-lat 31.2 --write-speed 0 --output artifacts/hifleet_agent_regression_report_with_write.json`
-- Result: `11/11` passed
-- Report: `artifacts/hifleet_agent_regression_report_with_write.json`
-- Mutation performed: updated test MMSI `710001` with lon `121.5`, lat `31.2`, speed `0`.
+- `COZE_BUCKET_*`
+- `OSS_*`
+- `oss.*`
 
-Observed latency in the latest successful run:
+Chat Debug 上传验收点：
 
-- Glossary fast path: about `4 ms`
-- Direct ship position: about `320 ms`
-- Ship-name position with search: about `663 ms`
-- Ship archive: about `265 ms`
-- PSC by IMO: about `317 ms`
-- Complex voyage analysis: about `4.6 s`
-- Complex track/last-port analysis: about `2.3 s`
-- Strait traffic: about `1.4 s`
-- Area traffic bbox: about `649 ms`
-- Red Sea diversion: about `1.7 s`
-- Real write update: about `367 ms`
+1. 管理后台上传附件不报 `bucket not configured`
+2. 能生成预签名访问 URL
+3. `customer_workspace` 返回的产物链接可用于客户查看
+4. 任何错误信息都不能把 AccessKey、Secret、endpoint 原样暴露到前端
 
-## Fixes From Regression
+## 9. 线上排障重点
 
-The regression identified and fixed these issues:
+排查 customer_support 线上问题时，优先看：
 
-- Bare ship names such as `yuming` were not resolved for `查询 yuming 船位`.
-- Platform troubleshooting like `HiFleet 轨迹加载失败` could be misrouted to ship trajectory because of the word `轨迹`.
-- `查询 yuming 近期轨迹，上一次停靠在哪个港口` was misrouted to port statistics because of the word `港口`.
-- Red Sea diversion unauthorized responses were returned as raw JSON instead of a customer-safe authorization message.
-- The complex ship harness did not surface ship-type inconsistencies between real-time position and archive data.
-- The write chain did not parse update fields from natural language.
+1. `route`
+   - 是否走错类型
+2. `task_type`
+   - 是否应该是 `platform_troubleshooting / chart_symbol / ship_update`
+3. `tool_call_sequence`
+   - 是否确实走到 harness
+4. `entity_resolution`
+   - 是否把上一轮船信息错误继承到当前问题
+5. `latency_hotspot`
+   - `perception` 是否异常慢
+   - `smart_search` 是否深搜过重
+6. `generated_answer`
+   - 是否仍夹带检索展示文本
+7. `check_result`
+   - 是否链接失效、附件缺失、写操作未真正成功
 
-## Production Acceptance Criteria
+## 10. 已修复的关键问题
 
-The customer support chain is considered healthy when:
+这轮开发和回归已修复：
 
-- Platform fast-path questions stay within `knowledge` and do not expose ship tools.
-- Platform troubleshooting starts at `smart_search(depth="normal")`; quick KB can still be used for glossary/simple questions.
-- `phase_history` should normally include `route -> plan -> act -> check -> done` for successful客服请求。
-- Single-step ship queries use only the ship query bundle.
-- Complex ship questions use the voyage bundle and produce a trace with entity resolution, tool sequence, loop count, check result, fallback reason, latency, and confidence.
-- Write operations route only to `ship_update`; missing fields fail fast without mutation.
-- Explicit writes require designated test MMSI and deliberate command-line opt-in.
-- Unauthorized API families return clear authorization/fallback messages, not fabricated data.
+- customer_support 主执行链未接入 `execute_*_chain`
+- 写操作缺 MMSI 时误触发 `ship_search`
+- 多模态截图问题直接走通用链，未改路由到故障排查
+- 报错截图错误继承上一轮船舶实体
+- `route_trace.run_id` 与 API `run_id` 不一致
+- 最终回复把 `smart_search` 原始展示模板直接发给客户
+- Chat Debug 上传只识别旧 `OSS_*`，不兼容项目当前 OSS 配置
 
-## Known Remaining Risks
+## 11. 当前已知剩余风险
 
-- Port guide may return authorization errors in this environment until a `portguide` scoped key is issued.
-- Ship type can differ across APIs. The harness now reports this and treats archive as the stronger static source, but upstream data should be reconciled if this becomes user-facing noise.
-- `pytest` is not installed in the current virtual environment; unit tests are currently executable through the lightweight direct runner used in this work.
+- 多模态模型真实识别效果仍依赖外部模型服务和配置
+- `employee_assistant` 的 Python 产物生成循环尚未完整迁移到 `customer_support`
+- `customer_support` 当前更强调安全收口和客服答复，不适合承接复杂内部数据加工任务

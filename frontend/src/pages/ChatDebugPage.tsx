@@ -143,7 +143,7 @@ function createSession(seed = 1): ChatSession {
       session_id: `admin_chat_debug_${Date.now()}`,
       user_id: "admin_debug_user",
       source_channel: "admin_panel",
-      agent_profile: "employee_assistant"
+      agent_profile: "customer_support"
     },
     userMessages: [],
     assistantMessages: [],
@@ -224,7 +224,7 @@ function buildAttachmentMessage(file: File, url: string): Record<string, unknown
   if (mime.startsWith("video/")) {
     return { type: "video_url", video_url: { url } };
   }
-  throw new Error("仅支持图片、音频、视频附件");
+  return { type: "file_url", file_url: { url } };
 }
 
 function renderStatus(status: ChatSession["status"]) {
@@ -844,7 +844,7 @@ export function ChatDebugPage() {
     fileList: attachmentFiles,
     beforeUpload: () => false,
     onChange: ({ fileList }) => setAttachmentFiles(fileList),
-    accept: "image/*,audio/*,video/*"
+    accept: "image/*,audio/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md,.json,.xml,.rtz,.rux,.rx4"
   };
 
   const createNewSession = () => {
@@ -1240,7 +1240,7 @@ export function ChatDebugPage() {
               <div className="chat-debug-input-hints">
                 {!supportsAutoThinking ? <Typography.Text type="secondary">当前模型不支持自动判断</Typography.Text> : <Typography.Text type="secondary">默认按配置页自动路由，也可在此手动覆盖。</Typography.Text>}
                 <Space size={12} wrap>
-                  <Tooltip title="上传依赖环境变量：OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME / OSS_ENDPOINT">
+                  <Tooltip title="上传依赖环境变量：优先 COZE_BUCKET_NAME / COZE_BUCKET_ENDPOINT_URL / COZE_BUCKET_ACCESS_KEY / COZE_BUCKET_SECRET_KEY；兼容 OSS_BUCKET_NAME / OSS_ENDPOINT / OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET">
                     <Typography.Text style={{ color: "#2563eb", cursor: "help" }}>OSS配置提示</Typography.Text>
                   </Tooltip>
                   <Typography.Text type="secondary">{panelTitleMap[activePanel]} 面板</Typography.Text>

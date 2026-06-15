@@ -14,6 +14,7 @@ from fastapi import HTTPException, UploadFile
 from observability import repository
 from observability.schemas import LogListFilters
 from llm_config import export_llm_config_view, load_llm_config, resolve_model_selection, save_llm_config
+from storage.s3.s3_storage import S3SyncStorage
 
 from .schemas import AdminTestRunRequest, ArkAttachment, ArkChatRequest, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LLMConfigRequest, LogListQuery, SessionListQuery
 
@@ -223,6 +224,77 @@ def _build_oss_public_url(bucket_name: str, object_key: str, endpoint: str) -> s
     return f"{scheme}://{bucket_name}.{host}/{object_key}"
 
 
+def _first_env(*keys: str) -> str:
+    for key in keys:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _resolve_upload_storage_config() -> dict[str, str]:
+    """Resolve admin upload storage config, supporting both legacy OSS_* and COZE_BUCKET_* names."""
+    dotted_bucket = _first_env("oss.bucketName")
+    legacy_bucket = _first_env("OSS_BUCKET_NAME")
+    dotted_endpoint = _first_env("oss.endpoint")
+    legacy_endpoint = _first_env("OSS_ENDPOINT")
+    cfg = {
+        "bucket_name": _first_env("COZE_BUCKET_NAME", "oss.bucketName", "OSS_BUCKET_NAME", "S3_BUCKET_NAME", "AWS_BUCKET_NAME"),
+        "endpoint": _first_env("COZE_BUCKET_ENDPOINT_URL", "oss.endpoint", "OSS_ENDPOINT", "S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"),
+        "access_key": _first_env("COZE_BUCKET_ACCESS_KEY", "oss.accessKeyId", "OSS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+        "secret_key": _first_env("COZE_BUCKET_SECRET_KEY", "oss.accessKeySecret", "OSS_ACCESS_KEY_SECRET", "AWS_SECRET_ACCESS_KEY"),
+        "region": _first_env("COZE_BUCKET_REGION", "OSS_REGION", "AWS_REGION") or "cn-beijing",
+        "signed_url_expire_seconds": _first_env("oss.signedUrlExpireSeconds", "OSS_SIGNED_URL_EXPIRE_SECONDS", "COZE_BUCKET_SIGNED_URL_EXPIRE_SECONDS") or "600",
+    }
+    endpoint = cfg["endpoint"].lower()
+    cfg["provider"] = "aliyun_oss" if dotted_bucket or legacy_bucket or dotted_endpoint or legacy_endpoint or "aliyuncs.com" in endpoint else "s3"
+    missing = [name for name in ("bucket_name", "endpoint", "access_key", "secret_key") if not cfg[name]]
+    if missing:
+        aliases = {
+            "bucket_name": "COZE_BUCKET_NAME or oss.bucketName or OSS_BUCKET_NAME",
+            "endpoint": "COZE_BUCKET_ENDPOINT_URL or oss.endpoint or OSS_ENDPOINT",
+            "access_key": "COZE_BUCKET_ACCESS_KEY or oss.accessKeyId or OSS_ACCESS_KEY_ID",
+            "secret_key": "COZE_BUCKET_SECRET_KEY or oss.accessKeySecret or OSS_ACCESS_KEY_SECRET",
+        }
+        detail = "Storage upload is not configured. Missing: " + ", ".join(aliases[name] for name in missing)
+        raise HTTPException(status_code=500, detail=detail)
+    return cfg
+
+
+def _upload_to_aliyun_oss(*, cfg: dict[str, str], object_key: str, content: bytes, content_type: str) -> dict[str, Any]:
+    try:
+        import oss2
+    except Exception as exc:
+        raise RuntimeError("oss2 SDK is not installed; install dependency `oss2` to use Aliyun OSS upload") from exc
+
+    auth = oss2.Auth(cfg["access_key"], cfg["secret_key"])
+    bucket = oss2.Bucket(auth, cfg["endpoint"], cfg["bucket_name"])
+    result = bucket.put_object(object_key, content, headers={"Content-Type": content_type})
+    expire_seconds = int(cfg.get("signed_url_expire_seconds") or "600")
+    signed_url = bucket.sign_url("GET", object_key, expire_seconds)
+    return {
+        "key": object_key,
+        "url": signed_url,
+        "etag": getattr(result, "etag", None),
+    }
+
+
+def _upload_to_s3_compatible(*, cfg: dict[str, str], object_key: str, content: bytes, content_type: str) -> dict[str, Any]:
+    storage = S3SyncStorage(
+        endpoint_url=cfg["endpoint"],
+        access_key=cfg["access_key"],
+        secret_key=cfg["secret_key"],
+        bucket_name=cfg["bucket_name"],
+        region=cfg["region"],
+    )
+    key = storage.upload_file(file_content=content, file_name=object_key, content_type=content_type)
+    try:
+        url = storage.generate_presigned_url(key=key, bucket=cfg["bucket_name"], expire_time=int(cfg.get("signed_url_expire_seconds") or "600"))
+    except Exception:
+        url = _build_oss_public_url(cfg["bucket_name"], key, cfg["endpoint"])
+    return {"key": key, "url": url, "etag": None}
+
+
 def _sanitize_filename(filename: str) -> str:
     base = Path(filename or "file").name
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", base).strip("._")
@@ -247,50 +319,25 @@ async def upload_admin_file(file: UploadFile) -> dict[str, Any]:
     if len(raw_content) > max_mb * 1024 * 1024:
         raise HTTPException(status_code=400, detail=f"File too large, max {max_mb}MB")
 
-    bucket_name = os.getenv("OSS_BUCKET_NAME", "").strip()
-    endpoint = os.getenv("OSS_ENDPOINT", "").strip()
-    if not bucket_name:
-        raise HTTPException(status_code=500, detail="OSS_BUCKET_NAME is not configured")
-    if not endpoint:
-        raise HTTPException(status_code=500, detail="OSS_ENDPOINT is not configured")
-
-    for env_key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET"):
-        if not os.getenv(env_key, "").strip():
-            raise HTTPException(status_code=500, detail=f"{env_key} is not configured")
-
-    try:
-        import alibabacloud_oss_v2 as oss
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"OSS SDK not installed: {exc}") from exc
-
-    object_key = _build_object_key(file.filename)
+    storage_cfg = _resolve_upload_storage_config()
     content_type = file.content_type or "application/octet-stream"
+    object_key = _build_object_key(file.filename)
 
     try:
-        credentials_provider = oss.credentials.EnvironmentVariableCredentialsProvider()
-        cfg = oss.config.load_default()
-        cfg.credentials_provider = credentials_provider
-        cfg.region = os.getenv("OSS_REGION", "cn-beijing")
-        cfg.endpoint = endpoint
-        client = oss.Client(cfg)
-
-        put_req = oss.PutObjectRequest(
-            bucket=bucket_name,
-            key=object_key,
-            body=raw_content,
-            content_type=content_type,
-        )
-        result = client.put_object(put_req)
+        if storage_cfg.get("provider") == "aliyun_oss":
+            upload_result = _upload_to_aliyun_oss(cfg=storage_cfg, object_key=object_key, content=raw_content, content_type=content_type)
+        else:
+            upload_result = _upload_to_s3_compatible(cfg=storage_cfg, object_key=object_key, content=raw_content, content_type=content_type)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"OSS upload failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Storage upload failed: {exc}") from exc
 
     return {
-        "bucket": bucket_name,
-        "key": object_key,
-        "url": _build_oss_public_url(bucket_name, object_key, endpoint),
+        "bucket": storage_cfg["bucket_name"],
+        "key": upload_result["key"],
+        "url": upload_result["url"],
         "content_type": content_type,
         "size": len(raw_content),
-        "etag": getattr(result, "etag", None),
+        "etag": upload_result.get("etag"),
     }
 
 

@@ -129,13 +129,15 @@ WIKI_MIN_SCORE = 0.30
 # ══════════════════════════════════════════════════
 # 第4层：官网站内搜索配置
 # ══════════════════════════════════════════════════
-HIFLEET_SITES = "hifleet.com,help.hifleet.com,www.hifleet.com"
+HIFLEET_COMMUNITY_URL = "https://www.hifleet.com/wp/communities"
+HIFLEET_SITES = "hifleet.com,help.hifleet.com,www.hifleet.com,www.hifleet.com/wp/communities"
 
 # ══════════════════════════════════════════════════
 # 第5层：域名权威度加权表
 # ══════════════════════════════════════════════════
 DOMAIN_AUTHORITY = {
     "hifleet.com": 1.0, "help.hifleet.com": 1.0,
+    "www.hifleet.com": 1.0,
     "msa.gov.cn": 0.95, "mot.gov.cn": 0.90,
     "imo.org": 0.95,
     "xindemarinenews.com": 0.85,
@@ -278,9 +280,9 @@ def _search_hifleet_site(query: str, ctx) -> list:
         results = _filter_accessible_items(results, require_hifleet_domain=True)
         if not results:
             results = [{
-                "title": "HiFleet 帮助中心",
-                "url": DEFAULT_HELP_CENTER_URL,
-                "snippet": "官方平台使用与问题排查文档入口",
+                "title": "HiFleet 官方社区",
+                "url": HIFLEET_COMMUNITY_URL,
+                "snippet": "HiFleet 官方社区与产品信息入口",
                 "full_content": "",
                 "content_quality": "official_fallback",
             }]
@@ -565,7 +567,9 @@ def _format_site_result(site_results: list, query: str) -> str:
 
     parts = [f"【Hifleet官方站内搜索】"]
     for item in site_results:
+        source_label = "官方社区" if "wp/communities" in str(item.get("url", "")) else "官网/帮助中心"
         parts.append(f"\n**{item['title']}**")
+        parts.append(f"来源：{source_label}")
         if item["full_content"]:
             parts.append(f"内容摘要：{item['full_content'][:800]}...")
         elif item["snippet"]:
@@ -574,6 +578,8 @@ def _format_site_result(site_results: list, query: str) -> str:
 
     if DEFAULT_HELP_CENTER_URL not in [str(i.get("url", "")) for i in site_results]:
         parts.append(f"\n🔗 官方帮助中心入口：{DEFAULT_HELP_CENTER_URL}")
+    if HIFLEET_COMMUNITY_URL not in [str(i.get("url", "")) for i in site_results]:
+        parts.append(f"🔗 官方社区入口：{HIFLEET_COMMUNITY_URL}")
 
     parts.append("\n---\n【回答指导】\n- 以上来自Hifleet官方网站，可直接引用。")
     return "\n".join(parts)

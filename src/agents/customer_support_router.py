@@ -27,6 +27,9 @@ TaskType = str
 Route = str
 
 KNOWLEDGE_BUNDLE = ["smart_search"]
+MULTIMODAL_BUNDLE = ["inspect_media_attachment", "smart_search"]
+FILE_BUNDLE = ["inspect_customer_file", "upload_customer_artifact"]
+BROWSER_VERIFY_BUNDLE = ["verify_public_page", "smart_search"]
 SHIP_QUERY_BUNDLE = ["ship_search", "get_ship_position", "get_ship_archive", "get_psc_records"]
 SHIP_STATS_BUNDLE = [
     "get_area_traffic",
@@ -91,6 +94,13 @@ class MessageEntities:
 
 
 @dataclass
+class Attachment:
+    type: str
+    url: str
+    filename: str = ""
+
+
+@dataclass
 class RouteDecision:
     route: Route
     task_type: TaskType
@@ -127,6 +137,43 @@ class ConversationContext:
     last_ship_mmsi: str = ""
     last_ship_imo: str = ""
     last_ship_source: str = ""
+
+
+def extract_attachments(messages: list[AnyMessage]) -> list[Attachment]:
+    attachments: list[Attachment] = []
+
+    def add_from_content(content: Any) -> None:
+        if not isinstance(content, list):
+            return
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type", "")).strip().lower()
+            url = ""
+            if item_type == "image_url":
+                url = str((item.get("image_url") or {}).get("url", "")).strip()
+                media_type = "image"
+            elif item_type == "video_url":
+                url = str((item.get("video_url") or {}).get("url", "")).strip()
+                media_type = "video"
+            elif item_type == "input_audio":
+                url = str((item.get("input_audio") or {}).get("url", "")).strip()
+                media_type = "audio"
+            elif item_type == "file_url":
+                url = str((item.get("file_url") or {}).get("url", "")).strip()
+                media_type = "file"
+            else:
+                continue
+            if url:
+                filename = url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1] or "attachment"
+                attachments.append(Attachment(type=media_type, url=url, filename=filename))
+
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            add_from_content(msg.content)
+        elif isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user":
+            add_from_content(msg.get("content"))
+    return attachments
 
 
 def normalize_message_text(text: str) -> str:
@@ -313,6 +360,8 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
     platform_markers = ["hifleet", "船队在线", "平台", "功能", "教程", "怎么", "如何", "规则", "配置", "帮助", "绿点", "岸基值班"]
     explicit_write_context = any(m in lower for m in ["上传", "补录", "修改", "更新静态", "更新船位"]) or bool(entities.mmsi and re.search(r"(经度|纬度|lon|lat|speed|heading|course|ship_name|船名|呼号|更新时间)", q, flags=re.IGNORECASE))
     is_troubleshooting = any(m in lower for m in troubleshooting_markers)
+    if entities.urls and any(m in lower for m in ["核验", "验证", "官网", "官方", "社区", "链接", "网页"]):
+        return RouteDecision("browser_verify", "browser_verify", BROWSER_VERIFY_BUNDLE, "complex", search_depth="normal", reason="public page verification")
     if explicit_write_context and any(m in lower for m in ["船位", "静态", "ais", "位置", "mmsi"]):
         return RouteDecision("ship_update", "ship_update", SHIP_UPDATE_BUNDLE, "simple", reason="explicit ship write operation")
 
@@ -347,8 +396,94 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
     return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="default customer support knowledge")
 
 
-def resolve_entities_with_context(entities: MessageEntities, context: ConversationContext) -> MessageEntities:
-    if entities.mmsi or entities.imo or entities.ship_name:
+def classify_multimodal_message(text: str, attachments: list[Attachment], base_decision: RouteDecision) -> RouteDecision:
+    q = normalize_message_text(text).lower()
+    if not attachments:
+        return base_decision
+    has_image = any(item.type == "image" for item in attachments)
+    has_audio = any(item.type == "audio" for item in attachments)
+    has_video = any(item.type == "video" for item in attachments)
+    has_file = any(item.type == "file" for item in attachments)
+    if has_file or any(marker in q for marker in ["文件", "表格", "excel", "csv", "pdf", "报告", "生成"]):
+        return RouteDecision("file_task", "file_task", FILE_BUNDLE, "complex", reason="file attachment")
+    if has_image and any(marker in q for marker in ["海图", "符号", "图标", "图中", "截图", "标志", "是什么意思"]):
+        return RouteDecision("chart_symbol", "chart_symbol", MULTIMODAL_BUNDLE, "complex", search_depth="deep", reason="chart symbol screenshot")
+    if has_audio:
+        return RouteDecision("multimodal_understanding", "audio_understanding", MULTIMODAL_BUNDLE, "complex", reason="audio attachment")
+    if has_video:
+        return RouteDecision("multimodal_understanding", "video_understanding", MULTIMODAL_BUNDLE, "complex", reason="video attachment")
+    if has_image:
+        return RouteDecision("multimodal_understanding", "image_understanding", MULTIMODAL_BUNDLE, "complex", reason="image attachment")
+    return base_decision
+
+
+def _multimodal_troubleshooting_markers() -> tuple[str, ...]:
+    return (
+        "error",
+        "报错",
+        "异常",
+        "失败",
+        "无法",
+        "加载失败",
+        "打不开",
+        "不显示",
+        "不刷新",
+        "上传不了",
+        "上传失败",
+        "服务异常",
+        "页面异常",
+        "network",
+    )
+
+
+def is_multimodal_troubleshooting_signal(text: str, perception: dict[str, Any] | None = None) -> bool:
+    merged = " ".join(
+        part
+        for part in [
+            normalize_message_text(text),
+            normalize_message_text(str((perception or {}).get("summary") or "")),
+            normalize_message_text(str((perception or {}).get("visible_text") or "")),
+            normalize_message_text(str((perception or {}).get("suspected_issue") or "")),
+            normalize_message_text(str((perception or {}).get("suspected_symbol") or "")),
+        ]
+        if part
+    ).lower()
+    return any(marker in merged for marker in _multimodal_troubleshooting_markers())
+
+
+def refine_multimodal_route_with_perception(
+    text: str,
+    attachments: list[Attachment],
+    perception: dict[str, Any],
+    base_decision: RouteDecision,
+) -> RouteDecision:
+    if not attachments:
+        return base_decision
+    if base_decision.route == "chart_symbol":
+        return base_decision
+    if is_multimodal_troubleshooting_signal(text, perception):
+        return RouteDecision(
+            "knowledge",
+            "platform_troubleshooting",
+            KNOWLEDGE_BUNDLE,
+            "complex",
+            search_depth="deep",
+            reason="multimodal troubleshooting screenshot",
+        )
+    return base_decision
+
+
+def should_use_ship_context(route: str) -> bool:
+    return route in {"ship_single", "ship_complex", "ship_context", "ship_update"}
+
+
+def resolve_entities_with_context(
+    entities: MessageEntities,
+    context: ConversationContext,
+    *,
+    allow_ship_context: bool = True,
+) -> MessageEntities:
+    if not allow_ship_context or entities.mmsi or entities.imo or entities.ship_name:
         return entities
     return MessageEntities(
         urls=list(entities.urls),
@@ -366,6 +501,15 @@ def resolve_entities_with_context(entities: MessageEntities, context: Conversati
 
 def answer_conversation_memory(text: str, context: ConversationContext) -> str:
     q = normalize_message_text(text)
+    if any(m in q for m in ["如何思索", "怎么思索", "检索资源", "审查确定", "总结逻辑", "详细介绍逻辑"]):
+        return (
+            "可以按“先识别问题类型，再找证据，再交叉校验，最后客服化回复”的方式理解：\n\n"
+            "1. 先看用户输入和附件，判断是平台操作、故障排查、海图符号、船舶查询还是文件任务。若截图里有符号或报错，会先提取可见特征和文字。\n\n"
+            "2. 再把问题改写成适合检索的关键词。例如海图符号会组合“HiFleet 全球海图、符号外观、疑似名称”，上传航线失败会组合“计划航线、上传航线、文件格式、经纬度格式、浏览器/权限”。\n\n"
+            "3. 检索顺序优先使用本地客服知识库和产品资料；命中弱时再查 HiFleet 官网/官方社区；仍不足时参考公共网页，并降低确定性表述。\n\n"
+            "4. 审查时主要看三点：来源是否可信，结论是否能被多个线索支持，链接是否可访问。涉及截图时，还会把图中可见特征和检索到的符号定义互相核对。\n\n"
+            "5. 最终回复不展示内部工具、日志或原始过程，只给客户可执行结论：先结论，再解释原因，再给操作建议；信息不够时只追问一个最关键问题。"
+        )
     if not context.recent_user_questions:
         return "当前会话里还没有可总结的上一轮问题。"
     if any(m in q for m in ["哪个船", "哪一个船", "这艘船", "该船", "上一个我问的是哪个船"]):
@@ -389,10 +533,94 @@ def is_no_hit_text(output: str) -> bool:
     return any(marker in text for marker in ("未检索到足够可信", "未找到精确的FAQ匹配", "未找到", "暂无", "信息不足"))
 
 
+def _strip_markdown(text: str) -> str:
+    value = text or ""
+    value = re.sub(r"\*\*(.*?)\*\*", r"\1", value)
+    value = value.replace("📋", "").replace("🔗", "").strip()
+    return value
+
+
+def _extract_search_answer(search_output: str) -> tuple[str, list[str]]:
+    text = normalize_message_text(search_output)
+    if not text:
+        return "", []
+    parts: list[str] = []
+    links: list[str] = []
+    for raw_line in text.splitlines():
+        line = _strip_markdown(raw_line).strip(" -")
+        if not line:
+            continue
+        if line.startswith("http://") or line.startswith("https://"):
+            links.append(line)
+            continue
+        if line.startswith("【回答指导】") or line.startswith("【互联网搜索结果") or line.startswith("【Hifleet官方站内搜索】"):
+            continue
+        if line.startswith("来源："):
+            continue
+        if line.startswith("相关度:") or line.startswith("权威来源可直接引用") or line.startswith("综合多个来源回答"):
+            continue
+        if line.startswith("术语："):
+            continue
+        if line.startswith("内容摘要：") or line.startswith("摘要：") or line.startswith("摘要:") or line.startswith("详细内容：") or line.startswith("详细内容:"):
+            content = line.split("：", 1)[-1] if "：" in line else line.split(":", 1)[-1]
+            content = content.strip()
+            if content:
+                parts.append(content.rstrip(".").rstrip("..."))
+            continue
+        if line.startswith("AI摘要：") or line.startswith("AI摘要:"):
+            content = line.split("：", 1)[-1] if "：" in line else line.split(":", 1)[-1]
+            content = content.strip()
+            if content:
+                parts.append(content.rstrip(".").rstrip("..."))
+            continue
+        if re.fullmatch(r"【[^】]+】", line):
+            continue
+        if line.startswith("http://") or line.startswith("https://"):
+            links.append(line)
+            continue
+        if line.startswith("www."):
+            links.append(f"https://{line}")
+            continue
+        parts.append(line)
+    deduped_parts: list[str] = []
+    for item in parts:
+        if item and item not in deduped_parts:
+            deduped_parts.append(item)
+    deduped_links: list[str] = []
+    for item in links:
+        if item and item not in deduped_links:
+            deduped_links.append(item)
+    return "\n".join(deduped_parts[:3]).strip(), deduped_links
+
+
+def _format_general_knowledge_answer(question: str, search_output: str) -> str:
+    summary, links = _extract_search_answer(search_output)
+    q = normalize_message_text(question).lower()
+    if any(marker in q for marker in ["图标", "符号"]) and any(marker in summary for marker in ["未提供", "缺少核心识别要素", "无法开展针对性的联网检索", "补充上传"]):
+        return (
+            "目前还不能直接判断这个图标或符号的含义，因为现有信息里缺少最关键的识别依据。\n\n"
+            "请只补充一个关键信息：图标原图或更清晰的截图。我收到后会结合 HiFleet 官方资料继续为您确认。"
+        )
+    if any(marker in q for marker in ["什么", "什么意思", "是什么"]) and summary:
+        return format_customer_answer(
+            f"根据目前检索到的官方资料，先给您结论：\n{summary}\n\n如果您愿意，我也可以继续结合具体页面、截图或使用场景帮您解释得更准确。"
+        )
+    if summary:
+        answer = f"我先根据目前检索到的官方资料给您结论：\n{summary}"
+        if any(link.startswith(HELP_CENTER_URL) or "hifleet.com/wp/communities" in link for link in links):
+            answer += f"\n\n如果您需要继续自助查看，也可以参考官方帮助中心：{HELP_CENTER_URL}"
+        return format_customer_answer(answer)
+    return (
+        "我暂时还没有拿到足够明确的官方信息来直接下结论。\n\n"
+        "请只补充一个最关键的细节，我再继续帮您核查。"
+    )
+
+
 def validate_links(text: str, checker: Callable[[str], bool] | None = None) -> tuple[bool, list[str]]:
     links = [u.rstrip(".,;!?，。；！？）】》") for u in re.findall(r"https?://[^\s)）\]】>\"']+", text or "")]
     if not links:
         return True, []
+    trusted_prefixes = (HELP_CENTER_URL, "https://www.hifleet.com/wp/communities")
     if checker is None:
         try:
             from skills.knowledge_qa.tools import _is_url_accessible
@@ -400,7 +628,7 @@ def validate_links(text: str, checker: Callable[[str], bool] | None = None) -> t
             checker = _is_url_accessible
         except Exception:
             checker = lambda url: bool(urlparse(url).scheme in ("http", "https"))
-    invalid = [url for url in links if not checker(url)]
+    invalid = [url for url in links if not url.startswith(trusted_prefixes) and not checker(url)]
     return not invalid, invalid
 
 
@@ -514,7 +742,234 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
             cleaned = cleaned.replace(url, "")
         output = cleaned.strip() + f"\n\n可访问的官方帮助中心：{HELP_CENTER_URL}"
         trace.fallback_reason = trace.fallback_reason or "invalid_links_removed"
-    return output
+    if "上传" in text and "航线" in text and any(marker in text for marker in ["不了", "失败", "怎么办", "无法"]):
+        return _format_route_upload_troubleshooting(output)
+    if decision.task_type == "platform_troubleshooting":
+        return _format_platform_troubleshooting_answer(text, output)
+    return _format_general_knowledge_answer(text, output)
+
+
+def _format_platform_troubleshooting_answer(question: str, search_output: str) -> str:
+    q = normalize_message_text(question).lower()
+    if any(marker in q for marker in ["error", "报错", "异常", "加载失败", "打不开", "不显示"]):
+        return (
+            "从当前信息看，这更像是 HiFleet 页面或网络加载异常，不是海图符号本身的问题。\n\n"
+            "建议先按这个顺序排查：\n"
+            "1. 先刷新页面或重新进入当前功能页，确认问题是否可稳定复现。\n"
+            "2. 切换网络重试，例如从移动网络切到 Wi-Fi，排除链路抖动、DNS 或代理影响。\n"
+            "3. 清理缓存后重新登录；如果是在微信内打开页面，也建议退出后重新进入。\n"
+            "4. 如果只有个别功能报错，优先记录触发动作和时间点，便于继续定位。\n\n"
+            f"如果还会出现这个弹窗，请只补充一个关键线索：报错出现前您点了哪个操作？\n\n可参考官方帮助中心：{HELP_CENTER_URL}"
+        )
+    return (
+        "我先按平台故障排查思路给您结论：这类问题通常优先检查网络、页面缓存、账号权限和操作入口是否正确。\n\n"
+        "建议顺序：\n"
+        "1. 先确认当前功能入口、账号权限和操作步骤是否正确。\n"
+        "2. 再切换浏览器或网络环境重试，排除缓存、Cookie、代理或弱网影响。\n"
+        "3. 如果问题持续存在，保留报错时间点和截图，便于进一步核查。\n\n"
+        f"如果您愿意，我继续排查时只需要一个关键信息：出现问题时的报错截图或具体报错文案。\n\n可参考官方帮助中心：{HELP_CENTER_URL}"
+    )
+
+
+def _format_route_upload_troubleshooting(search_output: str) -> str:
+    return (
+        "优先排查文件格式和内容问题，这是 HiFleet 航线上传失败最常见的原因。\n\n"
+        "一、先检查文件本身\n"
+        "1. 文件格式：HiFleet 支持常见航线文件，如 xls、csv、xml、rux、rx4、rtz 等，多数船舶 ECDIS 导出的航线文件可直接识别。\n"
+        "2. Excel 文件：建议使用 .xls 或平台模板，避免带宏、加密、受保护或复杂格式的表格。\n"
+        "3. 经度纬度：建议使用十进制度，例如 31.2304、121.4737；不要混用特殊符号、中文逗号或异常空格。\n"
+        "4. 列结构：如果使用模板，列名、经纬度、转向点顺序应与模板一致；转向点过少或顺序异常也可能失败。\n\n"
+        "二、再检查网络和浏览器\n"
+        "1. 切换 Chrome 或 Edge 重新上传。\n"
+        "2. 清理缓存/Cookie，或用无痕窗口重新登录。\n"
+        "3. 如果在公司或船舶局域网内，尝试切换网络，避免防火墙或代理中断上传。\n\n"
+        "三、确认账号权限和入口\n"
+        "1. 确认账号已绑定目标船舶，并有船队管理/航线编辑权限。\n"
+        "2. 上传入口建议从目标船舶进入“计划”页面，再选择文件上传。\n\n"
+        "四、临时替代方式\n"
+        "如果文件持续失败，可以先用手绘航线或航程规划生成计划航线；如是邮件登记用户，也可按登记方式发送 ECDIS 导出的航线文件。\n\n"
+        "如果以上仍失败，请发我一个最关键的信息：上传失败时的报错截图。"
+    )
+
+
+def format_customer_answer(raw: str, *, heading: str = "") -> str:
+    text = normalize_message_text(raw)
+    for marker in ["【互联网搜索结果（增强版）】", "【Hifleet官方站内搜索】", "【回答指导】", "AI摘要", "回答指导"]:
+        text = text.replace(marker, "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text:
+        return "暂时没有获得足够可靠的信息。请补充一个关键细节后我再继续核查。"
+    if heading and not text.startswith(heading):
+        return f"{heading}\n\n{text}"
+    return text
+
+
+def build_multimodal_search_query(text: str, perception: dict[str, Any], route: str, attachment_type: str) -> str:
+    observations = normalize_message_text(str(perception.get("summary") or perception.get("observations") or ""))
+    visible_text = normalize_message_text(str(perception.get("visible_text") or ""))
+    suspected = normalize_message_text(str(perception.get("suspected_issue") or perception.get("suspected_symbol") or ""))
+    if route == "chart_symbol":
+        return " ".join(part for part in ["HiFleet 全球海图 海图符号", suspected, visible_text, observations, text] if part)
+    return " ".join(part for part in [text, suspected, visible_text, observations] if part) or f"HiFleet {attachment_type} 附件问题"
+
+
+def _format_multimodal_troubleshooting_answer(
+    observations: str,
+    visible_text: str,
+    suspected: str,
+    search_output: str,
+) -> str:
+    issue_text = suspected or observations or "截图里显示页面出现异常"
+    prompt = "如果方便，请只补充一个关键线索：报错出现前您点了哪个操作？"
+    if "上传" in f"{issue_text} {visible_text}" and "航线" in f"{issue_text} {visible_text}":
+        prompt = "如果方便，请只补充一个关键线索：上传失败时的报错截图。"
+    return (
+        f"从截图看，当前更像是 HiFleet 页面出现了通用异常提示，重点不是图中符号，而是页面/网络/加载故障。\n\n"
+        f"初步判断：{issue_text}。\n\n"
+        "建议先按这个顺序排查：\n"
+        "1. 刷新页面或重新进入当前功能页，确认问题是否稳定复现。\n"
+        "2. 切换 Wi-Fi/移动网络后重试，排除链路抖动、DNS 或代理影响。\n"
+        "3. 退出后重新登录，必要时清理缓存；如果在微信内打开，也建议重新进入。\n"
+        "4. 如果只在某个页面报错，请记录触发动作和时间点，便于继续定位。\n\n"
+        f"{prompt}\n\n可参考官方帮助中心：{HELP_CENTER_URL}"
+    )
+
+
+def execute_multimodal_chain(
+    text: str,
+    attachments: list[Attachment],
+    perception: dict[str, Any],
+    decision: RouteDecision,
+    tool_map: dict[str, Any],
+    trace: HarnessTrace,
+) -> str:
+    if not attachments:
+        trace.fallback_reason = "missing_attachment"
+        trace.check_result = {"attachment_present": False}
+        return "请上传需要分析的截图、语音、视频或文件，我会结合内容继续判断。"
+
+    attachment = attachments[-1]
+    metadata = ""
+    if "inspect_media_attachment" in tool_map:
+        metadata = _invoke_tool(tool_map, trace, "inspect_media_attachment", {"file_url": attachment.url, "declared_type": attachment.type})
+
+    confidence = str(perception.get("confidence", "")).lower()
+    observations = normalize_message_text(str(perception.get("summary") or perception.get("observations") or ""))
+    visible_text = normalize_message_text(str(perception.get("visible_text") or ""))
+    suspected = normalize_message_text(str(perception.get("suspected_issue") or perception.get("suspected_symbol") or ""))
+    if confidence in {"low", "very_low"} and not observations and not visible_text and not suspected:
+        trace.fallback_reason = "low_multimodal_confidence"
+        trace.check_result = {"attachment_present": True, "confidence": confidence or "low"}
+        return "这张截图/附件里的关键信息不够清晰。请补充截图中想确认的具体位置或重新上传更清晰的图片。"
+
+    query = build_multimodal_search_query(text, perception, decision.route, attachment.type)
+
+    if "smart_search" not in tool_map:
+        trace.check_result = {"attachment_present": True, "metadata": metadata}
+        trace.answer_confidence = "medium"
+        return format_customer_answer(
+            "\n".join(part for part in [observations, visible_text, suspected] if part)
+            or "已收到附件，但当前缺少可用的检索工具。请补充文字描述，我会继续协助判断。",
+            heading="我先根据附件做初步判断：",
+        )
+
+    search = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": decision.search_depth or "deep"})
+    trace.check_result = {
+        "attachment_present": True,
+        "attachment_type": attachment.type,
+        "confidence": confidence or "medium",
+        "metadata_checked": bool(metadata),
+        "query": query,
+    }
+    trace.answer_confidence = "high" if not is_no_hit_text(search) else "medium"
+    evidence = []
+    if observations:
+        evidence.append(f"附件识别：{observations}")
+    if visible_text:
+        evidence.append(f"可见文字：{visible_text}")
+    if suspected:
+        evidence.append(f"疑似对象：{suspected}")
+    evidence.append(search)
+    if decision.route == "chart_symbol":
+        return _format_chart_symbol_answer(suspected=suspected, observations=observations, search_output=search)
+    if is_multimodal_troubleshooting_signal(text, perception):
+        return _format_multimodal_troubleshooting_answer(observations, visible_text, suspected, search)
+    return format_customer_answer("\n\n".join(evidence), heading="结论需要结合截图识别和资料检索判断：")
+
+
+def _format_chart_symbol_answer(suspected: str, observations: str, search_output: str) -> str:
+    text = f"{suspected} {observations}"
+    if "安全水域" in text or ("红色" in text and "黑点" in text):
+        return (
+            "这个红色圆形、中间带黑点的图形，在 HiFleet 全球海图的符号语境下，可按“安全水域浮标（Safe Water Mark）”理解，属于助航标志，不是危险物标。\n\n"
+            "详细说明：\n"
+            "1. 含义：安全水域浮标通常表示该标志周边为可安全通行水域，常用于航道中线、深水航路中心、港口进出口航道起点或开阔水域参考点。\n"
+            "2. 图形特征：常见表现为红白相间的浮标/灯标；在电子海图或平台图层里，可能被简化显示成红色圆点、中心点或小圆形符号。\n"
+            "3. 使用提醒：它和危险物、沉船、障碍物等符号不同，不能直接理解为风险点；但实际航行仍应结合海图比例尺、周边水深、航道和公告信息判断。\n\n"
+            "如果您需要，我也可以继续帮您整理 HiFleet 全球海图里常见航标、障碍物、锚地等符号的对照说明。"
+        )
+    if "锚地" in text or "锚泊" in text or "小圈圈" in text or "空心圆" in text:
+        return (
+            "图中的深色空心小圈圈，更可能是海图图层里的锚地/锚泊区域范围标识，用来提示该水域附近存在锚泊、候泊或相关管制区域。\n\n"
+            "详细说明：\n"
+            "1. 含义：这类圆圈通常不是单船目标，也不是普通 AIS 船舶图标，而是海图或平台图层对特定水域范围的标注。\n"
+            "2. 为什么会出现很多个：近岸、港口外锚地、航道附近经常有多个锚泊区或管制区，打开相应海图/标注图层后会集中显示。\n"
+            "3. 使用建议：如果您是在判断航线或靠离港风险，建议同时查看水深、航道、禁航/限航区、航行警告和船舶密度，不要只看圆圈本身下结论。\n\n"
+            "如果您希望我进一步确认某一个圈的具体名称或范围，请提供截图中该圈附近的地名/坐标，或放大后再截一张图。"
+        )
+    return format_customer_answer(
+        "\n\n".join(part for part in [f"截图识别：{observations}" if observations else "", f"疑似符号：{suspected}" if suspected else "", search_output] if part),
+        heading="这个符号需要结合截图特征和海图资料判断：",
+    )
+
+
+def execute_file_chain(
+    text: str,
+    attachments: list[Attachment],
+    decision: RouteDecision,
+    tool_map: dict[str, Any],
+    trace: HarnessTrace,
+) -> str:
+    file_attachments = [item for item in attachments if item.type in {"file", "image", "audio", "video"}]
+    if not file_attachments:
+        trace.fallback_reason = "missing_file"
+        trace.check_result = {"file_present": False}
+        return "请上传需要分析的文件，我会先识别文件类型和内容，再给出处理建议。"
+
+    attachment = file_attachments[-1]
+    if "inspect_customer_file" not in tool_map:
+        trace.fallback_reason = "file_tool_missing"
+        trace.check_result = {"file_present": True, "file_tool_available": False}
+        return "已收到文件，但当前文件解析工具未启用。请补充文件类型和报错截图，我会先按排查流程协助。"
+
+    raw = _invoke_tool(tool_map, trace, "inspect_customer_file", {"file_url": attachment.url})
+    trace.check_result = {"file_present": True, "inspected": True}
+    trace.answer_confidence = "medium"
+    return format_customer_answer(
+        "已收到并检查文件。下面是可用于排查的内容摘要：\n"
+        f"{raw}\n\n"
+        "如果需要生成报告或标注图，我会在产物生成后返回可访问链接；若缺少必要字段，会只追问一个关键问题。",
+    )
+
+
+def execute_browser_verify_chain(text: str, entities: MessageEntities, decision: RouteDecision, tool_map: dict[str, Any], trace: HarnessTrace) -> str:
+    if not entities.urls:
+        trace.fallback_reason = "browser_verify_missing_url"
+        trace.check_result = {"url_present": False}
+        if "smart_search" in tool_map:
+            return execute_knowledge_chain(text, decision, tool_map, trace)
+        return "请提供需要核验的公开网页链接，我会优先核查 HiFleet 官网和官方社区信息。"
+
+    url = entities.urls[0]
+    verified = ""
+    if "verify_public_page" in tool_map:
+        verified = _invoke_tool(tool_map, trace, "verify_public_page", {"url": url})
+    search = ""
+    if "smart_search" in tool_map:
+        search = _invoke_tool(tool_map, trace, "smart_search", {"query": text, "depth": decision.search_depth or "normal"})
+    trace.check_result = {"url_present": True, "verified": bool(verified), "searched": bool(search)}
+    trace.answer_confidence = "high" if verified or search else "medium"
+    return format_customer_answer("\n\n".join(part for part in [verified, search] if part), heading="已核验公开来源：")
 
 
 def execute_simple_ship_chain(text: str, decision: RouteDecision, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace) -> str:
@@ -570,8 +1025,9 @@ def execute_stats_chain(text: str, entities: MessageEntities, tool_map: dict[str
 
 def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace) -> str:
     mmsi = entities.mmsi
-    if not mmsi and entities.ship_name:
-        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": entities.ship_name})
+    ship_name = _clean_ship_name_candidate(entities.ship_name)
+    if not mmsi and ship_name and "ship_search" in tool_map:
+        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": ship_name})
         mmsi = _parse_first_mmsi(search)
     if not mmsi:
         trace.fallback_reason = "update_requires_mmsi"

@@ -10,8 +10,8 @@
     "thinking_type": "disabled",
     "deep_thinking_enabled": false,
     "top_p": 0.9,
-    "model": "doubao-seed-2-0-pro-260215",
-    "text_model": "doubao-seed-2-0-pro-260215",
+    "model": "deepseek-v4-flash-260425",
+    "text_model": "deepseek-v4-flash-260425",
     "multimodal_model": "doubao-seed-2-0-lite-260428"
   },
   "sp": "System prompt dynamically assembled from config/system_prompt_base.md + skills/*/SKILL.md",

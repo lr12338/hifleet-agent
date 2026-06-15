@@ -41,6 +41,7 @@ from coze_coding_utils.log.config import LOG_LEVEL
 from coze_coding_utils.error.classifier import ErrorClassifier
 from coze_coding_utils.helper.stream_runner import AgentStreamRunner, agent_stream_handler, RunOpt
 from agents.profiles import PROFILE_HEADER, resolve_profile_id, set_current_agent_profile
+from agents.customer_support_stream_debug import build_customer_support_debug_events
 from llm_config import load_llm_config, messages_have_multimodal_content, resolve_model_selection
 from utils.llm_route_state import clear_current_llm_route, set_current_llm_route
 
@@ -415,6 +416,14 @@ class AgentService:
     def _sse_event(data: Any, event_id: Any = None) -> str:
         id_line = f"id: {event_id}\n" if event_id else ""
         return f"{id_line}event: message\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+    async def explainable_stream_sse(self, payload: Dict[str, Any], ctx=None, run_opt: Optional[RunOpt] = None) -> AsyncGenerator[str, None]:
+        """Stream safe reasoning/search/review events before the real agent stream."""
+        for event in build_customer_support_debug_events(payload):
+            yield self._sse_event(event)
+            await asyncio.sleep(0)
+        async for item in self.stream_sse(payload, ctx=ctx, run_opt=run_opt):
+            yield item
 
     def _get_stream_runner(self):
         return self._agent_stream_runner
@@ -969,7 +978,7 @@ async def http_stream_run(request: Request):
             payload=stream_payload,
             ctx=ctx,
             run_id=run_id,
-            stream_sse_func=service.stream_sse,
+            stream_sse_func=service.explainable_stream_sse,
             sse_event_func=service._sse_event,
             error_classifier=service.error_classifier,
             register_task_func=_register_task,

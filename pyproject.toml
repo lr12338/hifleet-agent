@@ -26,6 +26,7 @@ dependencies = [
     "python-dotenv>=1.2,<2",
     "psycopg2-binary>=2.9,<3",
     "boto3>=1.40,<2",
+    "oss2>=2.19,<3",
     "langgraph-checkpoint-postgres>=3.0,<4",
     "psycopg[binary]>=3.3,<4",
     "psycopg-pool>=3.3,<4",

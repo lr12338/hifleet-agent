@@ -66,6 +66,7 @@ numpy==2.4.2
 openai==2.24.0
 opencv-python==4.13.0.92
 openpyxl==3.1.5
+oss2>=2.19,<3
 orjson==3.11.7
 ormsgpack==1.12.2
 packaging==26.0
