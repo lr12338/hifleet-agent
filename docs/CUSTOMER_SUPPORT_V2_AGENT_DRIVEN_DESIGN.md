@@ -630,6 +630,21 @@ confidence = authority * 0.4 + relevance * 0.3 + consistency * 0.3
 
 `smart_search` 不再只是一个被动工具，而是证据检索引擎。
 
+### 当前已落地能力
+
+当前代码已经先落了一版更接近 V2 的搜索底座，和早期设计相比有两个重要变化：
+
+1. 外部搜索层优先走**结构化联网搜索 API**
+   - `POST https://open.feedcoopapi.com/search_api/web_search`
+   - 优先使用返回的 `Summary / AuthInfoLevel / PublishTime / Choices`
+   - 不再主要依赖“让模型联网搜，再从生成文本里抽链接”
+
+2. 保留 Ark 联网搜索作为回退
+   - 当结构化联网搜索失败、超时、权限异常、额度不足或部署环境未读到 API Key 时
+   - 自动回退到 `_ark_web_search(...)`
+
+这意味着 `smart_search` 现在已经从“生成式联网搜索包装器”向“结构化证据检索引擎”迈进了一步。
+
 建议扩展：
 
 ### 当前接口
@@ -701,6 +716,24 @@ confidence = authority * 0.4 + relevance * 0.3 + consistency * 0.3
 - `HiFleet 锚地 圆圈 海图 标识`
 - `ECDIS anchor area circle symbol`
 
+### 当前实现与设计差异
+
+当前实现已经支持：
+
+- `normal` 场景的 HiFleet 官网站内搜索
+- `deep` 场景的多查询变体
+- `deep` 场景优先 `web_summary`
+- 基于 `AuthInfoLevel` 和域名表的来源加权
+
+但还没有完全做到设计稿里建议的：
+
+- `queries[]` 结构化入参
+- 每条检索 query 的独立 evidence trace
+- `official_hits / public_hits` 这类显式返回统计
+- Planner 直接消费结构化 `smart_search` 响应对象
+
+所以这里的下一步不是重写 `smart_search`，而是把当前已落地的结构化搜索能力继续往 Planner state 和 trace 上接。
+
 ## 8.3 来源优先级
 
 建议固定优先级：
@@ -714,6 +747,30 @@ confidence = authority * 0.4 + relevance * 0.3 + consistency * 0.3
 7. 普通公共网页
 
 任何结论如果只来自第 6、7 层，回答中必须降低确定性。
+
+### Linux 部署说明
+
+现网 Linux 部署当前已兼容以下 API Key 变量名：
+
+```bash
+VOLC_WEB_SEARCH_API_KEY
+WEB_SEARCH_API_KEY
+TORCHLIGHT_API_KEY
+ARK_WEBSEARCH_API_KEY
+ark_websearch_api_key
+```
+
+如果服务部署在 Linux 服务器上，且 `.env` 位于工作目录，例如：
+
+```text
+/home/ecs-user/coze_ai/.env
+```
+
+则需要确保：
+
+1. 服务启动时 `COZE_WORKSPACE_PATH=/home/ecs-user/coze_ai`
+2. 进程可读取 `/home/ecs-user/coze_ai/.env`
+3. 结构化联网搜索接口对外网络连通
 
 ---
 
