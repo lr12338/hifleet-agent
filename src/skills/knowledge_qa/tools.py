@@ -40,12 +40,15 @@ from skills.common.tool_result import ToolResult, emit_tool_metric
 
 logger = logging.getLogger(__name__)
 DEFAULT_HELP_CENTER_URL = "https://www.hifleet.com/helpcenter/?i18n=zh"
+VOLC_WEB_SEARCH_URL = "https://open.feedcoopapi.com/search_api/web_search"
 
 # 性能优化参数（可通过环境变量覆盖）
 SMART_SEARCH_CACHE_TTL_SEC = int(os.getenv("SMART_SEARCH_CACHE_TTL_SEC", "600"))
 URL_CHECK_TIMEOUT_SEC = float(os.getenv("SMART_SEARCH_URL_TIMEOUT_SEC", "2.0"))
 URL_CHECK_TOP_N = int(os.getenv("SMART_SEARCH_URL_TOP_N", "2"))
 DEEP_VARIANTS_MAX = int(os.getenv("SMART_SEARCH_DEEP_VARIANTS_MAX", "3"))
+VOLC_WEB_SEARCH_TIMEOUT_SEC = float(os.getenv("VOLC_WEB_SEARCH_TIMEOUT_SEC", "15"))
+VOLC_WEB_SEARCH_DEFAULT_COUNT = int(os.getenv("VOLC_WEB_SEARCH_DEFAULT_COUNT", "5"))
 
 _SEARCH_CACHE_LOCK = threading.Lock()
 _SEARCH_CACHE: dict = {}
@@ -130,7 +133,7 @@ WIKI_MIN_SCORE = 0.30
 # 第4层：官网站内搜索配置
 # ══════════════════════════════════════════════════
 HIFLEET_COMMUNITY_URL = "https://www.hifleet.com/wp/communities"
-HIFLEET_SITES = "hifleet.com,help.hifleet.com,www.hifleet.com,www.hifleet.com/wp/communities"
+HIFLEET_SITES = "hifleet.com|help.hifleet.com|www.hifleet.com"
 
 # ══════════════════════════════════════════════════
 # 第5层：域名权威度加权表
@@ -261,10 +264,17 @@ def _search_hifleet_site(query: str, ctx) -> list:
 
     results = []
     try:
-        search = _ark_web_search(
+        search = _web_search(
             query=query,
-            site_hint=HIFLEET_SITES,
-            count=3,
+            count=5,
+            search_type="web",
+            sites=HIFLEET_SITES,
+            need_summary=True,
+            need_content=False,
+            need_url=True,
+            query_rewrite=True,
+            auth_info_level=1,
+            content_format="markdown",
         )
         for item in search.get("items", []):
             url = item.get("url", "")
@@ -273,9 +283,11 @@ def _search_hifleet_site(query: str, ctx) -> list:
             results.append({
                 "title": item.get("title", ""),
                 "url": url,
-                "snippet": _sanitize_snippet_text(item.get("snippet", "")),
+                "snippet": _sanitize_snippet_text(item.get("summary") or item.get("snippet", "")),
                 "full_content": "",
-                "content_quality": "snippet" if item.get("snippet") else "link_only",
+                "content_quality": "summary" if item.get("summary") else "snippet" if item.get("snippet") else "link_only",
+                "publish_time": item.get("publish_time", ""),
+                "authority_level": item.get("authority_level", 1),
             })
         results = _filter_accessible_items(results, require_hifleet_domain=True)
         if not results:
@@ -297,20 +309,32 @@ def _search_web_enhanced(query: str, ctx) -> dict:
     result = {"items": [], "summary": ""}
 
     try:
-        search = _ark_web_search(query=query, count=5)
+        search = _web_search(
+            query=query,
+            count=VOLC_WEB_SEARCH_DEFAULT_COUNT,
+            search_type="web",
+            need_summary=True,
+            need_content=False,
+            need_url=True,
+            query_rewrite=False,
+            auth_info_level=0,
+            content_format="markdown",
+        )
         result["summary"] = search.get("summary", "")
 
         for item in search.get("items", []):
             url = item.get("url", "")
             domain = urlparse(url).netloc.lower().lstrip("www.")
-            authority = DOMAIN_AUTHORITY.get(domain, 0.3)
+            authority = _resolve_authority_score(domain, item.get("authority_level"))
             result["items"].append({
                 "title": item.get("title", ""),
                 "url": url,
-                "snippet": _sanitize_snippet_text(item.get("snippet", "")),
+                "snippet": _sanitize_snippet_text(item.get("summary") or item.get("snippet", "")),
                 "authority": authority,
                 "authority_label": _get_authority_label(authority),
                 "full_content": "",
+                "publish_time": item.get("publish_time", ""),
+                "site_name": item.get("site_name", ""),
             })
         result["items"] = _filter_accessible_items(result["items"], require_hifleet_domain=False)
         if not result["items"]:
@@ -358,9 +382,9 @@ def _search_web_deep_multi(query: str, ctx) -> dict:
     merged = {"items": [], "summary": ""}
     variants = _expand_query_variants(query)
     for i, q in enumerate(variants):
-        chunk = _search_web_enhanced(q, ctx)
+        chunk = _search_web_deep_single(q)
         if chunk.get("summary"):
-            merged["summary"] += f"\n[Query{i+1}:{q}] {chunk['summary'][:500]}"
+            merged["summary"] += f"\n查询{i+1}（{q}）：{chunk['summary'][:500]}"
         merged["items"].extend(chunk.get("items", []))
 
     # 去重 URL + 权威度排序
@@ -375,6 +399,41 @@ def _search_web_deep_multi(query: str, ctx) -> dict:
     merged["items"] = items[:8]
     merged["summary"] = merged["summary"][:1800]
     return merged
+
+
+def _search_web_deep_single(query: str) -> dict:
+    result = {"items": [], "summary": ""}
+    try:
+        search = _web_search(
+            query=query,
+            count=VOLC_WEB_SEARCH_DEFAULT_COUNT,
+            search_type="web_summary",
+            need_summary=True,
+            need_content=False,
+            need_url=True,
+            query_rewrite=True,
+            auth_info_level=0,
+            content_format="markdown",
+        )
+        result["summary"] = search.get("summary", "")
+        for item in search.get("items", []):
+            url = item.get("url", "")
+            domain = urlparse(url).netloc.lower().lstrip("www.")
+            authority = _resolve_authority_score(domain, item.get("authority_level"))
+            result["items"].append({
+                "title": item.get("title", ""),
+                "url": url,
+                "snippet": _sanitize_snippet_text(item.get("summary") or item.get("snippet", "")),
+                "authority": authority,
+                "authority_label": _get_authority_label(authority),
+                "full_content": "",
+                "publish_time": item.get("publish_time", ""),
+                "site_name": item.get("site_name", ""),
+            })
+        result["items"] = _filter_accessible_items(result["items"], require_hifleet_domain=False)
+    except Exception as e:
+        logger.warning(f"Deep web search error: {e}")
+    return result
 
 
 def _is_url_accessible(url: str, timeout_sec: float = URL_CHECK_TIMEOUT_SEC) -> bool:
@@ -425,6 +484,169 @@ def _get_env_value(*keys: str) -> str:
         if v and v.strip():
             return v.strip()
     return ""
+
+
+def _resolve_authority_score(domain: str, authority_level: Optional[int]) -> float:
+    if domain in DOMAIN_AUTHORITY:
+        return DOMAIN_AUTHORITY[domain]
+    if authority_level == 1:
+        return 0.95
+    if authority_level == 2:
+        return 0.80
+    if authority_level == 3:
+        return 0.60
+    if authority_level == 4:
+        return 0.35
+    return 0.30
+
+
+def _build_volc_web_search_payload(
+    query: str,
+    *,
+    search_type: str,
+    count: int,
+    sites: str = "",
+    need_summary: bool = True,
+    need_content: bool = False,
+    need_url: bool = True,
+    query_rewrite: bool = False,
+    auth_info_level: int = 0,
+    time_range: str = "",
+    content_format: str = "markdown",
+) -> dict:
+    payload = {
+        "Query": query[:100],
+        "SearchType": search_type,
+        "Count": max(1, min(int(count or VOLC_WEB_SEARCH_DEFAULT_COUNT), 50)),
+        "NeedSummary": bool(need_summary),
+        "QueryControl": {
+            "QueryRewrite": bool(query_rewrite),
+        },
+    }
+    if search_type == "web_summary":
+        payload["NeedSummary"] = True
+
+    filter_payload = {
+        "NeedContent": bool(need_content),
+        "NeedUrl": bool(need_url),
+    }
+    if sites:
+        filter_payload["Sites"] = sites
+    if auth_info_level in (0, 1):
+        filter_payload["AuthInfoLevel"] = auth_info_level
+    payload["Filter"] = filter_payload
+
+    if time_range:
+        payload["TimeRange"] = time_range
+    if content_format in ("text", "markdown"):
+        payload["ContentFormats"] = content_format
+    return payload
+
+
+def _extract_summary_from_choices(choices: list) -> str:
+    parts = []
+    for choice in choices or []:
+        message = choice.get("Message") or {}
+        delta = choice.get("Delta") or {}
+        content = message.get("Content") or delta.get("Content") or ""
+        if content:
+            parts.append(content)
+    return "".join(parts).strip()
+
+
+def _normalize_web_search_result(payload: dict) -> dict:
+    result = (payload or {}).get("Result") or payload or {}
+    items = []
+    for item in result.get("WebResults") or []:
+        items.append({
+            "title": item.get("Title", ""),
+            "site_name": item.get("SiteName", ""),
+            "url": item.get("Url", ""),
+            "snippet": item.get("Snippet", ""),
+            "summary": item.get("Summary", ""),
+            "content": item.get("Content", ""),
+            "publish_time": item.get("PublishTime", ""),
+            "authority_level": item.get("AuthInfoLevel"),
+            "authority_desc": item.get("AuthInfoDes", ""),
+            "rank_score": item.get("RankScore"),
+            "content_format": item.get("ContentFormats", ""),
+        })
+    summary = _extract_summary_from_choices(result.get("Choices") or [])
+    return {
+        "summary": summary,
+        "items": items,
+        "search_context": result.get("SearchContext") or {},
+        "time_cost": result.get("TimeCost"),
+        "log_id": result.get("LogId", ""),
+        "card_results": result.get("CardResults"),
+        "usage": result.get("Usage"),
+    }
+
+
+def _volc_web_search(
+    query: str,
+    *,
+    count: int = VOLC_WEB_SEARCH_DEFAULT_COUNT,
+    search_type: str = "web",
+    sites: str = "",
+    need_summary: bool = True,
+    need_content: bool = False,
+    need_url: bool = True,
+    query_rewrite: bool = False,
+    auth_info_level: int = 0,
+    time_range: str = "",
+    content_format: str = "markdown",
+) -> dict:
+    api_key = _get_env_value(
+        "VOLC_WEB_SEARCH_API_KEY",
+        "WEB_SEARCH_API_KEY",
+        "TORCHLIGHT_API_KEY",
+        "ARK_WEBSEARCH_API_KEY",
+        "ark_websearch_api_key",
+    )
+    if not api_key:
+        raise RuntimeError("未配置火山联网搜索 API Key")
+
+    payload = _build_volc_web_search_payload(
+        query,
+        search_type=search_type,
+        count=count,
+        sites=sites,
+        need_summary=need_summary,
+        need_content=need_content,
+        need_url=need_url,
+        query_rewrite=query_rewrite,
+        auth_info_level=auth_info_level,
+        time_range=time_range,
+        content_format=content_format,
+    )
+    response = requests.post(
+        VOLC_WEB_SEARCH_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=VOLC_WEB_SEARCH_TIMEOUT_SEC,
+    )
+    response.raise_for_status()
+    data = response.json()
+    error = ((data or {}).get("ResponseMetadata") or {}).get("Error")
+    if error:
+        raise RuntimeError(f"volc_web_search_error:{error.get('Code')}:{error.get('Message')}")
+    return _normalize_web_search_result(data)
+
+
+def _web_search(query: str, **kwargs) -> dict:
+    try:
+        return _volc_web_search(query, **kwargs)
+    except Exception as e:
+        logger.warning(f"Structured web search failed, fallback to Ark: {e}")
+        return _ark_web_search(
+            query=query,
+            site_hint=kwargs.get("sites", ""),
+            count=kwargs.get("count", VOLC_WEB_SEARCH_DEFAULT_COUNT),
+        )
 
 
 def _ark_web_search(query: str, site_hint: str = "", count: int = 5) -> dict:
@@ -511,13 +733,7 @@ def _get_authority_label(score: float) -> str:
 
 def _format_glossary_result(term: str, definition: str) -> str:
     """格式化术语速查结果"""
-    return (
-        f"从平台术语速查表中匹配到以下标准解释：\n\n"
-        f"【术语：{term}】\n"
-        f"{definition}\n\n"
-        f"【回答指导】\n"
-        f"- 这是官方标准解释，请直接使用上述定义回答用户，禁止猜测或编造其他解释。"
-    )
+    return f"【术语：{term}】\n{definition}"
 
 
 def _format_knowledge_result(kb_results: dict) -> str:
@@ -547,16 +763,6 @@ def _format_knowledge_result(kb_results: dict) -> str:
         for item in wiki_items[:2]:
             parts.append(f"\n**相关度: {item['score']:.2f}**\n{item['content'][:500]}")
 
-    # 回答指导
-    if has_faq:
-        parts.append("\n---\n【回答指导】\n- 找到精确FAQ匹配，优先使用标准答案回复。")
-    else:
-        parts.append(
-            "\n---\n【回答指导】\n"
-            "- 未找到精确的FAQ匹配，请基于主题说明谨慎回答，避免编造信息。\n"
-            "- 如需更全面的信息，可调用smart_search(depth='deep')进行深度搜索。"
-        )
-
     return "\n".join(parts)
 
 
@@ -565,7 +771,7 @@ def _format_site_result(site_results: list, query: str) -> str:
     if not site_results:
         return ""
 
-    parts = [f"【Hifleet官方站内搜索】"]
+    parts = ["【HiFleet 官方资料】"]
     for item in site_results:
         source_label = "官方社区" if "wp/communities" in str(item.get("url", "")) else "官网/帮助中心"
         parts.append(f"\n**{item['title']}**")
@@ -574,6 +780,8 @@ def _format_site_result(site_results: list, query: str) -> str:
             parts.append(f"内容摘要：{item['full_content'][:800]}...")
         elif item["snippet"]:
             parts.append(f"摘要：{item['snippet']}")
+        if item.get("publish_time"):
+            parts.append(f"发布时间：{item['publish_time']}")
         parts.append(f"🔗 {item['url']}")
 
     if DEFAULT_HELP_CENTER_URL not in [str(i.get("url", "")) for i in site_results]:
@@ -581,31 +789,26 @@ def _format_site_result(site_results: list, query: str) -> str:
     if HIFLEET_COMMUNITY_URL not in [str(i.get("url", "")) for i in site_results]:
         parts.append(f"🔗 官方社区入口：{HIFLEET_COMMUNITY_URL}")
 
-    parts.append("\n---\n【回答指导】\n- 以上来自Hifleet官方网站，可直接引用。")
     return "\n".join(parts)
 
 
 def _format_web_result(web_results: dict) -> str:
     """格式化网页搜索结果"""
-    parts = ["【互联网搜索结果（增强版）】"]
+    parts = ["【公开资料参考】"]
 
     if web_results.get("summary"):
-        parts.append(f"\n📋 **AI摘要**：{web_results['summary'][:1000]}")
+        parts.append(f"\n综合摘要：{web_results['summary'][:1000]}")
 
     for item in web_results.get("items", []):
         parts.append(f"\n**{item['title']}** {item['authority_label']}")
         if item["snippet"]:
             parts.append(f"摘要: {item['snippet'][:300]}")
-        if item["full_content"]:
-            parts.append(f"详细内容: {item['full_content'][:800]}...")
+        if item.get("site_name"):
+            parts.append(f"站点: {item['site_name']}")
+        if item.get("publish_time"):
+            parts.append(f"发布时间: {item['publish_time']}")
         if item["url"]:
             parts.append(f"🔗 {item['url']}")
-
-    parts.append(
-        "\n---\n【回答指导】\n"
-        "- 🟢权威来源可直接引用，🟡可信来源需交叉验证，🟠一般来源仅供参考，🔴待验证来源需谨慎。\n"
-        "- 综合多个来源回答，标注信息来源。"
-    )
     return "\n".join(parts)
 
 
@@ -622,13 +825,13 @@ def smart_search(query: str, depth: str = "normal") -> str:
     - 第1层: 术语速查（平台概念100%准确）
     - 第2层: 知识库FAQ（官方标准答案）
     - 第3层: 知识库Wiki（补充背景知识）
-    - 第4层: 官网站内搜索（Hifleet官方内容）
-    - 第5层: 互联网增强搜索（全文+权威度+AI摘要）
+    - 第4层: 官网站内搜索（HiFleet官方内容）
+    - 第5层: 互联网增强搜索（结构化摘要+权威度）
 
     depth参数说明：
     - "quick":  仅搜索知识库（第1-3层），速度快，适合简单问题
     - "normal": 知识库+官网（第1-4层），默认，适合大多数场景
-    - "deep":   全部5层搜索+全文抓取，适合复杂分析、行业研究、实时资讯
+    - "deep":   全部5层搜索+多查询深搜，适合复杂分析、行业研究、实时资讯
 
     适用场景：
     - Hifleet平台使用问题 → depth="quick"或"normal"

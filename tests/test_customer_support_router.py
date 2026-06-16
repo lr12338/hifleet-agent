@@ -34,6 +34,7 @@ from agents.customer_support_router import (
     should_use_ship_context,
     validate_links,
 )
+from agents.customer_support_guard import sanitize_customer_output
 from langchain_core.messages import AIMessage, HumanMessage
 
 
@@ -260,6 +261,86 @@ def test_context_followup_reuses_last_ship_identity():
     assert entities.mmsi == "414726000"
     assert entities.imo == "9613886"
     assert decision.route in {"ship_context", "ship_complex"}
+
+
+def test_business_question_about_track_retention_routes_to_knowledge_not_ship():
+    text = "基础版的历史轨迹可查多久前的"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+
+    assert decision.route == "knowledge"
+    assert decision.task_type == "platform_knowledge"
+
+
+def test_area_history_howto_routes_to_knowledge_not_stats():
+    text = "如何查询区域过往历史数据？"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+
+    assert decision.route == "knowledge"
+
+
+def test_context_clear_routes_to_conversation():
+    text = "清理上下文"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+
+    assert decision.route == "conversation"
+
+
+def test_hifleet_business_answers_prefer_direct_domain_answer():
+    trace = make_trace(classify_message("专业版账号有几天的气象预报？", extract_entities("专业版账号有几天的气象预报？")), extract_entities("专业版账号有几天的气象预报？"))
+
+    output = execute_knowledge_chain(
+        "专业版账号有几天的气象预报？",
+        classify_message("专业版账号有几天的气象预报？", extract_entities("专业版账号有几天的气象预报？")),
+        {},
+        trace,
+    )
+
+    assert "15 天" in output or "15天" in output
+    assert "彩云天气" not in output
+    assert trace.check_result["direct_business_answer"] is True
+
+
+def test_history_track_permission_answer_is_concise_and_domain_correct():
+    question = "基础版的历史轨迹可查多久前的"
+    entities = extract_entities(question)
+    decision = classify_message(question, entities)
+    trace = make_trace(decision, entities)
+
+    output = execute_knowledge_chain(question, decision, {}, trace)
+
+    assert "基础版：可查看近 12 个月历史轨迹" in output
+    assert "专业版：可查看近 36 个月历史轨迹" in output
+    assert "MMSI" not in output
+
+
+def test_context_clear_answer_does_not_false_claim_total_deletion():
+    question = "清理上下文"
+    context = build_conversation_context([HumanMessage(content="查询育明船位"), HumanMessage(content=question)])
+
+    output = answer_conversation_memory(question, context)
+
+    assert "重新理解" in output
+    assert "彻底清空历史记忆" in output
+    assert "未留存任何" not in output
+
+
+def test_sanitize_customer_output_strips_query_footer_and_app_promo():
+    raw = (
+        "我先根据目前检索到的官方资料给您结论：\n"
+        "[Query1:欧盟碳配额价格及每吨重油碳配额水平]\n"
+        "### 相关信息说明\n"
+        "如需更多帮助，请继续补充船名、MMSI、IMO、呼号或直接提问。\n"
+        "<a href=\"https://www.hifleet.com/download/qr.html\">下载APP</a>,手机查船更方便"
+    )
+
+    cleaned = sanitize_customer_output(raw)
+
+    assert "[Query1:" not in cleaned
+    assert "下载APP" not in cleaned
+    assert "手机查船更方便" not in cleaned
 
 
 def test_platform_troubleshooting_followup_beats_ship_update():
