@@ -6,11 +6,11 @@
 
 | 目标 | 文档 |
 | --- | --- |
-| 快速学习 `customer_support` 当前实现、提示词分层、节点职责、判断逻辑，以及后续如何安全改进 | [CUSTOMER_SUPPORT_V3_AGENT_HARNESS_PROMPT_DESIGN.md](CUSTOMER_SUPPORT_V3_AGENT_HARNESS_PROMPT_DESIGN.md) |
-| 理解当前 Agent 架构、customer_support 的 `Planner Agent -> Harness -> Guard` 消息处理逻辑、profile 对比、流程图 | [AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md) |
+| 快速学习 `customer_support` 当前实现、标准客服 Agent 组装方式、前后置 Guard、提示词与工具边界 | [CUSTOMER_SUPPORT_V3_AGENT_HARNESS_PROMPT_DESIGN.md](CUSTOMER_SUPPORT_V3_AGENT_HARNESS_PROMPT_DESIGN.md) |
+| 理解当前 Agent 架构、customer_support 的 `Pre-Guard -> Standard Agent -> Post-Guard` 逻辑、profile 对比、流程图 | [AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md) |
 | 接入 `/run`、`/stream_run`，处理多用户会话 | [API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md) |
 | 管理台使用、日志查询、调试入口 | [ADMIN_BACKEND_SYSTEM_GUIDE.md](ADMIN_BACKEND_SYSTEM_GUIDE.md) |
-| 客服 Agent 回归矩阵、Planner/Harness/Guard 验收、多模态/流式调试/OSS 验收、线上排障重点 | [CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md) |
+| 客服 Agent 回归矩阵、标准问答链/流式调试/Guard 验收、线上排障重点 | [CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md) |
 | 知识库与 `smart_search` 分层检索 | [KNOWLEDGE_BASE_GUIDE.md](KNOWLEDGE_BASE_GUIDE.md) |
 | 内部员工表格/Python 沙盒闭环 | [EMPLOYEE_ASSISTANT_SANDBOX_RUNBOOK.md](EMPLOYEE_ASSISTANT_SANDBOX_RUNBOOK.md) |
 
@@ -21,7 +21,7 @@ flowchart LR
     Client[渠道/调用方] --> API[src/main.py]
     API --> Profile[profile 解析]
     Profile --> Graph[统一 phase graph]
-    Graph --> CS[customer_support<br/>route -> plan(Planner) -> act(Planner/Harness) -> check -> finalize(Guard)]
+    Graph --> CS[customer_support<br/>route -> delegate(Standard Agent) -> check(Post-Guard) -> finalize]
     Graph --> Employee[employee_assistant<br/>route -> plan -> act -> check -> loop/finalize]
     API --> Obs[observability]
 ```

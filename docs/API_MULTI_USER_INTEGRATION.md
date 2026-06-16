@@ -8,7 +8,7 @@
 - 正确选择客服或数字员工 Profile。
 - 出现慢请求、错误、工具异常时可在后台管理系统定位。
 
-注意：`customer_support` 当前复用和 `employee_assistant` 同型的 phase graph，在 `plan` 阶段由 agent 判意图并收缩工具集；调用方不需要也不应该直接指定底层工具。
+注意：`customer_support` 当前采用轻量链路：前置安全拦截 -> 标准客服 Agent -> 后置输出质检。调用方不需要也不应该直接指定底层工具。
 
 ## 1. 核心接口
 
@@ -45,10 +45,10 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 
 `customer_support` 能力边界：
 
-- 平台问题：优先 `smart_search`，按 KB -> 官网/搜索 -> deep fallback 退化。
-- 船舶问题：自动识别单步查询、复杂分析、区域/海峡统计、写操作。
-- 写操作：只在用户明确要求更新/上传/修改时进入 `ship_update`，缺必要字段会快速失败。
-- 不开放 Python、Docker、文件处理和通用浏览器能力。
+- 平台问题：优先 `smart_search`，后续可继续补强知识库和公网搜索能力。
+- 船舶问题：标准 Agent 可自主调用 ship service 工具，但最终回复仍受客服 Guard 约束。
+- 写操作：只在 profile policy 允许且工具真实返回成功时才能对外宣称成功。
+- 不向客户暴露 Python、Docker、内部路径、prompt、tool registry、日志和配置细节。
 
 ## 4. session_id 生成规则
 

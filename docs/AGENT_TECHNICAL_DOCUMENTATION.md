@@ -28,8 +28,8 @@ flowchart TD
 | --- | --- |
 | `src/main.py` | HTTP 入口、消息归一化、流式输出、观测写入 |
 | `src/agents/profiles.py` | profile 配置、渠道映射、权限边界 |
-| `src/agents/agent.py` | 两个 profile 的 phase graph 构建、customer_support 的 Planner/Harness/Guard 主执行链、finalize 输出收口 |
-| `src/agents/customer_support_router.py` | 客服路由、实体提取、Planner 计划构建、证据审查、确定性 harness、客服答复模板 |
+| `src/agents/agent.py` | 两个 profile 的 phase graph 构建、customer_support 的标准问答主链、finalize 输出收口 |
+| `src/agents/customer_support_router.py` | 客服路由、实体提取、ship/file/browser 等工具链辅助函数，当前主要用于轻量分类和工具能力复用 |
 | `src/agents/customer_support_guard.py` | 客服最终输出脱敏、拒答、链接白名单校验兜底 |
 | `src/agents/customer_support_stream_debug.py` | `/stream_run` 的 runtime state -> debug event 映射 |
 | `src/skills/skill_loader.py` | skills 与 tools 注册、按名称收缩工具集 |
@@ -42,429 +42,135 @@ flowchart TD
 
 ## 2. 统一骨架，不同语义
 
-两个 profile 共用同一类 phase graph，但 `plan / act / check / finalize` 的语义完全不同。
+两个 profile 仍然都挂在统一的 Agent 构建入口下，但主执行图已经不再一样复杂。
 
 ```mermaid
 flowchart TD
     Start[request] --> Route[route]
-    Route -->|进入主链| Plan[plan]
-    Route -->|不走主链| Delegate[delegate]
+    Route -->|customer_support| Delegate[delegate]
+    Delegate --> Check[check]
+    Check --> Finalize[finalize]
+    Route -->|employee workspace task| Plan[plan]
     Plan --> Act[act]
-    Act --> Check[check]
-    Check -->|通过| Finalize[finalize]
-    Check -->|可重试| Loop[loop]
-    Check -->|达到上限| Fail[fail / fallback]
-    Loop --> Act
+    Act --> Verify[check]
+    Verify --> LoopOrDone[loop / finalize / fail]
 ```
 
-统一的是：
+当前差异：
 
-- phase graph 结构
-- `run_id / session_id / route_trace / phase_history` 的观测格式
-- `check -> loop/finalize/fail` 的收敛方式
-
-不同的是：
-
-- `customer_support` 以“客服答复准确性、工具收敛、安全输出”为主
-- `employee_assistant` 以“任务完成、文件/Python 产物、可验证执行过程”为主
+- `customer_support`：前置安全拦截 -> 标准客服 Agent -> 后置 Guard
+- `employee_assistant`：文件/沙盒工作流闭环
 
 ## 3. customer_support 与 employee_assistant 对比
 
 | 维度 | `customer_support` | `employee_assistant` |
 | --- | --- | --- |
 | 面向对象 | 外部客户、微信客服、CRM 渠道 | 内部员工、后台运营 |
-| 典型输入 | 平台问题、截图、船舶查询、写操作、公开网页核验 | 文件、表格、分析任务、报告生成、内部知识问答 |
-| 主目标 | 快速给出准确、可直接发送给客户的答复 | 帮员工完成任务并产出可复核结果 |
-| `plan` 阶段 | `Intent Agent + Planner Agent` 负责理解、假设、检索规划、响应模式决策 | 判断是否进入文件/沙盒工作流 |
-| `act` 阶段 | 先按 Planner 决策执行：知识/多模态走 Planner 检索链，船舶/写操作/文件/核验走 Harness | inspect 文件、生成 Python、运行沙盒、迭代修复 |
-| `check` 阶段 | 程序校验 + `Response QA Agent`，必要时修复或降级为单关键追问 | 检查 `exit_code`、artifact、数据完整性、自愈是否成功 |
-| `finalize` 阶段 | `Guard` 脱敏、清理搜索展示模板、返回客服口吻回复 | 汇总结果、保留产物链接、按内部任务口吻输出 |
-| 检索策略 | 本地知识库 -> 官网/帮助中心/官方社区 -> 结构化公网搜索 -> Ark 回退 | 视任务而定，知识问答可复用 `smart_search` |
-| 多模态 | 图片/语音/视频/文件先感知，再决定检索和推理 | 更关注文件结构和分析任务，不强调客服化表达 |
-| 写操作 | 仅在用户明确要求且字段完整时直接执行 | 可按内部流程使用更广泛工具 |
-| 安全边界 | 不能暴露工具名、路径、prompt、key、日志、内部执行细节 | 同样不能暴露内部信息，但允许更长任务过程 |
+| 主目标 | 给出稳定、简洁、可直接发送的客服回复 | 帮员工完成任务并产出可复核结果 |
+| 主执行方式 | 标准问答 Agent，自主 tool-calling | workspace task 才进入 `plan -> act -> check -> loop` |
+| 前置控制 | `route` 做敏感内部探查拦截 | `route` 判断是否进入 workspace task |
+| 后置控制 | `sanitize_customer_output` + 链接校验 + 统一兜底 | `exit_code` / artifact / sandbox 自愈 |
+| 核心瓶颈 | 知识库完整度、公网搜索匹配能力 | 文件结构识别、代码生成、沙盒执行 |
 
 ## 4. customer_support 消息处理逻辑
 
-### 4.1 主链总览
-
-`customer_support` 现在不是“把缩小工具包交给 LLM 自由调用”，而是“Planner Agent -> Harness -> Guard”的主链。
+### 4.1 当前主链
 
 ```mermaid
 flowchart TD
-    Msg[用户消息 / 附件] --> RouteNode[route node]
+    Msg[用户消息 / 附件] --> RouteNode[route]
     RouteNode -->|敏感内部请求| Refuse[固定拒答]
-    RouteNode -->|普通客服请求| PlanNode[plan node]
-    PlanNode --> Context[抽取文本 / 附件 / 上下文]
-    Context --> Intent[分类 route / task_type]
-    Intent --> Perception[多模态感知]
-    Perception --> Refine[基于感知二次改路由]
-    Refine --> Resolve[按 route 决定是否继承船舶上下文]
-    Resolve --> Planner[Planner 生成 problem_frame / hypotheses / search_plan / decision_rationale]
-    Planner --> ActNode[act node]
-    ActNode --> Decide{Planner 决策}
-    Decide -->|knowledge / chart_symbol / multimodal / conversation| PlannerExec[Planner 检索/证据审查直执链]
-    Decide -->|ship / write / file / browser| Harness[按 route 调用确定性 execute_*_chain]
-    PlannerExec --> CheckNode[check node]
-    Harness --> CheckNode
-    CheckNode -->|通过| Finalize[finalize node]
-    CheckNode -->|一次重试| Loop[loop]
-    Loop --> ActNode
+    RouteNode -->|正常请求| Delegate[标准客服 Agent]
+    Delegate --> Check[后置内容质检]
+    Check --> Finalize[finalize]
     Finalize --> Reply[客户最终回复]
 ```
 
 ### 4.2 route node
 
-`route node` 做两件事：
-
-1. 读取本轮最新用户文本。
-2. 如果命中敏感内部请求，直接固定拒答，不进入工具链。
-
-拒答场景包括：
-
-- agent 架构、代码、路径、配置、环境变量、`.env`
-- prompt、tool registry、内部路由、日志、key、token
-
-命中后直接返回安全回复，不触发搜索和任何内部工具。
-
-### 4.3 plan node
-
-`plan node` 是 customer_support 的 `Planner Agent` 入口，顺序如下：
-
-1. `latest_customer_user_text(messages)` 取用户最新有效文本。
-2. `build_conversation_context(messages)` 构造上下文。
-   - 最近问题
-   - 最近船名 / MMSI / IMO
-   - 最近回答是否已经暴露船舶身份
-3. `extract_entities(text)` 抽取 `MMSI / IMO / ship_name / port / area / strait / dates / urls`。
-4. `extract_attachments(messages)` 抽取附件。
-5. `_run_customer_support_intent_agent(...)` 先做结构化意图识别；失败时才回退 `_classify_customer_support(...)`。
-6. `classify_multimodal_message(...)` 基于附件类型做第一次多模态路由修正。
-7. `_perceive_customer_attachments(...)` 做多模态感知。
-   - 优先本地多模态模型 `doubao-seed-2-0-lite-260428`
-   - 模型不可用时走本地图像启发式兜底
-8. `refine_multimodal_route_with_perception(...)` 根据感知结果二次改路由。
-   - 截图符号 -> `chart_symbol`
-   - 报错/异常截图 -> `knowledge / platform_troubleshooting`
-9. `resolve_entities_with_context(...)` 决定是否继承上一轮船舶上下文。
-   - 仅 `ship_single / ship_complex / ship_update / ship_stats` 允许补船舶实体
-   - `knowledge / troubleshooting / multimodal_understanding` 不继承船舶实体，避免语义污染
-10. `build_customer_support_plan(...)` 先生成程序 fallback 计划，再由 `_run_customer_support_planner_agent(...)` 生成结构化规划结果：
-   - `problem_frame`
-   - `hypotheses`
-   - `search_plan`
-   - `missing_slot`
-   - `decision_rationale`
-   - `reasoning_public_trace`
-11. 生成 `route_trace`，记录：
-   - `run_id`
-   - `session_id`
-   - `route`
-   - `task_type`
-   - `tool_bundle`
-   - `entity_resolution`
-   - `intent_agent`
-   - `latency_hotspot.perception`
-   - `planner.problem_frame / hypotheses / search_plan / decision_rationale`
-12. 如果存在附件，构造 `evidence_pack["augmented_text"]` 供后续检索使用。
-
-当前 `plan node` 的真实语义已经是：
-
-- `Intent Agent` 负责结构化判意图
-- `Planner Agent` 负责结构化问题建模
-- 程序 fallback 负责在 JSON 失败或模型不稳定时兜底
-
-### 4.4 act node
-
-`act node` 不创建“客服小工具自由 Agent”，而是先看 Planner 的 `decision_rationale.response_mode`。
-
-```mermaid
-flowchart LR
-    Plan[Planner 产出] --> Mode{response_mode}
-    Mode -->|ask_one_question| Ask[直接返回一个关键追问]
-    Mode -->|direct_answer| PlannerChain[Planner 检索/证据审查直执链]
-    Mode -->|use_harness| Harness[确定性 execute_*_chain]
-    PlannerChain --> Answer[generated_answer]
-    Harness --> Answer
-```
-
-当前有两类执行：
-
-1. Planner 直执链
-   - `knowledge` -> `execute_planned_knowledge_chain`
-   - `chart_symbol / multimodal_understanding` -> `execute_planned_multimodal_chain`
-   - `conversation` -> `answer_conversation_memory`
-
-2. Harness 高风险执行链
-   - `ship_single`
-   - `ship_complex`
-   - `ship_stats`
-   - `ship_update`
-   - `file_task`
-   - `browser_verify`
-
-| route | 主执行链 | 说明 |
-| --- | --- | --- |
-| `knowledge` | `execute_planned_knowledge_chain` | Planner 负责检索规划、证据收敛和客服化回答 |
-| `chart_symbol` | `execute_planned_multimodal_chain` | Planner 结合截图感知和检索计划回答海图符号 |
-| `multimodal_understanding` | `execute_planned_multimodal_chain` | Planner 结合附件理解和检索计划补证据 |
-| `ship_single` | `execute_simple_ship_chain` | 单步船位/档案/PSC |
-| `ship_complex` | `execute_complex_ship_chain` | 轨迹、挂靠、航次、上一离港、停船 |
-| `ship_stats` | `execute_stats_chain` | 港口/区域/海峡/红海绕航 |
-| `ship_update` | `execute_update_chain` | 上传船位、更新静态信息 |
-| `file_task` | `execute_file_chain` | 文件检查、产物上传 |
-| `browser_verify` | `execute_browser_verify_chain` | 公开网页验证 |
-| `conversation` | `answer_conversation_memory` | 总结上文、上下文追问 |
-
-设计原则：
-
-- 低风险知识和截图问题先由 Planner 规划检索和证据
-- 高风险工具链仍由 Harness 托底，不把核心业务正确性交给 LLM 自由发挥
-- 工具调用顺序和缺字段追问是可预测的
-- 多模态只负责感知和补充证据，不直接越过证据审查
-
-此外，`act node` 在得到答案后不会直接进入 `finalize`，而是会先补一层 `Review Agent`：
-
-- `_run_customer_support_review_agent(...)` 判断当前证据是否足够直接回答
-- 若不足，则强制改为“只追问一个关键问题”
-
-### 4.5 check node
-
-`check node` 会验证：
-
-- 是否生成了答案
-- 链接是否可访问、是否在允许范围
-- `evidence_count`
-- 关键 check 结果是否存在
-  - `entity_resolved`
-  - `position_ok`
-  - `consistency_ok`
-  - `write_result`
-  - `metadata_checked`
-  - `verified`
-  - `ask_one_question`
-- `Response QA Agent` 是否通过
-- 是否已经发生 repair / degrade
-- 是否需要 loop
-
-这里的真实顺序已经变成：
-
-1. 程序级链接与基本答案校验
-2. `_run_customer_support_response_qa_agent(...)` 做客服回复质检
-3. 质检失败时 `_repair_customer_support_answer(...)` 尝试修复一次
-4. 修复仍失败则降级为单关键追问
-
-customer_support 默认只允许一次 loop；超过后走 fallback，避免客服渠道无限重试。
+当前 `route node` 只做轻量控制：
 
-### 4.6 finalize node
-
-`finalize node` 是对外输出的最后一道边界：
-
-1. 汇总总耗时到 `route_trace.latency_hotspot.total`
-2. 调用 `sanitize_customer_output(...)`
-3. 过滤：
-   - 工具名
-   - 路径
-   - `.env`
-   - key / token / secret
-   - `【公开资料参考】`
-   - `综合摘要`
-   - `【回答指导】`
-   - 原始来源标签和内部展示格式
-4. 返回客户可直接阅读的最终回复
-
-这一层就是 `Guard`。它不参与业务判断，只负责：
-
-- 固定拒答敏感内部请求
-- 抹平检索包装文本
-- 替换内部工具名
-- 屏蔽路径、`.env`、key、token、prompt、tool registry
-- 把任何中间链路残留收口成客户安全可见文本
-
-这意味着即使某条中间链路返回了搜索展示模板，最终也不会原样发给客户。
-
-## 5. customer_support 路由与消息类型
-
-当前主要 `route / task_type`：
-
-| route | task_type | 典型输入 | 工具 bundle |
-| --- | --- | --- | --- |
-| `knowledge` | `platform_knowledge` | “绿点是什么意思” “如何看船期” | `smart_search` |
-| `knowledge` | `platform_troubleshooting` | “页面报错怎么办” “上传不了航线” | `smart_search` |
-| `chart_symbol` | `chart_symbol` | “这个在全球海图里是什么意思” + 截图 | `inspect_media_attachment`, `smart_search` |
-| `multimodal_understanding` | `multimodal_understanding` | 附件理解但未命中特定符号/排障 | `inspect_media_attachment`, `smart_search` |
-| `ship_single` | `ship_single_query` | “查询 MMSI 414726000 船位” | `ship_search`, `get_ship_position`, `get_ship_archive`, `get_psc_records` |
-| `ship_complex` | `ship_multi_step_analysis` | “最近挂靠是否和航次一致” | 轨迹/挂靠/航次相关工具 |
-| `ship_stats` | `ship_stats` | “查询曼德海峡统计” | 区域/海峡/港口统计工具 |
-| `ship_update` | `ship_update` | “请更新船位 MMSI ...” | `ship_search`, `upload_ship_position`, `update_ship_static_info` |
-| `file_task` | `file_task` | “分析这个 Excel 并生成报告” | `inspect_customer_file`, `upload_customer_artifact` |
-| `browser_verify` | `browser_verify` | “核验这个官网信息” | `verify_public_page`, `smart_search` |
-| `conversation` | `conversation_memory` | “上面我问了哪些问题” | 无工具 |
-
-## 6. customer_support 各执行链
-
-### 6.1 Planner 知识检索链
-
-```mermaid
-flowchart LR
-    Q[用户问题] --> Frame[problem_frame]
-    Frame --> Hypo[hypotheses]
-    Hypo --> Plan[search_plan]
-    Plan --> Search[smart_search 按计划执行]
-    Search --> Review[evidence_items / evidence_summary]
-    Review --> Answer[客服化总结]
-```
-
-检索优先级：
-
-1. 本地知识库
-2. HiFleet 官网 / 帮助中心 / 官方社区
-3. 公共网页
-
-customer_support 不会把 `smart_search` 的原始展示模板直接返回给用户，而是通过 router 里的客服模板转成：
-
-- 先结论
-- 再解释
-- 再建议
-- 必要时只追问一个关键问题
-
-Planner 直执链当前会产出：
-
-- `search_plan`
-- `evidence_items`
-- `evidence_summary`
-- `final_confidence`
-
-### 6.1.1 `smart_search` 当前外部搜索实现
-
-当前 `smart_search` 的第 4-5 层不是单纯的生成式联网搜索，而是：
-
-1. 优先调用结构化联网搜索 API
-   - `POST https://open.feedcoopapi.com/search_api/web_search`
-   - `Authorization: Bearer <API_KEY>`
-2. 站内搜索场景优先限制到 HiFleet 官方域名
-3. `deep` 场景优先使用 `web_summary`
-4. 仅当结构化联网搜索失败时，回退到 `_ark_web_search(...)`
-
-当前字段使用原则：
-
-- 优先使用 `Summary`，不是 `Snippet`
-- 深搜时从 `Choices` 提取总结
-- `AuthInfoLevel / AuthInfoDes` 参与证据排序
-- `PublishTime` 参与时效判断
-
-Linux 部署兼容的 API Key 变量名：
-
-```bash
-VOLC_WEB_SEARCH_API_KEY
-WEB_SEARCH_API_KEY
-TORCHLIGHT_API_KEY
-ARK_WEBSEARCH_API_KEY
-ark_websearch_api_key
-```
-
-注意：
-
-- 项目启动时由 [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py) 加载 `COZE_WORKSPACE_PATH/.env`
-- 如果 Linux 服务进程没有读到 `.env`，结构化联网搜索会自动回退到 Ark 方案
-
-### 6.2 Planner 多模态链
-
-```mermaid
-flowchart TD
-    A[图片 / 语音 / 视频 / 文件] --> B[extract_attachments]
-    B --> C[_perceive_customer_attachments]
-    C --> D{是否符号/报错/文件任务?}
-    D -->|海图符号| E[chart_symbol]
-    D -->|报错截图| F[platform_troubleshooting]
-    D -->|文件任务| G[file_task]
-    D -->|其他| H[multimodal_understanding]
-    E --> I[拼接感知结果 + search_plan]
-    F --> J[排障模板回复]
-    G --> K[文件检查/产物上传]
-    H --> L[补充检索和证据审查后客服化输出]
-```
-
-当前已落地：
-
-- 图片截图理解
-- 本地图像启发式兜底
-- 报错截图自动改路由
-- 海图符号检索 query 拼接
-- 文件链入口
-- 流式调试事件展示感知过程
-
-### 6.3 简单船舶查询链
-
-顺序：
-
-1. 抽取 `MMSI / IMO / ship_name`
-2. 缺唯一标识时只问一个问题
-3. 只有船名时先 `ship_search`
-4. 按问题调用 `get_ship_position / get_ship_archive / get_psc_records`
-5. 组织客服答复
-
-### 6.4 复杂船舶分析链
-
-顺序：
-
-1. 补齐 MMSI
-2. 查询档案 + 当前船位
-3. 按问题补调：
-   - `get_ship_trajectory`
-   - `get_ship_call_ports`
-   - `get_ship_voyages`
-   - `get_last_departure`
-   - `get_current_stop`
-4. 做一致性检查
-5. 输出结论和校验提示
-
-### 6.5 Harness 写操作链
-
-规则：
-
-- 用户明确要求更新/上传
-- 字段完整才执行
-- 缺字段只问一个关键问题
-- 不二次确认
-- 最终成功/失败只能基于真实工具结果
-
-### 6.6 文件与浏览器链
-
-`customer_support` 开放的是受控能力，不是 `employee_assistant` 的全自由链。
-
-文件链和浏览器链仍属于 Harness 范围，不让 Planner 直接自由调用内部执行能力。
-
-文件链只做：
-
-- 文件检查
-- 只读解析
-- 产物上传
-- 返回客户安全摘要和 OSS/S3 可访问链接
-
-浏览器链只做：
-
-- 公开 URL 验证
-- 官网/官方社区核验
-- 不暴露浏览器日志、cookie、内部截图
-
-### 6.7 Planner 与 Harness 分工
-
-| 能力 | Planner Agent | Harness | Guard |
-| --- | --- | --- | --- |
-| 问题理解 | 是 | 否 | 否 |
-| 候选假设 | 是 | 否 | 否 |
-| 检索计划 | 是 | 否 | 否 |
-| 证据审查 | 是 | 部分，主要是工具结果 check | 否 |
-| 船舶查询 | 决策是否进入 | 是 | 否 |
-| 写操作 | 决策是否进入 | 是 | 否 |
-| 文件/网页核验 | 决策是否进入 | 是 | 否 |
-| 敏感拒答 | 否 | 否 | 是 |
-| 输出脱敏 | 否 | 否 | 是 |
-
-## 7. `/stream_run` 调试流
-
-`/stream_run` 不是输出隐藏的 chain-of-thought，而是输出安全、可审计的调试说明。
+1. 读取本轮最新用户文本
+2. 检查是否命中敏感内部探查请求
+3. 做轻量 `route / task_type / entities / attachments` 标注
+
+关键点：
+
+- 这里的 route 分类主要服务于 trace 和调试
+- 不再驱动旧 Planner/Harness 主链
+- 只要不是敏感请求，就直接交给标准客服 Agent
+
+### 4.3 delegate node
+
+`delegate node` 会调用 `_build_standard_agent(...)` 构造的标准客服 Agent。
+
+这层会装配：
+
+- `config/system_prompt_base.md`
+- `config/profiles/customer_support.md`
+- profile 允许的 skills 的 `SKILL.md`
+- 运行态模型配置
+- profile allowlist tools
+- `get_memory_saver()`
+
+然后把这些统一交给 `create_agent(...)`。
+
+### 4.4 check node
+
+`check node` 现在是后置 Guard：
+
+1. 提取标准 Agent 最终回答
+2. 调 `sanitize_customer_output(...)`
+3. 做链接校验
+4. 如果回答为空、不安全或不稳定，降级到统一致歉/建议补充信息
+
+### 4.5 finalize node
+
+`finalize node` 负责：
+
+- 返回最终客户可见文本
+- 汇总 `tool_call_sequence / check_result / latency`
+- 保证 `/run`、`/stream_run` 和 runtime state 一致
+
+## 5. customer_support 工具与知识能力
+
+当前 `customer_support` 的执行重心不再是复杂链路编排，而是：
+
+1. `customer_support` profile prompt 是否给对了行为约束
+2. `smart_search` 是否命中知识库和官方资料
+3. ship tools 是否返回了正确业务数据
+4. Guard 是否把不该暴露的内容挡住
+
+已知现实限制：
+
+- 知识库内容仍不足
+- 公网搜索匹配能力仍偏弱
+- 后续更适合补知识库和接入 `agent-browser`，而不是继续加厚中间推理层
+
+## 6. `/stream_run` 调试流
+
+当前调试流展示的是和 runtime 对齐的简化阶段：
+
+- `message_start`
+- `thinking`
+  - 前置安全与问题识别
+  - 标准客服 Agent 装配
+  - 附件输入分析
+  - 后置内容质检
+- `tool_response`
+  - 从真实 `tool_call_sequence` 提取
+- `answer`
+- `message_end`
+
+## 7. 当前 customer_support 阅读顺序
+
+建议按下面顺序读源码：
+
+1. [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+2. [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+3. [config/profiles/customer_support.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/config/profiles/customer_support.md)
+4. [src/agents/customer_support_guard.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_guard.py)
+5. [src/agents/customer_support_stream_debug.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_stream_debug.py)
 
 ```mermaid
 flowchart TD
@@ -472,20 +178,16 @@ flowchart TD
     Graph --> Update["真实 node updates"]
     Update --> Debug["build_customer_support_debug_events_from_update"]
     Debug --> SSE1[thinking]
-    Debug --> SSE2[tool_request]
-    Debug --> SSE3[tool_response]
-    Debug --> SSE4[answer]
-    SSE4 --> End[message_end]
+    Debug --> SSE2[tool_response]
+    Debug --> SSE3[answer]
+    SSE3 --> End[message_end]
 ```
 
 调试界面可看到：
 
-- `intent_agent_result`
-- `reasoning_public_trace`
-- `search_plan`
+- route / task_type
 - 实际执行过的工具
-- `review_agent_result`
-- `response_qa_result`
+- post guard 是否触发
 - 最终回复
 
 不会输出：
@@ -521,6 +223,330 @@ flowchart TD
 - 重点是产物和分析结果，不是客服化话术
 - `customer_support` 可以用文件/浏览器/多模态，但必须受控且对外极度收口
 
+### 8.1 入口判断
+
+`employee_assistant` 不是所有请求都进入沙盒工作流，先经过 `route node` 判断。
+
+关键函数：
+
+- `_extract_local_file_path(...)`
+- `_extract_public_file_url(...)`
+- `_extract_expected_artifact(...)`
+- `_detect_workspace_task(...)`
+- `_build_employee_agent(...)`
+
+真实判断逻辑：
+
+1. 先取最新用户文本
+2. 如果命中敏感内部请求，直接固定拒答
+3. 解析本地文件路径或公开文件 URL
+4. 推断用户是否真的在提“表格/数据/产物任务”
+5. 只有“文件输入 + 分析类关键词”同时成立，才进入 employee loop
+6. 否则直接 `delegate` 到标准 Agent
+
+这意味着：
+
+- `employee_assistant` 不是“任何消息都进 Python”
+- 它是“先判断是否值得进入受控文件任务闭环”
+
+### 8.1.1 employee 标准问答 agent
+
+很多人第一次读 `employee_assistant` 时会误以为：
+
+```text
+只要 profile 是 employee_assistant，所有请求都会进入 plan -> act -> check。
+```
+
+这不对。
+
+对于普通知识问答、平台功能咨询、船舶查询类消息，`employee_assistant` 实际上会走 `delegate -> standard agent`，而不是走 sandbox loop。
+
+流程图：
+
+```mermaid
+flowchart TD
+    A["/run or /stream_run"] --> B["resolve_profile_id = employee_assistant"]
+    B --> C["_build_employee_agent(...)"]
+    C --> D["route_node"]
+    D -->|workspace_task = true| E["employee workspace loop"]
+    D -->|workspace_task = false| F["delegate_node"]
+    F --> G["_build_standard_agent(...)"]
+    G --> H["create_agent(...)"]
+    H --> I["按 prompt + tools 自主决定是否检索/调船舶工具"]
+    I --> J["最终 messages 返回"]
+```
+
+真实源码位置：
+
+- 入口 profile 解析：
+  - [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+  - `resolve_profile_id(...)`
+- employee graph：
+  - [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+  - `_build_employee_agent(...)`
+- 标准问答 agent 装配：
+  - [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+  - `_build_standard_agent(...)`
+
+具体逻辑：
+
+1. 请求先统一进入 `/run` 或 `/stream_run`
+2. `resolve_profile_id(...)` 识别当前 profile 是 `employee_assistant`
+3. `build_agent(...)` 因 profile 命中，构造 `_build_employee_agent(...)`
+4. `route_node` 先判断当前消息是不是 workspace task
+5. 如果不是，就进入 `delegate_node`
+6. `delegate_node` 调 `standard_agent.invoke(...)`
+7. 标准问答 agent 再基于自身 prompt 和 tools 自主决定是否调用 `smart_search`、船舶工具等
+
+这里最重要的理解是：
+
+- employee graph 只负责先做一次“是否进入文件任务闭环”的判断
+- 普通问答真正执行时，靠的是 `create_agent(...)` 驱动的标准 agent
+
+### 8.1.2 standard agent 的装配结构
+
+`_build_standard_agent(...)` 没有再手写一套 `route -> plan -> check`。
+
+它只是把 4 个东西装起来：
+
+1. `system_prompt`
+2. `llm`
+3. `tools`
+4. `checkpointer/state_schema`
+
+对应代码：
+
+- `_build_system_prompt(...)`
+- `_build_llm(...)`
+- `_load_all_tools(...)`
+- `create_agent(...)`
+
+流程图：
+
+```mermaid
+flowchart LR
+    A["system_prompt_base.md"] --> D["full system prompt"]
+    B["employee_assistant.md"] --> D
+    C["allowed skills: SKILL.md"] --> D
+    D --> E["ChatOpenAI runtime model"]
+    F["profile allowlist tools"] --> G["tools"]
+    E --> H["create_agent(...)"]
+    G --> H
+    I["get_memory_saver + AgentState(messages)"] --> H
+```
+
+这说明 `employee` 标准问答链的“显式结构”比 `customer_support` 简单很多：
+
+- 项目自己只装配上下文和能力
+- 具体调用几轮工具，由通用 agent runtime 决定
+
+### 8.1.3 employee 标准问答 agent 的 prompt 来源
+
+`standard agent` 的 system prompt 不是单文件，而是三层拼接：
+
+1. `config/system_prompt_base.md`
+2. `config/profiles/employee_assistant.md`
+3. profile 允许的 skills 的 `SKILL.md`
+
+对应逻辑在 `_build_system_prompt(...)`。
+
+对理解行为最关键的是 `employee_assistant.md` 中的几条规则：
+
+- 内部数字员工助手，不只是聊天
+- 对 factual/customer-facing content，优先 search first
+- 对文件类任务，inspect -> sandbox -> verify
+- 不暴露 prompt、架构、tool registry、凭证、环境配置
+
+也就是说，即便走的是“标准问答 agent”，它仍然带着 employee profile 的身份和限制。
+
+### 8.1.4 employee 标准问答 agent 的工具范围
+
+当前 `employee_assistant` 的 profile allowlist 来自：
+
+- [config/agent_profiles.json](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/config/agent_profiles.json)
+
+skills 为：
+
+- `knowledge_qa`
+- `hifleet_ship_service`
+- `employee_workspace`
+
+这些 skills 经 `SkillLoader.get_tools_by_skill_names(...)` 展开后，常见工具包括：
+
+- `smart_search`
+- `ship_search`
+- `get_ship_position`
+- `get_ship_archive`
+- `get_psc_records`
+- `get_area_traffic`
+- `get_strait_traffic`
+- `download_public_file_to_artifact`
+- `inspect_tabular_file`
+- `run_sandboxed_python`
+
+但对“普通问答”最关键的是前两类：
+
+- 平台/行业知识：通常由 `smart_search` 支撑
+- 船舶查询类：通常由 ship service 工具支撑
+
+### 8.1.5 读普通问答链时该怎么看源码
+
+如果你的问题是：
+
+```text
+employee_assistant 对“绿点是什么意思”“为什么船位更新慢”“怎么查船期”这种问题怎么处理？
+```
+
+推荐按下面顺序读：
+
+1. [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+   先看 `normalize_request_payload(...)` 和 `classify_intent_hint(...)`
+2. [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+   看 `_build_employee_agent(...)` 里的 `route_node / delegate_node`
+3. [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+   再看 `_build_standard_agent(...)`
+4. [src/skills/knowledge_qa/SKILL.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/skills/knowledge_qa/SKILL.md)
+   理解平台知识问答为什么优先 `smart_search`
+5. [src/skills/hifleet_ship_service/SKILL.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/skills/hifleet_ship_service/SKILL.md)
+   理解船舶查询类普通问答为什么会调船舶工具
+
+你应该先建立这个判断：
+
+- 这条消息是否是 workspace task？
+
+只有确认不是，后面读 `standard agent` 才有意义。
+
+### 8.2 route -> plan -> act -> check -> loop/finalize
+
+`employee_assistant` 的核心不是检索，而是“先看文件结构，再生成代码，再进沙盒执行，再按结果修复”。
+
+#### route node
+
+职责：
+
+- 拒绝敏感内部请求
+- 识别输入文件和公开链接
+- 推断是否是 workspace task
+
+关键 state：
+
+- `workspace_task`
+- `task_goal`
+- `target_file_path`
+- `source_file_url`
+- `expected_artifact`
+
+#### plan node
+
+职责：
+
+1. 如果只有公开 URL，没有本地文件，先下载
+2. 调用 `inspect_tabular_file`
+3. 解析文件 schema
+4. 把 schema 交给后续代码生成
+
+关键工具：
+
+- `download_public_file_to_artifact`
+- `inspect_tabular_file`
+
+关键点：
+
+- 这一层不生成 Python
+- 这一层先把“文件真实结构”固定下来，避免模型臆造列名
+
+#### act node
+
+职责：
+
+- 基于 `task_goal + file_schema + last_error` 生成下一轮 Python 代码
+
+关键点：
+
+- 提示词明确要求“只返回 Python 代码”
+- 代码必须基于真实 schema
+- 输入文件必须从 `INPUT_FILE` 读取
+- 输出产物必须写到 `ARTIFACT_DIR`
+- 禁止 `eval/exec/compile/getattr/setattr` 和双下划线访问
+
+这层本质上是“受控 codegen”，不是自由编程代理。
+
+#### check node
+
+职责：
+
+- 调用 `run_sandboxed_python`
+- 检查：
+  - `exit_code`
+  - `artifact_check.ok`
+  - `stdout/stderr`
+
+如果成功：
+
+- 进入 `finalize`
+
+如果失败：
+
+- 进入 `loop`
+- 把 `stderr / exit_code / artifact_check` 记录到 `last_error`
+- 下一轮 codegen 会显式看到这些失败信息
+
+#### loop node
+
+职责：
+
+- 递增 `loop_count`
+- 重新回到 `act`
+
+这里是 employee 链和 customer 链差异最大的地方之一：
+
+- `customer_support` 默认只给 1 次 loop
+- `employee_assistant` 默认允许多轮自愈，次数由 `HIFLEET_EMPLOYEE_MAX_LOOPS` 控制
+
+#### finalize / fail
+
+成功：
+
+- `finalize` 会汇总产物和执行日志
+
+失败：
+
+- `fail` 会输出“自动修复已达到上限”以及最后一次错误摘要
+
+### 8.3 employee_assistant 的真正核心
+
+如果只记住一句话：
+
+```text
+employee_assistant 不是“会写 Python 的聊天机器人”，
+而是“先看文件结构，再做受控代码生成，再用沙盒校验结果，再按错误自愈”的工作流。
+```
+
+理解这条链时最重要的不是 prompt 花样，而是 3 个约束点：
+
+1. 文件结构先被固定
+2. 代码执行环境被固定
+3. 成功条件由程序检查，不由模型自报
+
+### 8.4 学习 employee_assistant 的推荐顺序
+
+建议按这条顺序读代码：
+
+1. [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+   先看 `_build_employee_agent(...)`
+2. [src/skills/employee_workspace/tools.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/skills/employee_workspace/tools.py)
+   再看 `inspect_tabular_file / run_sandboxed_python`
+3. [docs/EMPLOYEE_ASSISTANT_SANDBOX_RUNBOOK.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/docs/EMPLOYEE_ASSISTANT_SANDBOX_RUNBOOK.md)
+   最后看部署、环境变量、排障
+
+如果要快速验证你是否已经理解到位，可以回答这 5 个问题：
+
+1. 哪些请求不会进入 employee loop，而是直接 delegate？
+2. 为什么必须先做 `inspect_tabular_file`，不能直接让模型猜列名？
+3. `last_error` 是如何参与下一轮代码生成的？
+4. 什么时候算执行成功，是看模型说成功，还是看 `exit_code/artifact_check`？
+5. `employee_assistant` 为什么允许多轮 loop，而 `customer_support` 不适合？
+
 ## 9. 安全边界
 
 两个 profile 都不能向用户暴露：
@@ -552,23 +578,18 @@ flowchart TD
 customer_support 排障时优先看：
 
 1. `route / task_type` 是否符合真实问题。
-2. `route_trace.planner.problem_frame` 是否正确建模问题。
-3. `route_trace.planner.search_plan` 是否合理改写了检索方向。
-4. `decision_rationale.response_mode` 是否应该直答、追问还是进入 harness。
-5. `entity_resolution` 是否被错误继承。
-6. `tool_call_sequence` 是否走了预期 Planner 链或 Harness。
-7. `review_agent_result` 是否错误放行或错误拦截。
-8. `response_qa_result` 是否错误修复或错误降级。
-9. `evidence_summary` 是否支持当前结论。
-10. `latency_hotspot.perception` 是否异常偏高。
-11. `generated_answer` 是否被 `sanitize_customer_output` 正确收口。
+2. `entity_resolution` 是否被错误继承。
+3. `tool_call_sequence` 是否走了预期工具。
+4. `check_result` 是否因为空答、敏感内容或无效链接触发 post guard。
+5. `generated_answer` 是否被 `sanitize_customer_output` 正确收口。
+6. `latency_hotspot.total` 是否异常偏高。
 
 ## 11. 文档与代码联动规则
 
 后续改动遵循：
 
-1. Planner 建模、检索规划、证据审查变更，先改 `src/agents/customer_support_router.py`
-2. 主 graph 和 Planner/Harness 编排变化，改 `src/agents/agent.py`
+1. `customer_support` 主 graph 变化，先改 `src/agents/agent.py`
+2. 检索、ship/file/browser 工具能力变化，再改 `src/agents/customer_support_router.py`
 3. 输出边界变更，补 `src/agents/customer_support_guard.py`
 4. 流式调试变更，补 `src/agents/customer_support_stream_debug.py`
 5. 同步更新：

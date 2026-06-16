@@ -26,7 +26,7 @@ def test_reference_01_stream_debug_explains_chart_symbol_search():
     assert any(item["type"] == "tool_request" for item in events)
     assert "安全水域浮标" in text
     assert "HiFleet 全球海图 海图符号" in text
-    assert "审查与确定" in text
+    assert "后置内容质检" in text
 
 
 def test_reference_02_stream_debug_has_upload_route_searches():
@@ -37,7 +37,7 @@ def test_reference_02_stream_debug_has_upload_route_searches():
     assert len(queries) >= 3
     assert "上传航线" in text
     assert "文件格式" in text
-    assert "浏览器" in text
+    assert "标准客服 Agent" in text
 
 
 def test_reference_03_stream_debug_explains_anchor_area_circles():
@@ -45,7 +45,7 @@ def test_reference_03_stream_debug_explains_anchor_area_circles():
     text = "\n".join(str(item.get("text", "")) for item in events)
 
     assert "锚地" in text
-    assert "多模态感知" in text
+    assert "附件输入分析" in text
     assert any(item["type"] == "tool_response" for item in events)
 
 
@@ -53,28 +53,23 @@ def test_reference_04_stream_debug_is_safe_methodology():
     events = _events_for("基于上述对输入的思考与回复，总结是如何思索和检索资源并审查确定的，详细介绍逻辑")
     text = "\n".join(str(item.get("text", "")) for item in events)
 
-    assert "识别用户意图" in text
+    assert "前置安全" in text
     assert "本地知识库" in text
     assert "不展示内部工具名" in text
     assert "api_key" not in text.lower()
     assert "system prompt" not in text.lower()
 
 
-def test_runtime_update_debug_events_follow_real_plan_state():
+def test_runtime_update_debug_events_follow_real_delegate_state():
     cursor = DebugRuntimeCursor()
     update = {
-        "plan": {
+        "delegate": {
             "route": "knowledge",
             "task_type": "platform_knowledge",
-            "intent_agent_result": {"intent": "knowledge", "why": "用户在询问平台功能定义"},
-            "reasoning_public_trace": [
-                {"phase": "understand", "text": "已识别当前问题类型：definition。"},
-                {"phase": "search_plan", "text": "已规划 2 条检索方向，优先本地知识库和 HiFleet 官方资料。"},
-            ],
-            "search_plan": [
-                {"query": "HiFleet 绿点是什么意思", "source_priority": ["local_kb", "official_site"]},
-                {"query": "HiFleet 绿点 船舶颜色", "source_priority": ["official_site"]},
-            ],
+            "attachments": [{"type": "image"}],
+            "route_trace": {
+                "tool_call_sequence": ["smart_search", "get_ship_position"],
+            },
         }
     }
 
@@ -82,9 +77,29 @@ def test_runtime_update_debug_events_follow_real_plan_state():
     text = "\n".join(str(item.get("text", "")) for item in events)
 
     assert any(item["type"] == "message_start" for item in events)
-    assert any(item["type"] == "tool_request" for item in events)
-    assert "意图识别" in text
-    assert "已规划 2 条检索方向" in text
+    assert any(item["type"] == "tool_response" for item in events)
+    assert "标准客服 Agent" in text
+    assert "附件输入分析" in text
+
+
+def test_runtime_update_debug_events_follow_post_guard_state():
+    cursor = DebugRuntimeCursor(started=True)
+    update = {
+        "check": {
+            "check_result": {
+                "has_answer": True,
+                "links_ok": False,
+                "post_guard_applied": True,
+            }
+        }
+    }
+
+    events = build_customer_support_debug_events_from_update(update, cursor)
+    text = "\n".join(str(item.get("text", "")) for item in events)
+
+    assert any(item["type"] == "thinking" for item in events)
+    assert "后置内容质检" in text
+    assert "安全兜底" in text
 
 
 def test_runtime_update_debug_events_emit_final_answer():

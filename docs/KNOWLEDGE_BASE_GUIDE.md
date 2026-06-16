@@ -8,12 +8,12 @@
 
 ## 1. 当前检索链路
 
-`customer_support` 的平台问题在 `plan` 阶段被判定为 `knowledge` 后，只暴露 `knowledge bundle`，即 `smart_search`。
+`customer_support` 当前走标准客服 Agent。对于平台知识类问题，prompt 会要求优先使用 `smart_search`，而不是依赖外部复杂 Planner。
 
 ```mermaid
 flowchart TD
-    Q[用户平台问题] --> Plan[customer_support plan<br/>agent intent decision]
-    Plan --> Smart[smart_search]
+    Q[用户平台问题] --> Agent[customer_support standard agent]
+    Agent --> Smart[smart_search]
     Smart --> L1[术语速查]
     L1 -->|命中| Done[返回标准解释]
     L1 -->|未命中| L2[FAQ/标准回复 KB]

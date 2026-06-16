@@ -1404,67 +1404,53 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
 
 
 def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
-    logger.info("[MainAgent] Building customer_support phase graph")
-    fallback_agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+    logger.info("[MainAgent] Building customer_support standard-agent graph")
+    standard_agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
     allowed_write = bool((profile.tool_policy or {}).get("allow_write_actions", False))
+    guard_fallback = "抱歉，我暂时没能稳定确认这个问题的答案。您可以补充更具体的问题、相关截图，或联系人工客服继续处理。"
 
-    def _latest_human_content(messages: list[AnyMessage]) -> Any:
-        for msg in reversed(messages):
-            if isinstance(msg, HumanMessage):
-                return msg.content
-            if isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user":
-                return msg.get("content", "")
-        return ""
-
-    def _perceive_customer_attachments(messages: list[AnyMessage], attachments: list[Attachment], text: str) -> dict[str, Any]:
-        if not attachments:
-            return {}
-        local_fallback = _heuristic_image_perception(attachments, text)
-        fallback = {
-            "confidence": local_fallback.get("confidence", "low"),
-            "summary": "",
-            "visible_text": "",
-            "suspected_issue": "",
-            "attachment_types": [item.type for item in attachments],
-            **local_fallback,
-        }
-        try:
-            api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
-            base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
-            model = str((cfg.get("config") or {}).get("multimodal_model") or "doubao-seed-2-0-lite-260428")
-            if not api_key or not base_url:
-                return fallback
-            llm = ChatOpenAI(
-                model=model,
-                api_key=api_key,
-                base_url=base_url,
-                temperature=0.1,
-                streaming=False,
-                timeout=cfg["config"].get("timeout", 600),
-                extra_body={"thinking": {"type": "disabled"}},
-                default_headers=default_headers(ctx) if ctx else {},
-            )
-            prompt = (
-                "你是 HiFleet 客服的多模态感知层。只输出 JSON，不要解释。\n"
-                "字段：confidence(high/medium/low), summary, visible_text, suspected_symbol, suspected_issue, need_followup。\n"
-                "重点识别截图中的界面元素、海图符号、报错文字、上传失败线索；不确定时 confidence=low。\n"
-                f"用户文字：{text}"
-            )
-            result = llm.invoke([SystemMessage(content=prompt), HumanMessage(content=_latest_human_content(messages))])
-            parsed = _json_object_from_text(getattr(result, "content", ""))
-            return parsed or fallback
-        except Exception as exc:
-            logger.warning("[CustomerSupportTrace] multimodal perception fallback: %s", exc)
-            return fallback
-
-    def _classify_customer_support(messages: list[AnyMessage], entities: MessageEntities, context: ConversationContext) -> RouteDecision:
+    def _classify_customer_support(messages: list[AnyMessage]) -> tuple[RouteDecision, dict[str, Any], list[dict[str, Any]]]:
+        text = latest_customer_user_text(messages)
+        context = build_conversation_context(messages)
+        raw_entities = extract_entities(text)
+        attachments = extract_attachments(messages)
         if intent_hint:
             decision = _customer_support_route_for_intent(intent_hint, allowed_write)
         else:
-            decision = classify_message(latest_customer_user_text(messages), entities, context)
-        if decision.route == "ship_update" and not allowed_write:
-            decision = RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="write disabled")
-        return decision
+            decision = classify_message(text, raw_entities, context)
+        decision = classify_multimodal_message(text, attachments, decision)
+        entities = resolve_entities_with_context(
+            raw_entities,
+            context,
+            allow_ship_context=should_use_ship_context(decision.route),
+        )
+        return decision, dict(entities.model_dump()), [asdict(item) for item in attachments]
+
+    def _extract_final_answer(messages: list[AnyMessage]) -> str:
+        for msg in reversed(messages or []):
+            if isinstance(msg, AIMessage):
+                return str(msg.content or "").strip()
+            if isinstance(msg, dict):
+                role = str(msg.get("role") or msg.get("type") or "").lower()
+                if role in {"assistant", "ai"}:
+                    return str(msg.get("content", "") or "").strip()
+        return ""
+
+    def _extract_tool_sequence(messages: list[AnyMessage]) -> list[str]:
+        sequence: list[str] = []
+        seen: set[str] = set()
+        for msg in messages or []:
+            tool_calls: list[dict[str, Any]] = []
+            if isinstance(msg, AIMessage):
+                tool_calls = list(getattr(msg, "tool_calls", []) or [])
+            elif isinstance(msg, dict):
+                tool_calls = list(msg.get("tool_calls", []) or [])
+            for item in tool_calls:
+                name = str(item.get("name", "")).strip()
+                if name and name not in seen:
+                    sequence.append(name)
+                    seen.add(name)
+        return sequence
 
     def route_node(state: CustomerSupportState) -> dict[str, Any]:
         messages = state.get("messages", [])
@@ -1481,22 +1467,35 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 "task_type": "security_refusal",
                 "tool_bundle": [],
                 "entities": {},
+                "attachments": [],
                 "route_trace": {
                     "route": "security_refusal",
                     "task_type": "security_refusal",
                     "tool_bundle": [],
                     "tool_call_sequence": [],
-                    "check_result": {"blocked": True},
+                    "check_result": {"blocked": True, "pre_guard": True},
                     "answer_confidence": "high",
                 },
             }
+        decision, entities, attachments = _classify_customer_support(messages)
+        trace = make_trace(
+            decision,
+            MessageEntities(**entities),
+            session_id=str(state.get("session_id", "")),
+            run_id=str(getattr(ctx, "run_id", "") or ""),
+        )
         return {
             "phase": "route",
             "phase_history": ["route"],
             "support_task": bool(text),
             "task_goal": text,
+            "route": decision.route,
+            "task_type": decision.task_type,
+            "tool_bundle": list(decision.tool_bundle or []),
+            "entities": entities,
+            "attachments": attachments,
             "started_at_ms": int(time.time() * 1000),
-            "loop_count": int(state.get("loop_count") or 0),
+            "route_trace": asdict(trace),
         }
 
     def delegate_node(state: CustomerSupportState) -> dict[str, Any]:
@@ -1510,391 +1509,49 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "agent_profile": state.get("agent_profile", profile.profile_id),
             "intent_hint": state.get("intent_hint", intent_hint),
         }
-        delegated = fallback_agent.invoke(payload, context=ctx)
+        delegated = standard_agent.invoke(payload, context=ctx)
+        route_trace = dict(state.get("route_trace", {}) or {})
+        route_trace["tool_call_sequence"] = _extract_tool_sequence(list(delegated.get("messages", []) or []))
         delegated["phase"] = "delegated"
         delegated["status"] = delegated.get("status", "delegated")
         delegated["phase_history"] = list(state.get("phase_history", [])) + ["delegated"]
         delegated["support_task"] = False
+        delegated["route"] = state.get("route", "")
+        delegated["task_type"] = state.get("task_type", "")
+        delegated["tool_bundle"] = list(state.get("tool_bundle", []) or [])
+        delegated["entities"] = dict(state.get("entities", {}) or {})
+        delegated["attachments"] = list(state.get("attachments", []) or [])
+        delegated["task_goal"] = state.get("task_goal", "")
+        delegated["started_at_ms"] = int(state.get("started_at_ms") or 0)
+        delegated["route_trace"] = route_trace
         return delegated
 
-    def plan_node(state: CustomerSupportState) -> dict[str, Any]:
-        messages = state.get("messages", [])
-        text = state.get("task_goal", "") or latest_customer_user_text(messages)
-        context = build_conversation_context(messages)
-        raw_entities = extract_entities(text)
-        attachments = extract_attachments(messages)
-        fallback_decision = _classify_customer_support(messages, raw_entities, context)
-        intent_agent_result = _run_customer_support_intent_agent(
-            ctx=ctx,
-            cfg=cfg,
-            messages=messages,
-            text=text,
-            entities=raw_entities,
-            context=context,
-            allow_write=allowed_write,
-        )
-        decision = (
-            _customer_support_route_for_intent(str(intent_agent_result.get("intent", "")), allowed_write)
-            if intent_agent_result.get("intent")
-            else fallback_decision
-        )
-        decision = classify_multimodal_message(text, attachments, decision)
-        perception_started = time.time()
-        perception = _perceive_customer_attachments(messages, attachments, text) if attachments else {}
-        perception_ms = int((time.time() - perception_started) * 1000) if attachments else 0
-        decision = refine_multimodal_route_with_perception(text, attachments, perception, decision)
-        allow_context_ship = should_use_ship_context(decision.route) and (
-            bool(intent_agent_result.get("use_context_ship"))
-            or bool(raw_entities.mmsi or raw_entities.imo or raw_entities.ship_name)
-            or not bool(intent_agent_result)
-        )
-        entities = resolve_entities_with_context(
-            raw_entities,
-            context,
-            allow_ship_context=allow_context_ship,
-        )
-        trace = make_trace(
-            decision,
-            entities,
-            session_id=str(state.get("session_id", "")),
-            run_id=str(getattr(ctx, "run_id", "") or ""),
-        )
-        if perception_ms:
-            trace.latency_hotspot["perception"] = perception_ms
-        fallback_planner_pack = build_customer_support_plan(
-            text=text,
-            decision=decision,
-            entities=entities,
-            context=context,
-            attachments=attachments,
-            perception=perception,
-        )
-        planner_agent_result = _run_customer_support_planner_agent(
-            ctx=ctx,
-            cfg=cfg,
-            text=text,
-            decision=decision,
-            entities=entities,
-            context=context,
-            attachments=attachments,
-            perception=perception,
-            fallback_plan=fallback_planner_pack,
-        )
-        planner_pack = planner_agent_result or fallback_planner_pack
-        evidence_pack: dict[str, Any] = {}
-        if attachments:
-            evidence_pack["augmented_text"] = build_multimodal_search_query(
-                text,
-                perception,
-                decision.route,
-                attachments[-1].type,
-            )
-        trace_payload = asdict(trace)
-        trace_payload["intent_agent"] = dict(intent_agent_result or {})
-        trace_payload["planner"] = {
-            "problem_frame": dict(planner_pack.get("problem_frame", {}) or {}),
-            "hypotheses": list(planner_pack.get("hypotheses", []) or []),
-            "search_plan": list(planner_pack.get("search_plan", []) or []),
-            "decision_rationale": dict(planner_pack.get("decision_rationale", {}) or {}),
-            "reasoning_public_trace": list(planner_pack.get("reasoning_public_trace", []) or []),
-        }
-        logger.info(
-            "[CustomerSupportPlanner] run_id=%s session_id=%s route=%s task_type=%s bundle=%s response_mode=%s entities=%s reason=%s",
-            trace.run_id,
-            trace.session_id,
-            decision.route,
-            decision.task_type,
-            decision.tool_bundle,
-            planner_pack.get("decision_rationale", {}).get("response_mode", ""),
-            trace.entity_resolution,
-            decision.reason,
-        )
-        return {
-            "phase": "act",
-            "phase_history": list(state.get("phase_history", [])) + ["plan"],
-            "route": decision.route,
-            "task_type": decision.task_type,
-            "tool_bundle": decision.tool_bundle,
-            "entities": trace.entity_resolution,
-            "attachments": [asdict(item) for item in attachments],
-            "perception_result": perception,
-            "intent_agent_result": dict(intent_agent_result or {}),
-            "planner_agent_result": dict(planner_agent_result or {}),
-            "problem_frame": dict(planner_pack.get("problem_frame", {}) or {}),
-            "hypotheses": list(planner_pack.get("hypotheses", []) or []),
-            "search_plan": list(planner_pack.get("search_plan", []) or []),
-            "decision_rationale": dict(planner_pack.get("decision_rationale", {}) or {}),
-            "missing_slot": dict(planner_pack.get("missing_slot", {}) or {}),
-            "reasoning_public_trace": list(planner_pack.get("reasoning_public_trace", []) or []),
-            "evidence_pack": evidence_pack,
-            "route_trace": trace_payload,
-        }
-
-    def act_node(state: CustomerSupportState) -> dict[str, Any]:
-        messages = state.get("messages", [])
-        question = str(state.get("task_goal", "") or latest_customer_user_text(messages))
-        text = str((state.get("evidence_pack", {}) or {}).get("augmented_text") or question)
-        context = build_conversation_context(messages)
-        entities = resolve_entities_with_context(
-            extract_entities(question),
-            context,
-            allow_ship_context=should_use_ship_context(str(state.get("route", ""))),
-        )
-        attachments = [Attachment(**item) for item in list(state.get("attachments", []) or [])]
-        try:
-            response_mode = str((state.get("decision_rationale", {}) or {}).get("response_mode", ""))
-            missing_slot = dict(state.get("missing_slot", {}) or {})
-            evidence_items: list[dict[str, Any]] = []
-            evidence_summary: dict[str, Any] = {}
-            base_route_trace = dict(state.get("route_trace", {}) or {})
-            reasoning_public_trace = list(state.get("reasoning_public_trace", []) or [])
-            if response_mode == "ask_one_question" and missing_slot.get("question"):
-                route_trace = dict(base_route_trace)
-                route_trace["check_result"] = {"ask_one_question": True, "missing_slot": missing_slot.get("field", "")}
-                route_trace["answer_confidence"] = "medium"
-                answer = str(missing_slot.get("question", "")).strip()
-                review_result = {
-                    "best_hypothesis": "",
-                    "can_answer_directly": False,
-                    "confidence": "medium",
-                    "conflicts": [],
-                    "missing_key_fact": str(missing_slot.get("field", "")),
-                    "recommended_response_style": "ask_one_question",
-                }
-                reasoning_public_trace = _append_customer_support_reasoning_trace(reasoning_public_trace, "review", "当前信息不足，已改为只追问一个关键问题。")
-            elif str(state.get("route", "")) in HARNESSED_ROUTES:
-                answer, route_trace = _execute_customer_support_harness(
-                    text=text,
-                    route=str(state.get("route", "")),
-                    task_type=str(state.get("task_type", "")),
-                    tool_bundle=list(state.get("tool_bundle", []) or []),
-                    entities=entities,
-                    context=context,
-                    attachments=attachments,
-                    perception=dict(state.get("perception_result", {}) or {}),
-                    session_id=str(state.get("session_id", "")),
-                    run_id=str((state.get("route_trace", {}) or {}).get("run_id", "")),
-                )
-                evidence_summary = {
-                    "best_hypothesis": (state.get("hypotheses", [{}]) or [{}])[0].get("id", "H1"),
-                    "support_count": 1 if answer else 0,
-                    "official_support_count": 0,
-                    "conflict_count": 0,
-                    "confidence": str(route_trace.get("answer_confidence", "medium")),
-                    "can_answer_directly": bool(answer),
-                }
-                review_result = _run_customer_support_review_agent(
-                    ctx=ctx,
-                    cfg=cfg,
-                    question=question,
-                    problem_frame=dict(state.get("problem_frame", {}) or {}),
-                    hypotheses=list(state.get("hypotheses", []) or []),
-                    evidence_items=evidence_items,
-                    selected_output=answer,
-                    fallback_summary=evidence_summary,
-                )
-            else:
-                answer, route_trace, evidence_items, evidence_summary = _execute_customer_support_planner(
-                    question=question,
-                    route=str(state.get("route", "")),
-                    task_type=str(state.get("task_type", "")),
-                    tool_bundle=list(state.get("tool_bundle", []) or []),
-                    entities=entities,
-                    context=context,
-                    search_plan=list(state.get("search_plan", []) or []),
-                    attachments=attachments,
-                    perception=dict(state.get("perception_result", {}) or {}),
-                    session_id=str(state.get("session_id", "")),
-                    run_id=str((state.get("route_trace", {}) or {}).get("run_id", "")),
-                )
-                review_result = _run_customer_support_review_agent(
-                    ctx=ctx,
-                    cfg=cfg,
-                    question=question,
-                    problem_frame=dict(state.get("problem_frame", {}) or {}),
-                    hypotheses=list(state.get("hypotheses", []) or []),
-                    evidence_items=evidence_items,
-                    selected_output=answer,
-                    fallback_summary=evidence_summary,
-                )
-            if base_route_trace.get("planner"):
-                route_trace["planner"] = dict(base_route_trace.get("planner", {}) or {})
-            if base_route_trace.get("intent_agent"):
-                route_trace["intent_agent"] = dict(base_route_trace.get("intent_agent", {}) or {})
-            route_trace["review_agent"] = dict(review_result or {})
-            evidence_summary = {**dict(evidence_summary or {}), **dict(review_result or {})}
-            if evidence_summary:
-                route_trace["evidence_summary"] = dict(evidence_summary)
-            if not review_result.get("can_answer_directly", True):
-                answer = _build_customer_support_followup_question(str(state.get("route", "")), missing_slot, review_result)
-                route_trace["fallback_reason"] = route_trace.get("fallback_reason") or "review_requires_followup"
-                reasoning_public_trace = _append_customer_support_reasoning_trace(reasoning_public_trace, "review", "现有证据不足以直接回答，已改为只追问一个关键问题。")
-            else:
-                reasoning_public_trace = _append_customer_support_reasoning_trace(reasoning_public_trace, "review", "已有足够证据支持当前答复，可直接回答。")
-            if not answer:
-                raise RuntimeError(route_trace.get("fallback_reason") or "empty_harness_answer")
-            return {
-                "phase": "check",
-                "phase_history": list(state.get("phase_history", [])) + ["act"],
-                "generated_answer": answer,
-                "generated_tool_calls": list(route_trace.get("tool_call_sequence", []) or []),
-                "route_trace": route_trace,
-                "check_result": dict(route_trace.get("check_result", {}) or {}),
-                "evidence_items": evidence_items,
-                "evidence_summary": evidence_summary,
-                "review_agent_result": dict(review_result or {}),
-                "reasoning_public_trace": reasoning_public_trace,
-                "final_confidence": str(evidence_summary.get("confidence") or route_trace.get("answer_confidence", "medium")),
-            }
-        except Exception as exc:
-            logger.exception("[CustomerSupportTrace] act failed: %s", exc)
-            return {
-                "phase": "loop",
-                "phase_history": list(state.get("phase_history", [])) + ["act"],
-                "last_error": {"error_type": type(exc).__name__, "error_message": str(exc)},
-                "fallback_reason": f"act_error:{type(exc).__name__}",
-            }
-
     def check_node(state: CustomerSupportState) -> dict[str, Any]:
-        raw_trace = dict(state.get("route_trace", {}) or {})
-        trace = make_trace(
-            RouteDecision(
-                route=str(state.get("route", "")),
-                task_type=str(state.get("task_type", "")),
-                tool_bundle=list(state.get("tool_bundle", []) or []),
-                complexity="simple",
-            ),
-            MessageEntities(**dict(state.get("entities", {}) or {})),
-            session_id=str(state.get("session_id", "")),
-            run_id=str(raw_trace.get("run_id", "")),
-        )
-        trace.entity_resolution = dict(state.get("entities", {}) or {})
-        trace.tool_call_sequence = list(state.get("generated_tool_calls", []) or [])
-        trace.loop_count = int(state.get("loop_count") or 0)
-        trace.fallback_reason = str(state.get("fallback_reason", "") or "")
-        answer = str(state.get("generated_answer", "") or "").strip()
-        ok = bool(answer)
-        check_result: dict[str, Any]
-        if state.get("route") == "conversation":
-            check_result = {"conversation_context_used": True, "history_count": max(0, len(build_conversation_context(state.get("messages", [])).recent_user_questions))}
-            ok = True
-        else:
-            links_ok, invalid_links = validate_links(answer)
-            review_result = dict(state.get("review_agent_result", {}) or {})
-            qa_result = _run_customer_support_response_qa_agent(
-                ctx=ctx,
-                cfg=cfg,
-                question=str(state.get("task_goal", "") or ""),
-                answer=answer,
-                route=str(state.get("route", "")),
-                task_type=str(state.get("task_type", "")),
-                review_result=review_result,
-            )
-            repair_attempted = bool(state.get("repair_attempted"))
-            degrade_reason = str(state.get("degrade_reason", "") or "")
-            if (not qa_result.get("pass")) and not repair_attempted:
-                repaired_answer = _repair_customer_support_answer(
-                    ctx=ctx,
-                    cfg=cfg,
-                    question=str(state.get("task_goal", "") or ""),
-                    answer=answer,
-                    route=str(state.get("route", "")),
-                    task_type=str(state.get("task_type", "")),
-                    missing_slot=dict(state.get("missing_slot", {}) or {}),
-                    review_result=review_result,
-                    qa_result=qa_result,
-                )
-                if repaired_answer:
-                    answer = repaired_answer.strip()
-                    links_ok, invalid_links = validate_links(answer)
-                    qa_result = _run_customer_support_response_qa_agent(
-                        ctx=ctx,
-                        cfg=cfg,
-                        question=str(state.get("task_goal", "") or ""),
-                        answer=answer,
-                        route=str(state.get("route", "")),
-                        task_type=str(state.get("task_type", "")),
-                        review_result=review_result,
-                    )
-                    repair_attempted = True
-            if not qa_result.get("pass"):
-                answer = _build_customer_support_followup_question(
-                    str(state.get("route", "")),
-                    dict(state.get("missing_slot", {}) or {}),
-                    review_result,
-                )
-                links_ok, invalid_links = validate_links(answer)
-                degrade_reason = degrade_reason or f"qa_{qa_result.get('repair_mode', 'rewrite')}"
-                qa_result = {
-                    **dict(qa_result),
-                    "pass": True,
-                    "issues": list(qa_result.get("issues", []) or []) + ["已降级为单关键问题追问"],
-                    "repair_mode": "ask_one_question",
-                }
-            ok = bool(answer) and links_ok
-            check_result = {
-                "harness_driven": str((state.get("decision_rationale", {}) or {}).get("response_mode", "")) == "use_harness",
-                "has_answer": bool(answer),
-                "links_ok": links_ok,
-                "invalid_links": invalid_links,
-                "evidence_count": len(list(state.get("evidence_items", []) or [])),
-                "response_qa_pass": bool(qa_result.get("pass")),
-                "response_qa_issues": list(qa_result.get("issues", []) or []),
-                **dict(state.get("check_result", {}) or {}),
-            }
-            if invalid_links:
-                trace.fallback_reason = trace.fallback_reason or "invalid_links"
-            trace.check_result = check_result
-            trace.answer_confidence = str(state.get("final_confidence", "") or ("high" if ok else "medium"))
-            return {
-                "phase": "done" if ok else "loop",
-                "status": "success" if ok else state.get("status", ""),
-                "phase_history": list(state.get("phase_history", [])) + ["check"],
-                "generated_answer": answer,
-                "check_result": check_result,
-                "route_trace": {**asdict(trace), "response_qa_result": dict(qa_result or {})},
-                "response_qa_result": dict(qa_result or {}),
-                "repair_attempted": repair_attempted,
-                "degrade_reason": degrade_reason,
-                **(
-                    {}
-                    if ok
-                    else {
-                        "last_error": {
-                            "answer": answer,
-                            "check_result": check_result,
-                        },
-                        "fallback_reason": trace.fallback_reason or "check_failed",
-                    }
-                ),
-            }
-        trace.check_result = check_result
-        trace.answer_confidence = str(state.get("final_confidence", "") or ("high" if ok else "medium"))
-        if ok:
-            return {
-                "phase": "done",
-                "status": "success",
-                "phase_history": list(state.get("phase_history", [])) + ["check"],
-                "check_result": check_result,
-                "route_trace": asdict(trace),
-            }
-        return {
-            "phase": "loop",
-            "phase_history": list(state.get("phase_history", [])) + ["check"],
-            "check_result": check_result,
-            "route_trace": asdict(trace),
-            "last_error": {
-                "answer": answer,
-                "check_result": check_result,
-            },
-            "fallback_reason": trace.fallback_reason or "check_failed",
+        messages = list(state.get("messages", []) or [])
+        raw_answer = _extract_final_answer(messages)
+        sanitized_answer = sanitize_customer_output(raw_answer)
+        links_ok, invalid_links = validate_links(sanitized_answer)
+        tool_sequence = _extract_tool_sequence(messages)
+        if not sanitized_answer or not links_ok:
+            sanitized_answer = guard_fallback
+        trace = dict(state.get("route_trace", {}) or {})
+        trace["tool_call_sequence"] = tool_sequence
+        trace["check_result"] = {
+            "has_answer": bool(raw_answer),
+            "sanitized": sanitized_answer != raw_answer,
+            "links_ok": links_ok,
+            "invalid_links": invalid_links,
+            "post_guard_applied": sanitized_answer == guard_fallback or sanitized_answer == SENSITIVE_REFUSAL,
         }
-
-    def loop_node(state: CustomerSupportState) -> dict[str, Any]:
+        trace["answer_confidence"] = "medium" if tool_sequence else "high"
         return {
-            "phase": "act",
-            "phase_history": list(state.get("phase_history", [])) + ["loop"],
-            "loop_count": int(state.get("loop_count") or 0) + 1,
+            "phase": "done",
+            "status": "success",
+            "phase_history": list(state.get("phase_history", [])) + ["check"],
+            "generated_answer": sanitized_answer,
+            "generated_tool_calls": tool_sequence,
+            "check_result": dict(trace.get("check_result", {}) or {}),
+            "route_trace": trace,
         }
 
     def finalize_node(state: CustomerSupportState) -> dict[str, Any]:
@@ -1903,24 +1560,17 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         if started_at_ms:
             route_trace["latency_hotspot"] = dict(route_trace.get("latency_hotspot", {}))
             route_trace["latency_hotspot"]["total"] = max(0, int(time.time() * 1000) - started_at_ms)
-        route_trace["loop_count"] = int(state.get("loop_count") or 0)
-        route_trace["check_result"] = dict(state.get("check_result", {}) or route_trace.get("check_result", {}))
-        route_trace["tool_call_sequence"] = list(state.get("generated_tool_calls", []) or route_trace.get("tool_call_sequence", []))
-        route_trace["response_qa_result"] = dict(state.get("response_qa_result", {}) or route_trace.get("response_qa_result", {}))
+        final_answer = sanitize_customer_output(str(state.get("generated_answer", "") or _extract_final_answer(list(state.get("messages", []) or []))))
         logger.info(
-            "[CustomerSupportTrace] run_id=%s session_id=%s route=%s task_type=%s sequence=%s loops=%s check=%s fallback=%s latency=%s confidence=%s",
+            "[CustomerSupportTrace] run_id=%s session_id=%s route=%s task_type=%s sequence=%s check=%s latency=%s",
             route_trace.get("run_id", ""),
             route_trace.get("session_id", ""),
             route_trace.get("route", ""),
             route_trace.get("task_type", ""),
             route_trace.get("tool_call_sequence", []),
-            route_trace.get("loop_count", 0),
             route_trace.get("check_result", {}),
-            route_trace.get("fallback_reason", ""),
             route_trace.get("latency_hotspot", {}),
-            route_trace.get("answer_confidence", "medium"),
         )
-        final_answer = sanitize_customer_output(str(state.get("generated_answer", "") or ""))
         return {
             "phase": "done",
             "status": "success",
@@ -1931,79 +1581,26 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "tool_bundle": list(state.get("tool_bundle", []) or []),
             "entities": dict(state.get("entities", {}) or {}),
             "attachments": list(state.get("attachments", []) or []),
-            "perception_result": dict(state.get("perception_result", {}) or {}),
-            "problem_frame": dict(state.get("problem_frame", {}) or {}),
-            "hypotheses": list(state.get("hypotheses", []) or []),
-            "search_plan": list(state.get("search_plan", []) or []),
-            "evidence_items": list(state.get("evidence_items", []) or []),
-            "evidence_summary": dict(state.get("evidence_summary", {}) or {}),
-            "decision_rationale": dict(state.get("decision_rationale", {}) or {}),
-            "intent_agent_result": dict(state.get("intent_agent_result", {}) or {}),
-            "planner_agent_result": dict(state.get("planner_agent_result", {}) or {}),
-            "review_agent_result": dict(state.get("review_agent_result", {}) or {}),
-            "response_qa_result": dict(state.get("response_qa_result", {}) or {}),
-            "missing_slot": dict(state.get("missing_slot", {}) or {}),
-            "reasoning_public_trace": list(state.get("reasoning_public_trace", []) or []),
-            "final_confidence": str(state.get("final_confidence", "") or route_trace.get("answer_confidence", "medium")),
-            "evidence_pack": dict(state.get("evidence_pack", {}) or {}),
-            "artifact_links": list(state.get("artifact_links", []) or []),
             "route_trace": route_trace,
-            "repair_attempted": bool(state.get("repair_attempted")),
-            "degrade_reason": state.get("degrade_reason", ""),
-            "fallback_reason": state.get("fallback_reason", ""),
+            "generated_tool_calls": list(state.get("generated_tool_calls", []) or []),
+            "check_result": dict(state.get("check_result", {}) or {}),
         }
 
-    def fail_node(state: CustomerSupportState) -> dict[str, Any]:
-        trace = dict(state.get("route_trace", {}) or {})
-        trace["fallback_reason"] = state.get("fallback_reason", "") or "customer_support_fail"
-        delegated = fallback_agent.invoke(
-            {
-                "messages": state.get("messages", []),
-                "session_id": state.get("session_id", ""),
-                "user_id": state.get("user_id", ""),
-                "source_channel": state.get("source_channel", ""),
-                "agent_profile": state.get("agent_profile", profile.profile_id),
-                "intent_hint": state.get("intent_hint", intent_hint),
-            },
-            context=ctx,
-        )
-        delegated["phase"] = "failed"
-        delegated["status"] = delegated.get("status", "error")
-        delegated["phase_history"] = list(state.get("phase_history", [])) + ["failed"]
-        delegated["route_trace"] = trace
-        delegated["fallback_reason"] = trace["fallback_reason"]
-        return delegated
-
     def route_after_entry(state: CustomerSupportState) -> str:
-        if state.get("support_task"):
-            return "plan"
-        return "delegate"
-
-    def route_after_check(state: CustomerSupportState) -> str:
         if state.get("phase") == "done":
             return "finalize"
-        if int(state.get("loop_count") or 0) >= 1:
-            return "fail"
-        return "loop"
+        return "delegate"
 
     graph = StateGraph(CustomerSupportState)
     graph.add_node("route", route_node)
     graph.add_node("delegate", delegate_node)
-    graph.add_node("plan", plan_node)
-    graph.add_node("act", act_node)
     graph.add_node("check", check_node)
-    graph.add_node("loop", loop_node)
     graph.add_node("finalize", finalize_node)
-    graph.add_node("fail", fail_node)
     graph.add_edge(START, "route")
-    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "plan": "plan"})
-    graph.add_edge("delegate", END)
-    graph.add_edge("plan", "act")
-    graph.add_edge("act", "check")
-    graph.add_conditional_edges("check", route_after_check, {"finalize": "finalize", "loop": "loop", "fail": "fail"})
-    graph.add_edge("loop", "act")
+    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "finalize": "finalize"})
+    graph.add_edge("delegate", "check")
+    graph.add_edge("check", "finalize")
     graph.add_edge("finalize", END)
-    graph.add_edge("fail", END)
     return graph.compile(checkpointer=get_memory_saver())
 
 

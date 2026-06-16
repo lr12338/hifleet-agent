@@ -1,492 +1,186 @@
-# HiFleet `customer_support` V3 当前实现与学习改进指南
+# HiFleet `customer_support` 当前实现与学习改进指南
 
-本文不是历史方案稿，而是基于当前仓库代码整理出的 `customer_support` 真实实现说明。重点回答 4 个问题：
-
-1. 现在的 `customer_support` 到底是怎么跑的
-2. 相关提示词、节点、判断逻辑分别在哪
-3. 新同学应该按什么顺序学习，才能真正读懂这条链
-4. 以后如果要改进，应优先改哪里、怎么改才不破坏边界
-
----
+本文描述当前仓库里真实生效的 `customer_support` 实现。当前版本已经不再走 `Planner Agent -> Harness -> Review -> QA` 主链，而是改成更贴近 `employee_assistant` 标准问答链的轻量结构。
 
 ## 1. 当前结论
 
-当前 `customer_support` 已经完成 V3 的 4 个核心目标：
-
-1. `Intent Agent`
-2. `Planner Agent`
-3. `Review Agent`
-4. `Response QA Agent`
-5. `/stream_run` 改为读取真实 runtime state，而不是伪造 explainable 文案
-
-一句话概括当前架构：
-
-```text
-Harness 决定边界和执行权限
-Prompt 约束每个节点如何思考和输出
-Agent 负责理解、规划、审查和修正
-Guard 负责最后一道对外收口
-```
-
----
-
-## 2. 先建立整体脑图
+当前 `customer_support` 的核心链路是：
 
 ```mermaid
 flowchart TD
-    A["用户消息 / 附件"] --> B["route"]
-    B -->|敏感内部请求| C["固定拒答"]
-    B -->|普通客服请求| D["plan"]
-    D --> E["Intent Agent"]
-    E --> F["多模态感知 / 上下文实体解析"]
-    F --> G["Planner Agent"]
-    G --> H{"response_mode"}
-    H -->|ask_one_question| I["单关键问题追问"]
-    H -->|direct_answer| J["Planner Execute"]
-    H -->|use_harness| K["Execution Harness"]
-    J --> L["Review Agent"]
-    K --> L
-    L --> M["check"]
-    M --> N["Response QA Agent"]
-    N -->|通过| O["finalize / Guard"]
-    N -->|修复/降级| O
-    O --> P["最终输出"]
+    A["用户输入"] --> B{"前置安全拦截"}
+    B -->|敏感内部探查| C["固定拒答"]
+    B -->|正常请求| D["标准客服 Agent (LLM + Tools)"]
+    D --> E{"后置内容质检"}
+    E -->|不安全/不稳定| F["标准致歉或建议补充信息"]
+    E -->|安全可发| G["最终输出给客户"]
+    C --> G
+    F --> G
 ```
 
-相关代码入口：
+一句话概括：
 
-- 主 graph: [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
-- 路由、Planner、Harness、证据总结: [src/agents/customer_support_router.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_router.py)
-- 输出安全收口: [src/agents/customer_support_guard.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_guard.py)
-- `/stream_run` runtime debug 映射: [src/agents/customer_support_stream_debug.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_stream_debug.py)
-- 角色主提示词: [config/profiles/customer_support.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/config/profiles/customer_support.md)
+```text
+customer_support 现在的重点不是复杂链路编排，
+而是用更稳定的标准问答 Agent 结合知识库/业务工具回答，再用前后置 Guard 收住风险。
+```
 
----
+## 2. 为什么这样改
 
-## 3. 学习顺序
+当前项目里的经验结论已经比较明确：
 
-如果你的目标是“真正理解并能安全修改 `customer_support`”，推荐严格按这个顺序读：
+1. `employee_assistant` 的标准问答 Agent 更稳定，符合实际需求。
+2. 当前知识库内容仍不足，后续应优先补知识库，而不是继续加重链路复杂度。
+3. 当前公网搜索能力仍偏弱，后续更适合通过补强检索能力或接入 `agent-browser` 来解决，而不是再叠更多中间 Agent。
 
-### 第 1 步：先看入口和 phase graph
+所以现在 `customer_support` 的优化重点变成：
 
-文件：
+- 保留官方客服 prompt 和工具边界
+- 保留前置安全拦截
+- 保留后置输出收口
+- 取消复杂 Planner/Harness/Review/QA 主执行链
+
+## 3. 真实代码入口
+
+先读这几个文件：
 
 - [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
 - [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
-
-要看懂：
-
-1. `/run` 和 `/stream_run` 都会走 `build_agent(...)`
-2. `customer_support` 会进入 `_build_customer_support_agent(...)`
-3. graph 的固定骨架仍然是：
-   - `route -> plan -> act -> check -> finalize`
-   - 失败时 `loop` 或 `fail`
-
-学习目标：
-
-- 先把“有哪些节点”搞清楚
-- 不要一上来就钻检索细节
-
-### 第 2 步：再看 plan 节点
-
-文件：
-
-- [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
-- [src/agents/customer_support_router.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_router.py)
-
-要看懂：
-
-1. 文本、附件、上下文怎么抽出来
-2. `Intent Agent` 怎么决定 route
-3. 多模态感知怎样影响 route
-4. `Planner Agent` 最终产出哪些结构化字段
-
-学习目标：
-
-- 明白系统是“先建模问题，再决定执行”
-- 明白 `route` 和 `response_mode` 是两层不同决策
-
-### 第 3 步：再看 act/check/finalize
-
-要看懂：
-
-1. 哪些 route 走 Planner 直执链
-2. 哪些 route 必须走 Harness
-3. `Review Agent` 怎么判断“能不能直接回答”
-4. `Response QA Agent` 怎么判断“这段话能不能直接发给客户”
-5. `Guard` 最后会删什么
-
-学习目标：
-
-- 明白业务正确性和安全正确性分别在哪层保证
-
-### 第 4 步：最后看 `/stream_run`
-
-文件：
-
-- [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+- [config/profiles/customer_support.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/config/profiles/customer_support.md)
+- [src/agents/customer_support_guard.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_guard.py)
 - [src/agents/customer_support_stream_debug.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_stream_debug.py)
 
-要看懂：
+当前主入口：
 
-1. explainable stream 现在直接消费 graph `updates`
-2. 调试事件是如何从真实 state 映射成：
-   - `message_start`
-   - `thinking`
-   - `tool_request`
-   - `tool_response`
-   - `answer`
-   - `message_end`
+1. `/run` 或 `/stream_run` 进入 [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+2. `resolve_profile_id(...)` 识别 `customer_support`
+3. `build_agent(...)` 命中 `_build_customer_support_agent(...)`
+4. `customer_support` graph 只保留：
+   - `route`
+   - `delegate`
+   - `check`
+   - `finalize`
 
-学习目标：
+## 4. 当前节点职责
 
-- 明白调试展示已经和 runtime state 对齐
-- 修改 state 字段时知道 `/stream_run` 也要一起更新
-
----
-
-## 4. 提示词层怎么理解
-
-`customer_support` 当前有两类提示词：
-
-### 4.1 角色主提示词
-
-文件：
-
-- [config/profiles/customer_support.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/config/profiles/customer_support.md)
-
-作用：
-
-- 定义“你是 HiFleet 官方客服”
-- 限制不能表现成泛搜索助手或内部运维机器人
-- 统一最终语气、边界、输出风格
-
-### 4.2 节点级提示词
-
-文件：
-
-- [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
-
-当前节点：
-
-1. `CUSTOMER_SUPPORT_INTENT_PROMPT`
-2. `CUSTOMER_SUPPORT_PLANNER_PROMPT`
-3. `CUSTOMER_SUPPORT_REVIEW_PROMPT`
-4. `CUSTOMER_SUPPORT_RESPONSE_QA_PROMPT`
-5. `CUSTOMER_SUPPORT_REPAIR_PROMPT`
-
-理解原则：
-
-- 角色主提示词定义“你是谁”
-- 节点提示词定义“这一层只能做什么”
-- 真正的边界仍由程序保证，不能靠 prompt 自觉
-
----
-
-## 5. 各节点真实职责
-
-## 5.1 route
+### 4.1 route
 
 职责：
 
-- 判断是不是敏感内部请求
-- 命中就直接固定拒答
+- 读取最新用户问题
+- 执行前置安全拦截
+- 做轻量 route / task_type / entities / attachments 标注
 
 关键点：
 
-- 这一层不做业务理解
-- 只做安全入口裁决
+- 命中内部敏感探查，直接固定拒答
+- 正常请求不再进入复杂 Planner
+- route 的分类现在主要用于 trace 和调试展示，不再驱动复杂执行分支
 
-## 5.2 plan
-
-职责：
-
-1. 取最新用户消息
-2. 组装上下文
-3. 抽取实体
-4. 抽取附件
-5. 跑 `Intent Agent`
-6. 做多模态感知
-7. 跑 `Planner Agent`
-8. 产出结构化计划
-
-核心 state 字段：
-
-- `route`
-- `task_type`
-- `entities`
-- `perception_result`
-- `problem_frame`
-- `hypotheses`
-- `search_plan`
-- `decision_rationale`
-- `missing_slot`
-- `reasoning_public_trace`
-- `intent_agent_result`
-- `planner_agent_result`
-
-## 5.3 act
+### 4.2 delegate
 
 职责：
 
-- 根据 `response_mode` 决定执行路径
+- 调用 `_build_standard_agent(...)` 构造的标准客服 Agent
+- 把会话历史、profile prompt、skills prompt 和 tools 一起交给 `create_agent(...)`
+- 从返回的 messages 中提取真实工具调用序列
 
-三种情况：
+这一层和 `employee_assistant` 的普通问答链是同型的。
 
-1. `ask_one_question`
-   - 直接返回一个关键追问
-2. `direct_answer`
-   - 走 Planner 直执链
-3. `use_harness`
-   - 走确定性 Harness
-
-## 5.4 review
+### 4.3 check
 
 职责：
 
-- 判断当前证据是否足以直接回答
-- 如果不够，就阻止硬答，改成追问
+- 从标准 Agent 返回结果中提取最终回答
+- 调用 `sanitize_customer_output(...)`
+- 做链接校验
+- 如果答案为空、不安全或不稳定，降级到统一致歉/建议补充信息
 
-它解决的是：
+这就是当前的后置质检层。
 
-- “搜到了东西”不等于“可以安全回答”
-- “有一条公开网页”不等于“结论可靠”
-
-## 5.5 check + response qa
-
-职责：
-
-- 链接校验
-- 输出质量检查
-- 必要时修复
-- 修复仍失败则降级
-
-这一层解决的是：
-
-- 不是所有“逻辑上对”的回复都适合直接发给客户
-
-## 5.6 finalize / guard
+### 4.4 finalize
 
 职责：
 
-- 最终脱敏
-- 清理工具名、路径、prompt、key、日志、检索包装残片
-- 输出最终客服回复
+- 产出最终客户回复
+- 汇总 `route_trace / tool_call_sequence / check_result / latency`
+- 保证返回给调用方和 `/stream_run` 的最终状态一致
 
----
+## 5. 标准客服 Agent 的装配方式
 
-## 6. 判断逻辑应该重点读什么
-
-理解 `customer_support` 时，最值得重点读的是这几类判断：
-
-### 6.1 route 判断
-
-文件：
-
-- [src/agents/customer_support_router.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_router.py)
-
-重点函数：
-
-- `classify_message(...)`
-- `classify_multimodal_message(...)`
-- `refine_multimodal_route_with_perception(...)`
-- `resolve_entities_with_context(...)`
-
-要看什么：
-
-- 平台问题和船舶问题怎么区分
-- 截图符号和异常截图怎么区分
-- 哪些路由允许继承上一轮船舶上下文
-
-### 6.2 Planner 判断
-
-重点函数：
-
-- `build_customer_support_plan(...)`
-- `_planner_question_type(...)`
-- `_planner_missing_slot(...)`
-- `_planner_hypotheses(...)`
-- `_planner_search_plan(...)`
-
-要看什么：
-
-- `problem_frame` 怎样抽象问题
-- `missing_slot` 怎样决定“只追问一个问题”
-- `search_plan` 怎样改写检索词，而不是复读原句
-
-### 6.3 Harness 进入条件
-
-重点常量：
-
-- `HARNESSED_ROUTES`
-- `PLANNER_DIRECT_ROUTES`
-
-要看什么：
-
-- 为什么船舶、写操作、文件、网页核验不能交给自由回答链
-
-### 6.4 Review / QA 判断
-
-重点 helper：
-
-- `_run_customer_support_review_agent(...)`
-- `_run_customer_support_response_qa_agent(...)`
-- `_repair_customer_support_answer(...)`
-
-要看什么：
-
-- 哪些场景禁止直接回答
-- 哪些场景必须降级为单关键追问
-
----
-
-## 7. 现在线上的 `/stream_run` 是怎么工作的
-
-当前实现目标不是暴露私有 CoT，而是把真实 runtime state 安全映射成调试事件。
+`customer_support` 的核心执行现在直接复用标准 Agent 装配：
 
 ```mermaid
-flowchart TD
-    Req[/stream_run/] --> Graph["graph.astream(stream_mode=updates)"]
-    Graph --> Update["真实 node update"]
-    Update --> Map["build_customer_support_debug_events_from_update"]
-    Map --> SSE["thinking / tool_request / tool_response / answer / message_end"]
+flowchart LR
+    A["system_prompt_base.md"] --> D["full system prompt"]
+    B["customer_support.md"] --> D
+    C["skills/*/SKILL.md"] --> D
+    D --> E["ChatOpenAI runtime model"]
+    F["profile allowlist tools"] --> G["tools"]
+    E --> H["create_agent(...)"]
+    G --> H
+    I["get_memory_saver + AgentState(messages)"] --> H
 ```
 
-当前会映射的真实信息包括：
+这意味着当前 `customer_support` 的能力上限主要取决于：
 
-- `intent_agent_result`
-- `perception_result`
-- `reasoning_public_trace`
-- `search_plan`
-- `generated_tool_calls`
-- `review_agent_result`
-- `response_qa_result`
-- `finalize` 里的最终回复
+1. `customer_support` profile prompt 是否写得对
+2. `smart_search` 和 ship tools 是否足够可靠
+3. 知识库内容是否完整
+4. 公网搜索能力是否能补足知识库缺口
 
-这意味着：
+## 6. 学习顺序
 
-- `/stream_run` 已经不再是“静态脚本解释”
-- 它现在是“runtime state 的安全摘要”
+如果你的目标是“真正理解并能继续改这条链”，建议按这个顺序读：
 
----
+1. [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+   先看 `/run`、`/stream_run` 如何设置 `agent_profile / intent_hint / llm_route`
+2. [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+   重点看 `_build_standard_agent(...)` 和 `_build_customer_support_agent(...)`
+3. [config/profiles/customer_support.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/config/profiles/customer_support.md)
+   理解客服角色约束、检索优先级和写操作边界
+4. [src/agents/customer_support_guard.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_guard.py)
+   理解最终有哪些内容绝不能对客户暴露
+5. [src/agents/customer_support_stream_debug.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/customer_support_stream_debug.py)
+   理解调试展示如何映射到真实 runtime
 
-## 8. 修改时怎么下手
+## 7. `/stream_run` 现在展示什么
 
-## 8.1 改提示词
+`/stream_run` 现在不再展示旧 Planner/Harness/Review/QA 的伪阶段，而是对齐当前 runtime：
 
-适用场景：
+- `message_start`
+- `thinking`
+  - 前置安全与问题识别
+  - 标准客服 Agent 装配
+  - 附件输入分析
+  - 后置内容质检
+- `tool_response`
+  - 基于真实 `tool_call_sequence`
+- `answer`
+- `message_end`
 
-- 模型理解方向不稳
-- 输出 JSON 字段不稳定
-- 客服语气不一致
+## 8. 当前已知能力边界
 
-优先改：
+当前版本最重要的两个限制：
 
-- `src/agents/agent.py` 中对应节点 prompt
-- `config/profiles/customer_support.md`
+1. 知识库内容仍不足
+   - 这会直接限制 `smart_search` 的命中质量
+   - 优先补知识库内容，而不是再叠复杂链路
+2. 公网搜索能力仍偏弱
+   - 当知识库里没有答案时，可能无法在公网检索到最匹配的信息
+   - 后续可以考虑引入 `agent-browser` 做更强的全网补充能力
 
-不要做：
+## 9. 后续改进优先级
 
-- 用一个大 prompt 把所有节点职责揉在一起
+建议按这个顺序继续演进：
 
-## 8.2 改 route 判断
+1. 先补知识库内容
+2. 再补 `smart_search` 的 query 改写和弱命中兜底
+3. 再引入 `agent-browser` 补强知识库外知识
+4. 最后再看是否需要恢复更复杂的中间推理层
 
-适用场景：
+当前阶段不建议优先做的事情：
 
-- 平台问题误进船舶链
-- 报错截图误进海图符号链
-- 上下文船舶继承错误
-
-优先改：
-
-- `classify_message(...)`
-- `classify_multimodal_message(...)`
-- `refine_multimodal_route_with_perception(...)`
-- `resolve_entities_with_context(...)`
-
-## 8.3 改 Planner
-
-适用场景：
-
-- `problem_frame` 建模不准
-- `search_plan` 改写质量差
-- 该追问时没追问
-
-优先改：
-
-- `build_customer_support_plan(...)`
-- `CUSTOMER_SUPPORT_PLANNER_PROMPT`
-
-## 8.4 改 Harness
-
-适用场景：
-
-- 某个高风险 route 的工具顺序不对
-- 缺字段追问不对
-- 返回格式不适合客服场景
-
-优先改：
-
-- `src/agents/customer_support_router.py` 中对应 `execute_*_chain`
-
-## 8.5 改 Review / QA
-
-适用场景：
-
-- 明明证据不足却硬答
-- 最终回复太像检索结果，不像客服回复
-- 应该降级追问却没有降级
-
-优先改：
-
-- `_run_customer_support_review_agent(...)`
-- `_run_customer_support_response_qa_agent(...)`
-- `_repair_customer_support_answer(...)`
-
-## 8.6 改 `/stream_run`
-
-适用场景：
-
-- 新增了 state 字段，调试流没展示
-- 调试流顺序不对
-- 调试事件和 runtime 真实执行不一致
-
-优先改：
-
-- `build_customer_support_debug_events_from_update(...)`
-- `src/main.py` 中 `explainable_stream_sse(...)`
-
----
-
-## 9. 安全改进原则
-
-后续改进必须守住这些边界：
-
-1. 是否允许执行高风险能力，永远由程序决定，不由 Agent 决定
-2. 写操作权限不能只靠 prompt，必须保留 `allow_write` 强制覆盖
-3. 最终输出仍必须经过 `sanitize_customer_output(...)`
-4. `/stream_run` 只能输出安全摘要，不能输出 prompt、私有 CoT、路径、key、内部 JSON 原文
-5. 回退链必须保留：
-   - Intent 失败 -> 回退规则分类
-   - Planner 失败 -> 回退 `build_customer_support_plan(...)`
-   - Review 失败 -> 回退程序证据总结
-   - QA/Repair 失败 -> 降级为更保守输出
-
----
-
-## 10. 推荐联动阅读
-
-建议一起看：
-
-- 当前真实架构总览: [AGENT_TECHNICAL_DOCUMENTATION.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/docs/AGENT_TECHNICAL_DOCUMENTATION.md)
-- 客服回归矩阵: [CUSTOMER_SUPPORT_AGENT_REGRESSION.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md)
-- 知识检索链: [KNOWLEDGE_BASE_GUIDE.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/docs/KNOWLEDGE_BASE_GUIDE.md)
-
-如果只想最快读懂 `customer_support`，建议按这个顺序：
-
-1. 本文
-2. `src/agents/agent.py`
-3. `src/agents/customer_support_router.py`
-4. `src/agents/customer_support_stream_debug.py`
-5. `tests/test_customer_support_intent_agent.py`
-6. `tests/test_customer_support_stream_debug.py`
+- 再引入多层 Planner/Review/QA 主执行链
+- 再把 `customer_support` 设计成复杂 Harness 驱动系统
+- 在知识库和搜索能力不足时，用更多中间 Agent 掩盖底层能力问题

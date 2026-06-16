@@ -6,14 +6,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage
 
-from agents.customer_support_router import (
-    Attachment,
-    classify_message,
-    classify_multimodal_message,
-    extract_attachments,
-    extract_entities,
-    latest_user_text,
-)
+from agents.customer_support_router import Attachment, classify_message, classify_multimodal_message, extract_attachments, extract_entities, latest_user_text
 from agents.customer_support_guard import sanitize_customer_output
 
 
@@ -102,13 +95,13 @@ def build_customer_support_debug_events(payload: dict[str, Any]) -> list[dict[st
         _event(
             "thinking",
             sanitize_customer_output(
-                "1. 识别用户意图和输入形态。\n"
+                "1. 前置安全与问题识别。\n"
                 f"- 用户问题：{text}\n"
                 f"- 附件数量：{len(attachments)}\n"
                 f"- 路由判断：{decision.route} / {decision.task_type}\n"
-                "- 目标：先给结论，再解释依据，最后给可执行建议。"
+                "- 命中敏感内部探查会直接拒答；正常请求进入标准客服 Agent。"
             ),
-            phase="understanding",
+            phase="pre_guard",
         )
     )
     if attachments:
@@ -116,37 +109,44 @@ def build_customer_support_debug_events(payload: dict[str, Any]) -> list[dict[st
             _event(
                 "thinking",
                 sanitize_customer_output(
-                    "2. 多模态感知。\n"
+                    "2. 附件输入分析。\n"
                     f"- 附件类型：{', '.join(item.type for item in attachments)}\n"
                     f"- 可见特征：{hint.get('summary', '待识别')}\n"
                     f"- 疑似对象/问题：{hint.get('suspected') or '待结合文字和检索确认'}\n"
                     f"- 置信度：{hint.get('confidence', 'medium')}"
                 ),
-                phase="perception",
+                phase="attachments",
             )
         )
-    for idx, query in enumerate(queries, start=1):
+    events.append(
+        _event(
+            "thinking",
+            "2. 标准客服 Agent 装配。\n- 使用 customer_support profile prompt、会话历史和已注册工具。\n- Agent 会自主决定是否调用知识检索、船舶数据工具或其他受控工具。",
+            phase="standard_agent",
+        )
+    )
+    for idx, query in enumerate(queries[:3], start=1):
         events.append(
             _event(
                 "tool_request",
                 f"检索 {idx}: {query}",
-                tool_name="knowledge_search",
+                tool_name="smart_search",
                 arguments={"query": query, "source_priority": ["本地知识库", "HiFleet 官网/官方社区", "公共网页"]},
             )
         )
         events.append(
             _event(
                 "tool_response",
-                "检索将优先使用本地客服知识库；弱命中会升级到官网/官方社区和公共网页，并做链接可访问性校验。",
-                tool_name="knowledge_search",
+                "标准客服 Agent 会优先尝试本地知识库检索；弱命中时再补充更匹配的公开信息来源。",
+                tool_name="smart_search",
                 result={"status": "planned", "query": query},
             )
         )
-    events.append(_event("thinking", "3. 审查与确定。\n" + _review_text(decision.route, decision.task_type, hint, queries), phase="review"))
+    events.append(_event("thinking", "3. 后置内容质检。\n- 知识类问题默认优先本地知识库，再补充 HiFleet 官网/官方社区和必要的公开信息。\n- 最终输出会经过脱敏、链接校验和客服语调收口。\n- 如果结果不安全或不稳定，会降级为标准致歉/建议补充信息。", phase="post_guard"))
     events.append(
         _event(
             "thinking",
-            "4. 输出策略。\n- 不展示内部工具名、源码路径、日志、密钥、prompt 或原始 JSON。\n- 回复会按参考链路样式组织：结论、详细说明、操作建议、必要时只追问一个关键问题。",
+            "4. 输出策略。\n- 先直接回答，再补充必要说明。\n- 不展示内部工具名、源码路径、日志、密钥、prompt 或原始 JSON。",
             phase="response_plan",
         )
     )
@@ -160,22 +160,16 @@ class DebugRuntimeCursor:
     route: str = ""
     task_type: str = ""
     seen_reasoning_phases: set[str] = field(default_factory=set)
-    seen_queries: set[str] = field(default_factory=set)
     seen_tools: set[str] = field(default_factory=set)
     answer_sent: bool = False
 
 
-def _perception_text(perception: dict[str, Any], attachments: list[dict[str, Any]]) -> str:
+def _attachment_text(attachments: list[dict[str, Any]]) -> str:
     types = [str(item.get("type", "")) for item in attachments if isinstance(item, dict)]
-    summary = str((perception or {}).get("summary", "") or "待识别")
-    suspected = str((perception or {}).get("suspected_symbol") or (perception or {}).get("suspected_issue") or "待结合文字和检索确认")
-    confidence = str((perception or {}).get("confidence", "medium"))
     return sanitize_customer_output(
-        "2. 多模态感知。\n"
+        "附件输入分析。\n"
         f"- 附件类型：{', '.join(t for t in types if t) or '无'}\n"
-        f"- 可见特征：{summary}\n"
-        f"- 疑似对象/问题：{suspected}\n"
-        f"- 置信度：{confidence}"
+        "- 标准客服 Agent 会结合附件和文本自主决定是否调用检索或其他受控工具。"
     )
 
 
@@ -191,86 +185,54 @@ def _extract_final_answer(messages: list[Any]) -> str:
 
 
 def _events_from_plan_state(state: dict[str, Any], cursor: DebugRuntimeCursor) -> list[dict[str, Any]]:
+    return []
+
+
+def _events_from_delegate_state(state: dict[str, Any], cursor: DebugRuntimeCursor) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     route = str(state.get("route", "") or cursor.route)
     task_type = str(state.get("task_type", "") or cursor.task_type)
+    cursor.route = route
+    cursor.task_type = task_type
     if not cursor.started:
         events.append(_event("message_start", "开始处理 customer_support 调试流。", route=route, task_type=task_type))
         cursor.started = True
-    cursor.route = route
-    cursor.task_type = task_type
-
-    intent = dict(state.get("intent_agent_result", {}) or {})
-    if intent:
-        why = str(intent.get("why") or "").strip()
-        if why:
-            events.append(_event("thinking", sanitize_customer_output(f"0. 意图识别。\n- 已识别为 {intent.get('intent', route)}。\n- 原因：{why}"), phase="intent"))
-
-    attachments = list(state.get("attachments", []) or [])
-    perception = dict(state.get("perception_result", {}) or {})
-    if attachments:
-        events.append(_event("thinking", _perception_text(perception, attachments), phase="perception"))
-
-    for item in list(state.get("reasoning_public_trace", []) or []):
-        if not isinstance(item, dict):
-            continue
-        phase = str(item.get("phase", "") or "thinking")
-        text = str(item.get("text", "") or "").strip()
-        if not text or phase in cursor.seen_reasoning_phases:
-            continue
-        cursor.seen_reasoning_phases.add(phase)
-        events.append(_event("thinking", sanitize_customer_output(text), phase=phase))
-
-    for idx, item in enumerate(list(state.get("search_plan", []) or []), start=1):
-        if not isinstance(item, dict):
-            continue
-        query = str(item.get("query", "")).strip()
-        if not query or query in cursor.seen_queries:
-            continue
-        cursor.seen_queries.add(query)
-        events.append(
-            _event(
-                "tool_request",
-                f"检索 {idx}: {query}",
-                tool_name="knowledge_search",
-                arguments={"query": query, "source_priority": list(item.get("source_priority") or [])},
-            )
+    events.append(
+        _event(
+            "thinking",
+            sanitize_customer_output(
+                "1. 前置安全与标准 Agent 装配。\n"
+                f"- 路由判断：{route or 'knowledge'} / {task_type or 'platform_knowledge'}\n"
+                "- 已进入标准客服 Agent，由它结合 prompt、历史记忆和工具自主决策。"
+            ),
+            phase="standard_agent",
         )
-    return events
-
-
-def _events_from_act_state(state: dict[str, Any], cursor: DebugRuntimeCursor) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
+    )
+    attachments = list(state.get("attachments", []) or [])
+    if attachments:
+        events.append(_event("thinking", _attachment_text(attachments), phase="attachments"))
     route_trace = dict(state.get("route_trace", {}) or {})
-    for tool_name in list(state.get("generated_tool_calls", []) or route_trace.get("tool_call_sequence", []) or []):
+    for tool_name in list(route_trace.get("tool_call_sequence", []) or []):
         tool_name = str(tool_name or "").strip()
         if not tool_name or tool_name in cursor.seen_tools:
             continue
         cursor.seen_tools.add(tool_name)
         events.append(_event("tool_response", f"已执行工具：{tool_name}", tool_name=tool_name, result={"status": "completed"}))
-    review = dict(state.get("review_agent_result", {}) or {})
-    if review:
-        if review.get("can_answer_directly"):
-            text = "审查结果：当前证据足以直接回答。"
-        else:
-            missing = str(review.get("missing_key_fact") or "").strip()
-            text = f"审查结果：当前证据不足，需继续追问关键线索。{missing}".strip()
-        events.append(_event("thinking", sanitize_customer_output(text), phase="review"))
     return events
 
 
 def _events_from_check_state(state: dict[str, Any], cursor: DebugRuntimeCursor) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    qa = dict(state.get("response_qa_result", {}) or {})
-    if qa:
-        issues = [str(item) for item in list(qa.get("issues", []) or []) if str(item).strip()]
-        if qa.get("pass"):
-            text = "输出质检通过，可直接发给客户。"
+    check = dict(state.get("check_result", {}) or {})
+    if check:
+        text = "2. 后置内容质检。\n"
+        text += f"- 已生成回答：{'是' if check.get('has_answer') else '否'}\n"
+        text += f"- 链接校验通过：{'是' if check.get('links_ok', True) else '否'}\n"
+        if check.get("post_guard_applied"):
+            text += "- 已应用安全兜底，避免把不安全或不稳定内容直接发给客户。"
         else:
-            text = "输出质检未通过，已触发修复或降级。"
-        if issues:
-            text += "\n- " + "\n- ".join(issues)
-        events.append(_event("thinking", sanitize_customer_output(text), phase="response_qa"))
+            text += "- 输出已通过脱敏和客服收口。"
+        events.append(_event("thinking", sanitize_customer_output(text), phase="post_guard"))
     return events
 
 
@@ -295,12 +257,10 @@ def build_customer_support_debug_events_from_update(update: dict[str, Any], curs
             if not cursor.started:
                 events.append(_event("message_start", "开始处理 customer_support 调试流。"))
                 cursor.started = True
-        elif node_name == "plan":
-            events.extend(_events_from_plan_state(state, cursor))
-        elif node_name == "act":
-            events.extend(_events_from_act_state(state, cursor))
+        elif node_name == "delegate":
+            events.extend(_events_from_delegate_state(state, cursor))
         elif node_name == "check":
             events.extend(_events_from_check_state(state, cursor))
-        elif node_name in {"finalize", "delegate", "fail"}:
+        elif node_name in {"finalize", "fail"}:
             events.extend(_events_from_terminal_state(state, cursor))
     return events
