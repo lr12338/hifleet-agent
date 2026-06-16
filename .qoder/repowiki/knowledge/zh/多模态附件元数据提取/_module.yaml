@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: backend/skills/multimodal_support
+title: 多模态附件元数据提取
+scope:
+    - src/skills/multimodal_support/
+source_files: []
+depends_on: []
+related_to: []

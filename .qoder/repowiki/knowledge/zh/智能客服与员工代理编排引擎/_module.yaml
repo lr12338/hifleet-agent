@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: backend/agents
+title: 智能客服与员工代理编排引擎
+scope:
+    - src/agents/
+source_files: []
+depends_on: []
+related_to: []

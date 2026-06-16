@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: backend/admin_api
+title: 管理后台 API
+scope:
+    - src/admin_api/
+source_files: []
+depends_on: []
+related_to: []

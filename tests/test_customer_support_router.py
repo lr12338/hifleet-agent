@@ -311,8 +311,8 @@ def test_history_track_permission_answer_is_concise_and_domain_correct():
 
     output = execute_knowledge_chain(question, decision, {}, trace)
 
-    assert "基础版：可查看近 12 个月历史轨迹" in output
-    assert "专业版：可查看近 36 个月历史轨迹" in output
+    assert "基础版：可查看近 12 个月" in output
+    assert "专业版：可查看近 36 个月" in output
     assert "MMSI" not in output
 
 

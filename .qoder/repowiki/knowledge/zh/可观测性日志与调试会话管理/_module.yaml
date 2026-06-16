@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: backend/observability
+title: 可观测性日志与调试会话管理
+scope:
+    - src/observability/
+source_files: []
+depends_on: []
+related_to: []

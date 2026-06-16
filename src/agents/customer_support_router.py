@@ -103,8 +103,15 @@ HIFLEET_FEATURE_MARKERS = {
     "绿点",
     "账号",
 }
-HIFLEET_HOWTO_MARKERS = {"如何", "怎么", "怎样", "步骤", "入口", "查询"}
-HIFLEET_PERMISSION_QUERY_MARKERS = {"历史轨迹", "轨迹", "气象预报", "海图", "权限", "能看多久", "几天", "多久前"}
+HIFLEET_HOWTO_MARKERS = {"如何", "怎么", "怎样", "为什么", "步骤", "入口", "查询"}
+HIFLEET_PERMISSION_QUERY_MARKERS = {"历史轨迹", "轨迹", "气象预报", "气象导航", "海图", "权限", "能看多久", "几天", "多久前", "可查", "多少天"}
+
+# 船位概念类词汇（非指定船舶查询，而是平台功能问题）
+SHIP_CONCEPT_TROUBLESHOOTING_PATTERNS = [
+    ("船位", ["慢", "延迟", "不刷新", "不更新", "不准", "为什么", "沟通", "频率"]),
+    ("ais", ["慢", "延迟", "不刷新", "不更新", "不准", "为什么", "接收", "信号"]),
+    ("轨迹", ["不显示", "不刷新", "看不了", "无反应", "加载"]),
+]
 
 
 @dataclass
@@ -399,8 +406,29 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
     if explicit_write_context and any(m in lower for m in ["船位", "静态", "ais", "位置", "mmsi"]):
         return RouteDecision("ship_update", "ship_update", SHIP_UPDATE_BUNDLE, "simple", reason="explicit ship write operation")
 
+    # ══ 优先级 1：账号权限类问题（免费版/基础版/专业版 + 功能查询）══
+    if has_account_marker and any(marker in q for marker in HIFLEET_PERMISSION_QUERY_MARKERS):
+        return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="account permission knowledge")
+
+    # ══ 优先级 2：船位/AIS 概念性故障排查（非指定船舶查询）══
+    _is_ship_concept_troubleshooting = False
+    for concept_word, trouble_indicators in SHIP_CONCEPT_TROUBLESHOOTING_PATTERNS:
+        if concept_word in lower and any(ind in lower for ind in trouble_indicators):
+            _is_ship_concept_troubleshooting = True
+            break
+    if _is_ship_concept_troubleshooting and not (entities.mmsi or entities.imo or entities.ship_name):
+        return RouteDecision("knowledge", "platform_troubleshooting", KNOWLEDGE_BUNDLE, "simple", search_depth="normal", reason="ship concept troubleshooting (not specific ship)")
+
+    # ══ 优先级 3：平台故障排查（明确 troubleshooting 标记 + 平台关键词）══
     if is_troubleshooting and (any(m in lower for m in platform_markers) or any(m in context.previous_user_text.lower() for m in platform_markers)):
         return RouteDecision("knowledge", "platform_troubleshooting", KNOWLEDGE_BUNDLE, "simple", search_depth="normal", reason="platform troubleshooting")
+
+    # ══ 优先级 4：HiFleet 功能查询（平台特性 + howto + 无明确船舶实体）══
+    if (has_hifleet_feature or is_howto) and not (entities.mmsi or entities.imo or entities.ship_name):
+        # 含有账号标记或平台特性词 + 航线词汇，应走知识库而非船舶查询
+        voyage_terms_in_q = any(m in lower for m in ["历史轨迹", "轨迹", "挂靠", "航次", "气象导航", "海图"])
+        if voyage_terms_in_q:
+            return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="normal", reason="platform feature knowledge (not ship analysis)")
 
     has_ship_entity = bool(entities.mmsi or entities.imo or entities.ship_name or context.last_ship_mmsi or context.last_ship_imo or context.last_ship_name)
     voyage_markers = ["历史轨迹", "轨迹", "历史挂靠", "挂靠", "航次", "上一港", "上次离港", "当前停船", "停在哪", "停靠", "最近靠港", "目的港", "一致"]
@@ -408,16 +436,16 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
         return RouteDecision("ship_complex", "ship_multi_step_analysis", SHIP_VOYAGE_BUNDLE, "complex", reason="voyage or multi-step ship analysis")
 
     stats_markers = ["海峡", "通航", "区域", "范围内", "bbox", "polygon", "红海绕航", "港口", "port", "船舶列表"]
+    # 具体统计查询（有地理实体或日期）优先走 ship_stats
+    has_geo_entity = bool(entities.strait or entities.area or entities.bbox)
+    has_stats_signal = any(m in lower for m in ["通航", "统计", "绕航", "船舶列表"])
+    if has_geo_entity or (any(m in lower for m in stats_markers) and (has_stats_signal or entities.start_date)):
+        return RouteDecision("ship_stats", "ship_stats", SHIP_STATS_BUNDLE, "simple", reason="area/strait/port statistics")
     if is_howto and any(marker in q for marker in ["区域", "海峡", "历史数据", "过往历史", "bbox", "区域船舶"]):
         return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="area/strait how-to")
-    if entities.strait or entities.area or entities.bbox or any(m in lower for m in stats_markers):
-        return RouteDecision("ship_stats", "ship_stats", SHIP_STATS_BUNDLE, "simple", reason="area/strait/port statistics")
 
     if not has_ship_entity and is_troubleshooting:
         return RouteDecision("knowledge", "platform_troubleshooting", KNOWLEDGE_BUNDLE, "simple", search_depth="normal", reason="platform troubleshooting")
-
-    if has_account_marker and any(marker in q for marker in HIFLEET_PERMISSION_QUERY_MARKERS):
-        return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="account permission knowledge")
 
     if has_hifleet_feature and not has_ship_entity and any(m in lower for m in voyage_markers):
         return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="feature knowledge not ship analysis")
@@ -578,7 +606,15 @@ def _planner_search_plan(
     if decision.route == "browser_verify":
         return [{"hypothesis_id": "H1", "query": text, "depth": decision.search_depth or "normal", "source_priority": source_priority, "purpose": "核验官方网页与公开信息"}]
     if decision.route == "knowledge":
-        return [{"hypothesis_id": "H1", "query": text, "depth": decision.search_depth or "quick", "source_priority": source_priority, "purpose": "优先从知识库和官方资料回答"}]
+        # 多角度检索：主查询 + 补充角度，确保覆盖平台功能、使用场景、常见问题
+        primary_query = _rewrite_hifleet_knowledge_query(text)
+        primary_depth = decision.search_depth or "quick"
+        plan = [{"hypothesis_id": "H1", "query": primary_query, "depth": primary_depth, "source_priority": source_priority, "purpose": "从知识库和官方资料回答核心问题"}]
+        # 生成补充检索词
+        expansion_query = _generate_knowledge_expansion_query(text, decision)
+        if expansion_query and expansion_query != primary_query:
+            plan.append({"hypothesis_id": "H2", "query": expansion_query, "depth": "normal", "source_priority": source_priority, "purpose": "补充产品能力和使用场景信息"})
+        return plan
     return []
 
 
@@ -827,6 +863,7 @@ def _is_hifleet_business_query(question: str) -> bool:
 
 
 def _rewrite_hifleet_knowledge_query(question: str) -> str:
+    """Rewrite query to add HiFleet product context for better KB retrieval."""
     q = normalize_message_text(question)
     if not q:
         return q
@@ -834,7 +871,41 @@ def _rewrite_hifleet_knowledge_query(question: str) -> str:
         return q
     if any(marker in q for marker in HIFLEET_FEATURE_MARKERS | HIFLEET_ACCOUNT_MARKERS):
         return f"HiFleet {q}"
+    # 对平台知识类问题补充 HiFleet 产品上下文
+    platform_signal_words = {"海图", "航线", "轨迹", "气象", "船位", "岸基", "点验",
+                             "告警", "报警", "监控", "导航", "ais", "dtu", "船舶跟踪"}
+    if any(w in q.lower() for w in platform_signal_words):
+        return f"HiFleet {q}"
     return q
+
+
+def _generate_knowledge_expansion_query(text: str, decision: RouteDecision) -> str:
+    """Generate a complementary search query from a different angle."""
+    q = normalize_message_text(text).lower()
+    # 账号权限类：补充功能说明
+    if any(m in q for m in ["免费版", "基础版", "专业版", "账号", "权限", "会员"]):
+        feature = ""
+        for f in ["历史轨迹", "气象预报", "气象导航", "海图", "船位", "航线", "岸基值班"]:
+            if f in q:
+                feature = f
+                break
+        if feature:
+            return f"HiFleet {feature} 功能说明 使用场景"
+    # 功能询问类：补充操作步骤和常见问题
+    if any(m in q for m in ["如何", "怎么", "怎样", "为什么"]):
+        core_topic = ""
+        for topic in ["气象导航", "全球海图", "中国海图", "历史轨迹", "岸基值班",
+                      "船舶点验", "航线", "报警", "监控", "船位更新"]:
+            if topic in q:
+                core_topic = topic
+                break
+        if core_topic:
+            return f"HiFleet {core_topic} 操作步骤 常见问题"
+    # 故障排查类：补充解决方案
+    if decision.task_type == "platform_troubleshooting":
+        return f"HiFleet {text} 解决方案 处理方法"
+    # 通用产品问题：补充产品功能介绍
+    return f"HiFleet {text} 产品功能 使用说明"
 
 
 def _try_direct_hifleet_knowledge_answer(question: str) -> str:
@@ -855,6 +926,27 @@ def _try_direct_hifleet_knowledge_answer(question: str) -> str:
             "2. AVCS Online 海图与船上使用的 ENC 海图同步，为每周更新。\n"
             "3. 如果您问的是气象海况图层，数据每 6 小时更新一次，每天更新 4 次，最长可看未来 15 天。\n\n"
             "如果您方便，也可以告诉我是【全球海图 / AVCS 海图 / 气象海况】哪一类，我可以继续给您更精确的说明。"
+        )
+
+    if ("气象导航" in q or ("气象" in q and "导航" in q)) and any(marker in q for marker in ["如何", "怎么", "怎样", "使用", "功能"]):
+        return (
+            "HiFleet 气象导航功能可以帮助您基于实时气象数据规划最优航线。\n\n"
+            "主要使用方式：\n"
+            "1. 在计划航线页面，选择\"气象叠加\"可查看航线沿途的风、浪、流等气象预报。\n"
+            "2. 通过\"气象路径优化\"功能，系统会自动推荐避开恶劣天气的备选航线。\n"
+            "3. 气象数据每 6 小时更新一次，专业版最长可查看未来 15 天预报。\n\n"
+            "入口：进入目标船舶 -> 计划/航线 -> 气象叠加/气象导航。\n\n"
+            "如需更具体的操作指引，请告诉我您是想查看航线气象还是做航线气象优化。"
+        )
+
+    if "全球海图" in q and not any(m in q for m in ["更新", "频率", "符号"]):
+        return (
+            "HiFleet 全球海图（Global Chart）基于 Cmap 授权数据，覆盖全球航区，主要能力包括：\n\n"
+            "1. 海图显示：支持全球电子海图浏览，包含航道、水深、灯标、助航标志等信息。\n"
+            "2. 海图更新：支持年度/季度/每周更新。\n"
+            "3. 航线叠加：可在海图上叠加计划航线和历史轨迹。\n"
+            "4. 功能入口：平台首页 -> 全球海图。\n\n"
+            "如您有关于海图符号、图层操作或权限范围的具体问题，请继续告诉我。"
         )
 
     if ("专业版" in q or "专业版账号" in q) and ("气象预报" in q or "气象" in q) and any(marker in q for marker in ["几天", "多久"]):
@@ -883,7 +975,8 @@ def _try_direct_hifleet_knowledge_answer(question: str) -> str:
     return ""
 
 
-def _format_general_knowledge_answer(question: str, search_output: str) -> str:
+def _format_general_knowledge_answer(question: str, search_output: str, *, evidence_items: list[dict[str, Any]] | None = None) -> str:
+    """Format knowledge answer with structured output: conclusion → explanation → suggestion."""
     direct_answer = _try_direct_hifleet_knowledge_answer(question)
     if direct_answer:
         return format_customer_answer(direct_answer)
@@ -894,19 +987,46 @@ def _format_general_knowledge_answer(question: str, search_output: str) -> str:
             "目前还不能直接判断这个图标或符号的含义，因为现有信息里缺少最关键的识别依据。\n\n"
             "请只补充一个关键信息：图标原图或更清晰的截图。我收到后会结合 HiFleet 官方资料继续为您确认。"
         )
-    if any(marker in q for marker in ["什么", "什么意思", "是什么"]) and summary:
-        return format_customer_answer(
-            f"根据目前检索到的官方资料，先给您结论：\n{summary}\n\n如果您愿意，我也可以继续结合具体页面、截图或使用场景帮您解释得更准确。"
-        )
+    # 结构化回复：先结论，再详细说明，最后建议
     if summary:
-        answer = summary
+        # 从多源证据中综合生成结构化回复
+        supplementary_info = _extract_supplementary_evidence(evidence_items) if evidence_items else ""
+        answer_parts = []
+        if any(marker in q for marker in ["什么", "什么意思", "是什么", "哪些"]):
+            answer_parts.append(f"根据目前检索到的官方资料，先给您结论：\n{summary}")
+        elif any(marker in q for marker in ["如何", "怎么", "怎样", "为什么"]):
+            answer_parts.append(summary)
+        else:
+            answer_parts.append(summary)
+        # 补充信息（来自多源证据综合）
+        if supplementary_info:
+            answer_parts.append(f"\n\n补充说明：\n{supplementary_info}")
+        # 官方链接引导
         if any(link.startswith(HELP_CENTER_URL) or "hifleet.com/wp/communities" in link for link in links):
-            answer += f"\n\n如需自助查看，可参考官方帮助中心：{HELP_CENTER_URL}"
-        return format_customer_answer(answer)
+            answer_parts.append(f"\n\n如需自助查看，可参考官方帮助中心：{HELP_CENTER_URL}")
+        return format_customer_answer("".join(answer_parts))
     return (
         "我暂时还没有拿到足够明确的官方信息来直接下结论。\n\n"
         "请只补充一个最关键的细节，我再继续帮您核查。"
     )
+
+
+def _extract_supplementary_evidence(evidence_items: list[dict[str, Any]] | None) -> str:
+    """从多条证据中提取补充信息（仅取非主查询的高质量结果）。"""
+    if not evidence_items or len(evidence_items) <= 1:
+        return ""
+    supplementary_snippets = []
+    for i, item in enumerate(evidence_items[1:], 1):
+        snippet = str(item.get("snippet", "")).strip()
+        relevance = float(item.get("relevance", 0))
+        if snippet and relevance >= 0.7 and len(snippet) > 20:
+            # 去重：不重复主查询已有的内容
+            main_snippet = str(evidence_items[0].get("snippet", ""))
+            if snippet[:40] not in main_snippet:
+                supplementary_snippets.append(snippet[:200])
+    if not supplementary_snippets:
+        return ""
+    return "\n".join(f"- {s}" for s in supplementary_snippets[:2])
 
 
 def validate_links(text: str, checker: Callable[[str], bool] | None = None) -> tuple[bool, list[str]]:
@@ -1056,34 +1176,55 @@ def execute_planned_knowledge_chain(
     tool_map: dict[str, Any],
     trace: HarnessTrace,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
-    queries = search_plan or [{"query": question, "depth": decision.search_depth or "quick", "hypothesis_id": "H1", "purpose": "回答当前问题"}]
+    queries = search_plan or [{"query": _rewrite_hifleet_knowledge_query(question), "depth": decision.search_depth or "quick", "hypothesis_id": "H1", "purpose": "回答当前问题"}]
     outputs: list[str] = []
     evidence_items: list[dict[str, Any]] = []
+    found_high_quality = False
     for item in queries:
-        query = str(item.get("query", "")).strip() or question
+        query = str(item.get("query", "")).strip() or _rewrite_hifleet_knowledge_query(question)
         depth = str(item.get("depth", "")).strip() or decision.search_depth or "quick"
         output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
         outputs.append(output)
+        source_type = _guess_evidence_source_type(output)
+        is_hit = not is_no_hit_text(output)
         evidence_items.append(
             {
-                "source_type": _guess_evidence_source_type(output),
+                "source_type": source_type,
                 "source_name": "smart_search",
                 "url": HELP_CENTER_URL if "helpcenter" in output.lower() else "",
                 "snippet": _extract_search_answer(output)[0][:240],
                 "supports": [str(item.get("hypothesis_id", "H1"))],
                 "conflicts": [],
                 "authority": 0.95 if "hifleet.com" in output.lower() else 0.75,
-                "relevance": 0.9 if not is_no_hit_text(output) else 0.4,
+                "relevance": 0.9 if is_hit else 0.4,
                 "query": query,
                 "depth": depth,
                 "purpose": str(item.get("purpose", "")),
             }
         )
-        if not is_no_hit_text(output) and _guess_evidence_source_type(output) in {"local_kb", "official_site", "official_community"}:
-            break
-    output = outputs[-1] if outputs else ""
-    if outputs and all(is_no_hit_text(item) for item in outputs) and decision.task_type == "platform_troubleshooting":
-        trace.fallback_reason = trace.fallback_reason or "normal_search_empty"
+        if is_hit and source_type in {"local_kb", "official_site", "official_community"}:
+            found_high_quality = True
+    # 如果所有查询都未命中，尝试升级搜索深度
+    if not found_high_quality and outputs and all(is_no_hit_text(item) for item in outputs):
+        trace.fallback_reason = trace.fallback_reason or "all_queries_weak_hit"
+        escalated_query = _rewrite_hifleet_knowledge_query(question)
+        escalated_output = _invoke_tool(tool_map, trace, "smart_search", {"query": escalated_query, "depth": "deep"})
+        outputs.append(escalated_output)
+        evidence_items.append({
+            "source_type": _guess_evidence_source_type(escalated_output),
+            "source_name": "smart_search",
+            "url": "",
+            "snippet": _extract_search_answer(escalated_output)[0][:240],
+            "supports": ["H1"],
+            "conflicts": [],
+            "authority": 0.7,
+            "relevance": 0.7 if not is_no_hit_text(escalated_output) else 0.3,
+            "query": escalated_query,
+            "depth": "deep",
+            "purpose": "升级搜索深度后尝试获取更多信息",
+        })
+    # 选择最佳输出：优先匹配高质量结果
+    output = _select_best_evidence_output(outputs, evidence_items)
     ok, invalid = validate_links(output)
     if invalid:
         cleaned = output
@@ -1098,13 +1239,14 @@ def execute_planned_knowledge_chain(
         "planned_queries": [item.get("query", "") for item in queries],
         "evidence_count": len(evidence_items),
         "official_support_count": evidence_summary["official_support_count"],
+        "multi_query_synthesis": len(queries) > 1,
     }
     trace.answer_confidence = evidence_summary["confidence"]
     if "上传" in question and "航线" in question and any(marker in question for marker in ["不了", "失败", "怎么办", "无法"]):
         return _format_route_upload_troubleshooting(output), evidence_items, evidence_summary
     if decision.task_type == "platform_troubleshooting":
         return _format_platform_troubleshooting_answer(question, output), evidence_items, evidence_summary
-    return _format_general_knowledge_answer(question, output), evidence_items, evidence_summary
+    return _format_general_knowledge_answer(question, output, evidence_items=evidence_items), evidence_items, evidence_summary
 
 
 def _format_platform_troubleshooting_answer(question: str, search_output: str) -> str:
@@ -1180,6 +1322,25 @@ def _guess_evidence_source_type(output: str) -> str:
     if "faq" in lowered or "标准回复" in lowered or "smart_search_l1_hit" in lowered:
         return "local_kb"
     return "public_web"
+
+
+def _select_best_evidence_output(outputs: list[str], evidence_items: list[dict[str, Any]]) -> str:
+    """从多次搜索结果中选择最佳输出：优先高质量源，其次高相关度。"""
+    if not outputs:
+        return ""
+    if len(outputs) == 1:
+        return outputs[0]
+    # 优先返回本地知识库或官方站点的结果
+    high_quality_sources = {"local_kb", "official_site", "official_community"}
+    for i, item in enumerate(evidence_items):
+        if i < len(outputs) and item.get("source_type") in high_quality_sources and not is_no_hit_text(outputs[i]):
+            return outputs[i]
+    # 其次返回任何命中的结果
+    for i, output in enumerate(outputs):
+        if not is_no_hit_text(output):
+            return output
+    # 全部未命中，返回最后一个（通常是升级搜索的结果）
+    return outputs[-1]
 
 
 def review_evidence_items(evidence_items: list[dict[str, Any]]) -> dict[str, Any]:

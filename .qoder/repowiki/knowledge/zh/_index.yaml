@@ -1,0 +1,88 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: main
+exported_at: "2026-06-16T03:15:34Z"
+modules:
+    backend/admin_api:
+        dir_name: 管理后台 API
+        title: 管理后台 API
+        scope:
+            - src/admin_api/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/agents:
+        dir_name: 智能客服与员工代理编排引擎
+        title: 智能客服与员工代理编排引擎
+        scope:
+            - src/agents/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/observability:
+        dir_name: 可观测性日志与调试会话管理
+        title: 可观测性日志与调试会话管理
+        scope:
+            - src/observability/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/skills/browser_verify:
+        dir_name: 公共网页验证助手
+        title: 公共网页验证助手
+        scope:
+            - src/skills/browser_verify/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/skills/customer_workspace:
+        dir_name: 客户工作区文件安全交互
+        title: 客户工作区文件安全交互
+        scope:
+            - src/skills/customer_workspace/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/skills/employee_workspace:
+        dir_name: 员工工作区数据分析与沙盒执行
+        title: 员工工作区数据分析与沙盒执行
+        scope:
+            - src/skills/employee_workspace/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/skills/hifleet_ship_service/references_and_config:
+        dir_name: HiFleet 船舶服务参考与配置
+        title: HiFleet 船舶服务参考与配置
+        scope:
+            - src/skills/hifleet_ship_service/references/
+            - src/skills/hifleet_ship_service/config/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/skills/hifleet_ship_service/scripts:
+        dir_name: HiFleet 船舶数据交互脚本集
+        title: HiFleet 船舶数据交互脚本集
+        scope:
+            - src/skills/hifleet_ship_service/scripts/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    backend/skills/multimodal_support:
+        dir_name: 多模态附件元数据提取
+        title: 多模态附件元数据提取
+        scope:
+            - src/skills/multimodal_support/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

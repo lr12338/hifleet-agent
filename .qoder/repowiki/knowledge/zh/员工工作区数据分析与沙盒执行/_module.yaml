@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: backend/skills/employee_workspace
+title: 员工工作区数据分析与沙盒执行
+scope:
+    - src/skills/employee_workspace/
+source_files: []
+depends_on: []
+related_to: []

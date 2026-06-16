@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: backend/skills/customer_workspace
+title: 客户工作区文件安全交互
+scope:
+    - src/skills/customer_workspace/
+source_files: []
+depends_on: []
+related_to: []
