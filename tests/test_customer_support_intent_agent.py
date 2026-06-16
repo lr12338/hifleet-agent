@@ -4,10 +4,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agents.agent import (
+    _build_customer_support_followup_question,
     _customer_support_route_for_intent,
     _execute_customer_support_harness,
     _execute_customer_support_planner,
     _heuristic_image_perception,
+    _repair_customer_support_answer,
+    _run_customer_support_intent_agent,
+    _run_customer_support_response_qa_agent,
+    _run_customer_support_review_agent,
     is_sensitive_internal_request,
 )
 from agents.customer_support_router import (
@@ -213,3 +218,84 @@ def test_customer_support_planner_handles_knowledge_without_harness(monkeypatch)
     assert trace["tool_call_sequence"] == ["smart_search"]
     assert evidence_items
     assert evidence_summary["confidence"] in {"medium", "high"}
+
+
+def test_customer_support_intent_agent_enforces_write_policy(monkeypatch):
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "intent": "ship_update",
+            "confidence": "high",
+            "use_context_ship": False,
+            "why": "用户在要求更新船位",
+        },
+    )
+
+    result = _run_customer_support_intent_agent(
+        ctx=None,
+        cfg={"config": {}},
+        messages=[HumanMessage(content="帮我更新这条船的船位")],
+        text="帮我更新这条船的船位",
+        entities=extract_entities("帮我更新这条船的船位"),
+        context=build_conversation_context([HumanMessage(content="帮我更新这条船的船位")]),
+        allow_write=False,
+    )
+
+    assert result["intent"] == "ship_update"
+    assert result["task_type"] == "platform_knowledge"
+
+
+def test_customer_support_review_agent_blocks_conflicting_public_only_evidence(monkeypatch):
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "best_hypothesis": "H1",
+            "can_answer_directly": True,
+            "confidence": "high",
+            "conflicts": ["两个公开网页说法不一致"],
+            "missing_key_fact": "需要官方资料确认",
+            "recommended_response_style": "direct",
+        },
+    )
+
+    review = _run_customer_support_review_agent(
+        ctx=None,
+        cfg={"config": {}},
+        question="这个功能是什么意思",
+        problem_frame={"question_type": "definition"},
+        hypotheses=[{"id": "H1", "label": "功能定义"}],
+        evidence_items=[{"source_type": "public_web", "supports": ["H1"], "conflicts": ["冲突"]}],
+        selected_output="这是公开网页上的说法",
+        fallback_summary={"support_count": 1, "official_support_count": 0, "conflict_count": 1, "confidence": "medium", "can_answer_directly": True},
+    )
+
+    assert review["can_answer_directly"] is False
+    assert review["confidence"] == "medium"
+
+
+def test_customer_support_response_qa_and_repair_falls_back_to_one_question():
+    qa = _run_customer_support_response_qa_agent(
+        ctx=None,
+        cfg={"config": {}},
+        question="HiFleet 绿点是什么意思",
+        answer="【回答指导】[Query1: xxx]\nAI摘要：smart_search 命中",
+        route="knowledge",
+        task_type="platform_knowledge",
+        review_result={"can_answer_directly": True},
+    )
+
+    repaired = _repair_customer_support_answer(
+        ctx=None,
+        cfg={"config": {}},
+        question="HiFleet 绿点是什么意思",
+        answer="【回答指导】[Query1: xxx]\nAI摘要：smart_search 命中",
+        route="knowledge",
+        task_type="platform_knowledge",
+        missing_slot={},
+        review_result={"missing_key_fact": "请提供具体页面截图"},
+        qa_result=qa,
+    )
+
+    assert qa["pass"] is False
+    assert qa["repair_mode"] == "rewrite"
+    assert repaired == _build_customer_support_followup_question("knowledge", {}, {"missing_key_fact": "请提供具体页面截图"})

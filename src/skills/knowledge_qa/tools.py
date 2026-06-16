@@ -133,7 +133,7 @@ WIKI_MIN_SCORE = 0.30
 # 第4层：官网站内搜索配置
 # ══════════════════════════════════════════════════
 HIFLEET_COMMUNITY_URL = "https://www.hifleet.com/wp/communities"
-HIFLEET_SITES = "hifleet.com|help.hifleet.com|www.hifleet.com"
+HIFLEET_SITES = "hifleet.com|help.hifleet.com|www.hifleet.com|www.hifleet.com/wp/communities"
 
 # ══════════════════════════════════════════════════
 # 第5层：域名权威度加权表

@@ -41,7 +41,11 @@ from coze_coding_utils.log.config import LOG_LEVEL
 from coze_coding_utils.error.classifier import ErrorClassifier
 from coze_coding_utils.helper.stream_runner import AgentStreamRunner, agent_stream_handler, RunOpt
 from agents.profiles import PROFILE_HEADER, resolve_profile_id, set_current_agent_profile
-from agents.customer_support_stream_debug import build_customer_support_debug_events
+from agents.customer_support_stream_debug import (
+    DebugRuntimeCursor,
+    build_customer_support_debug_events,
+    build_customer_support_debug_events_from_update,
+)
 from llm_config import load_llm_config, messages_have_multimodal_content, resolve_model_selection
 from utils.llm_route_state import clear_current_llm_route, set_current_llm_route
 
@@ -419,11 +423,56 @@ class AgentService:
 
     async def explainable_stream_sse(self, payload: Dict[str, Any], ctx=None, run_opt: Optional[RunOpt] = None) -> AsyncGenerator[str, None]:
         """Stream safe reasoning/search/review events before the real agent stream."""
-        for event in build_customer_support_debug_events(payload):
-            yield self._sse_event(event)
-            await asyncio.sleep(0)
-        async for item in self.stream_sse(payload, ctx=ctx, run_opt=run_opt):
-            yield item
+        if ctx is None:
+            ctx = new_context(method="stream_sse")
+        if run_opt is None:
+            run_opt = RunOpt()
+
+        profile_id = str((payload or {}).get("agent_profile", "") or "customer_support")
+        if profile_id != "customer_support":
+            for event in build_customer_support_debug_events(payload):
+                yield self._sse_event(event)
+                await asyncio.sleep(0)
+            async for item in self.stream_sse(payload, ctx=ctx, run_opt=run_opt):
+                yield item
+            return
+
+        run_id = ctx.run_id
+        logger.info(f"Starting explainable stream with run_id: {run_id}")
+        graph = self._get_graph(ctx)
+        run_config = init_agent_config(graph, ctx)
+        session_id = ""
+        if isinstance(payload, dict):
+            session_id = str(payload.get("session_id", "")).strip()
+        thread_id = session_id or ctx.run_id
+        if not isinstance(run_config, dict):
+            run_config = {}
+        configurable = run_config.get("configurable")
+        if not isinstance(configurable, dict):
+            configurable = {}
+            run_config["configurable"] = configurable
+        configurable["thread_id"] = thread_id
+        cursor = DebugRuntimeCursor()
+
+        try:
+            async for chunk in graph.astream(
+                payload,
+                config=run_config,
+                context=ctx,
+                stream_mode=["updates"],
+            ):
+                if not (isinstance(chunk, tuple) and len(chunk) == 2):
+                    continue
+                mode, data = chunk
+                if mode != "updates" or not isinstance(data, dict):
+                    continue
+                for event in build_customer_support_debug_events_from_update(data, cursor):
+                    yield self._sse_event(event)
+                    await asyncio.sleep(0)
+        finally:
+            self.running_tasks.pop(run_id, None)
+            clear_current_llm_route()
+        cozeloop.flush()
 
     def _get_stream_runner(self):
         return self._agent_stream_runner

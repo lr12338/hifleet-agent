@@ -31,7 +31,7 @@ flowchart TD
 | `src/agents/agent.py` | 两个 profile 的 phase graph 构建、customer_support 的 Planner/Harness/Guard 主执行链、finalize 输出收口 |
 | `src/agents/customer_support_router.py` | 客服路由、实体提取、Planner 计划构建、证据审查、确定性 harness、客服答复模板 |
 | `src/agents/customer_support_guard.py` | 客服最终输出脱敏、拒答、链接白名单校验兜底 |
-| `src/agents/customer_support_stream_debug.py` | `/stream_run` 的调试思考流事件 |
+| `src/agents/customer_support_stream_debug.py` | `/stream_run` 的 runtime state -> debug event 映射 |
 | `src/skills/skill_loader.py` | skills 与 tools 注册、按名称收缩工具集 |
 | `src/skills/knowledge_qa/tools.py` | `smart_search` 分层检索链、结构化联网搜索适配、Ark 回退逻辑 |
 | `src/skills/hifleet_ship_service/tools.py` | 船舶查询、统计、写操作工具 |
@@ -75,9 +75,9 @@ flowchart TD
 | 面向对象 | 外部客户、微信客服、CRM 渠道 | 内部员工、后台运营 |
 | 典型输入 | 平台问题、截图、船舶查询、写操作、公开网页核验 | 文件、表格、分析任务、报告生成、内部知识问答 |
 | 主目标 | 快速给出准确、可直接发送给客户的答复 | 帮员工完成任务并产出可复核结果 |
-| `plan` 阶段 | `Planner Agent` 负责理解、假设、检索规划、证据审查前置建模、决策 | 判断是否进入文件/沙盒工作流 |
+| `plan` 阶段 | `Intent Agent + Planner Agent` 负责理解、假设、检索规划、响应模式决策 | 判断是否进入文件/沙盒工作流 |
 | `act` 阶段 | 先按 Planner 决策执行：知识/多模态走 Planner 检索链，船舶/写操作/文件/核验走 Harness | inspect 文件、生成 Python、运行沙盒、迭代修复 |
-| `check` 阶段 | 检查是否有答案、链接是否可用、证据数量、是否只问一个关键问题、是否存在写结果 | 检查 `exit_code`、artifact、数据完整性、自愈是否成功 |
+| `check` 阶段 | 程序校验 + `Response QA Agent`，必要时修复或降级为单关键追问 | 检查 `exit_code`、artifact、数据完整性、自愈是否成功 |
 | `finalize` 阶段 | `Guard` 脱敏、清理搜索展示模板、返回客服口吻回复 | 汇总结果、保留产物链接、按内部任务口吻输出 |
 | 检索策略 | 本地知识库 -> 官网/帮助中心/官方社区 -> 结构化公网搜索 -> Ark 回退 | 视任务而定，知识问答可复用 `smart_search` |
 | 多模态 | 图片/语音/视频/文件先感知，再决定检索和推理 | 更关注文件结构和分析任务，不强调客服化表达 |
@@ -138,7 +138,7 @@ flowchart TD
    - 最近回答是否已经暴露船舶身份
 3. `extract_entities(text)` 抽取 `MMSI / IMO / ship_name / port / area / strait / dates / urls`。
 4. `extract_attachments(messages)` 抽取附件。
-5. `_classify_customer_support(...)` 做基础路由分类。
+5. `_run_customer_support_intent_agent(...)` 先做结构化意图识别；失败时才回退 `_classify_customer_support(...)`。
 6. `classify_multimodal_message(...)` 基于附件类型做第一次多模态路由修正。
 7. `_perceive_customer_attachments(...)` 做多模态感知。
    - 优先本地多模态模型 `doubao-seed-2-0-lite-260428`
@@ -149,7 +149,7 @@ flowchart TD
 9. `resolve_entities_with_context(...)` 决定是否继承上一轮船舶上下文。
    - 仅 `ship_single / ship_complex / ship_update / ship_stats` 允许补船舶实体
    - `knowledge / troubleshooting / multimodal_understanding` 不继承船舶实体，避免语义污染
-10. `build_customer_support_plan(...)` 生成结构化规划结果：
+10. `build_customer_support_plan(...)` 先生成程序 fallback 计划，再由 `_run_customer_support_planner_agent(...)` 生成结构化规划结果：
    - `problem_frame`
    - `hypotheses`
    - `search_plan`
@@ -163,11 +163,16 @@ flowchart TD
    - `task_type`
    - `tool_bundle`
    - `entity_resolution`
+   - `intent_agent`
    - `latency_hotspot.perception`
    - `planner.problem_frame / hypotheses / search_plan / decision_rationale`
 12. 如果存在附件，构造 `evidence_pack["augmented_text"]` 供后续检索使用。
 
-`Planner Agent` 当前是“结构化规则 + 感知增强”的实现，不是开放式全自由工具 Agent。它负责先把问题建模清楚，再决定是直接回答、只追问一个关键问题，还是把执行交给 Harness。
+当前 `plan node` 的真实语义已经是：
+
+- `Intent Agent` 负责结构化判意图
+- `Planner Agent` 负责结构化问题建模
+- 程序 fallback 负责在 JSON 失败或模型不稳定时兜底
 
 ### 4.4 act node
 
@@ -218,6 +223,11 @@ flowchart LR
 - 工具调用顺序和缺字段追问是可预测的
 - 多模态只负责感知和补充证据，不直接越过证据审查
 
+此外，`act node` 在得到答案后不会直接进入 `finalize`，而是会先补一层 `Review Agent`：
+
+- `_run_customer_support_review_agent(...)` 判断当前证据是否足够直接回答
+- 若不足，则强制改为“只追问一个关键问题”
+
 ### 4.5 check node
 
 `check node` 会验证：
@@ -233,7 +243,16 @@ flowchart LR
   - `metadata_checked`
   - `verified`
   - `ask_one_question`
+- `Response QA Agent` 是否通过
+- 是否已经发生 repair / degrade
 - 是否需要 loop
+
+这里的真实顺序已经变成：
+
+1. 程序级链接与基本答案校验
+2. `_run_customer_support_response_qa_agent(...)` 做客服回复质检
+3. 质检失败时 `_repair_customer_support_answer(...)` 尝试修复一次
+4. 修复仍失败则降级为单关键追问
 
 customer_support 默认只允许一次 loop；超过后走 fallback，避免客服渠道无限重试。
 
@@ -449,25 +468,25 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Req[/stream_run 请求/] --> Debug[build_customer_support_debug_events]
+    Req[/stream_run 请求/] --> Graph["graph.astream(stream_mode=updates)"]
+    Graph --> Update["真实 node updates"]
+    Update --> Debug["build_customer_support_debug_events_from_update"]
     Debug --> SSE1[thinking]
     Debug --> SSE2[tool_request]
     Debug --> SSE3[tool_response]
-    SSE1 --> Agent[真实 agent 执行]
-    SSE2 --> Agent
-    SSE3 --> Agent
-    Agent --> Answer[answer 流]
-    Answer --> End[message_end]
+    Debug --> SSE4[answer]
+    SSE4 --> End[message_end]
 ```
 
 调试界面可看到：
 
-- 问题理解
-- 附件感知
-- 检索词改写
-- 来源优先级
-- 审查逻辑
-- 输出策略
+- `intent_agent_result`
+- `reasoning_public_trace`
+- `search_plan`
+- 实际执行过的工具
+- `review_agent_result`
+- `response_qa_result`
+- 最终回复
 
 不会输出：
 
@@ -538,9 +557,11 @@ customer_support 排障时优先看：
 4. `decision_rationale.response_mode` 是否应该直答、追问还是进入 harness。
 5. `entity_resolution` 是否被错误继承。
 6. `tool_call_sequence` 是否走了预期 Planner 链或 Harness。
-7. `evidence_summary` 是否支持当前结论。
-8. `latency_hotspot.perception` 是否异常偏高。
-9. `generated_answer` 是否被 `sanitize_customer_output` 正确收口。
+7. `review_agent_result` 是否错误放行或错误拦截。
+8. `response_qa_result` 是否错误修复或错误降级。
+9. `evidence_summary` 是否支持当前结论。
+10. `latency_hotspot.perception` 是否异常偏高。
+11. `generated_answer` 是否被 `sanitize_customer_output` 正确收口。
 
 ## 11. 文档与代码联动规则
 

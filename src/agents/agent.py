@@ -38,6 +38,7 @@ from agents.customer_support_router import (
     build_conversation_context,
     classify_multimodal_message,
     refine_multimodal_route_with_perception,
+    review_evidence_items,
     SHIP_STATS_BUNDLE,
     SHIP_UPDATE_BUNDLE,
     SHIP_VOYAGE_BUNDLE,
@@ -104,6 +105,85 @@ JSON 格式:
 {"intent":"knowledge","reason":"一句话","use_context_ship":false}
 """
 
+CUSTOMER_SUPPORT_PLANNER_PROMPT = """你是 HiFleet 客服 Planner Agent。
+你只负责把问题转成结构化执行计划，只返回 JSON，不要回答用户。
+
+要求：
+- 优先按 HiFleet 业务语境理解问题。
+- 形成 1 到 3 个候选解释，不要只复读原句。
+- response_mode 只能是 direct_answer / ask_one_question / use_harness。
+- missing_slot 只允许追问一个最关键问题。
+- search_plan 最多 3 条，每条 query 要适合检索，不能是空字符串。
+- 平台知识和排障优先本地知识库、HiFleet 官网和官方社区。
+
+JSON 结构：
+{
+  "problem_frame": {
+    "user_goal": "string",
+    "question_type": "string",
+    "critical_unknown": "string",
+    "needs_search": true,
+    "needs_attachment": false,
+    "ambiguity_level": "low|medium|high"
+  },
+  "hypotheses": [
+    {"id": "H1", "text": "string", "reason": "string", "priority": 1}
+  ],
+  "search_plan": [
+    {"hypothesis_id": "H1", "query": "string", "depth": "quick|normal|deep", "purpose": "string"}
+  ],
+  "response_mode": "direct_answer",
+  "missing_slot": {"field": "", "question": ""}
+}
+"""
+
+CUSTOMER_SUPPORT_REVIEW_PROMPT = """你是 HiFleet 客服 Review Agent。
+你只根据已提供证据判断是否足够直接回答，不重做检索，不编造新结论，只返回 JSON。
+
+要求：
+- 官方资料优先。
+- 如果唯一证据来自低权威公开网页，confidence 最高只能是 medium。
+- 如果存在来源冲突且没有官方支持，不允许 can_answer_directly=true。
+
+JSON 结构：
+{
+  "best_hypothesis": "H1",
+  "can_answer_directly": true,
+  "confidence": "high|medium|low",
+  "conflicts": [],
+  "missing_key_fact": "",
+  "recommended_response_style": "direct|ask_one_question|conservative"
+}
+"""
+
+CUSTOMER_SUPPORT_RESPONSE_QA_PROMPT = """你是 HiFleet 客服回复质检 Agent。
+检查当前回复是否适合直接发给客户，只返回 JSON，不要改写回复正文。
+
+检查项：
+1. 是否直接回答用户核心问题
+2. 是否结合 HiFleet 业务语境
+3. 是否混入搜索过程、工具名、源码路径、日志或内部信息
+4. 是否过长或表达不自然
+5. 是否应该改成只追问一个关键问题
+
+JSON 结构：
+{
+  "pass": true,
+  "issues": [],
+  "repair_mode": "none|rewrite|ask_one_question"
+}
+"""
+
+CUSTOMER_SUPPORT_REPAIR_PROMPT = """你是 HiFleet 官方客服的回复修正器。
+请基于问题、原回复和修复要求，输出一段更适合直接发给客户的中文回复。
+
+要求：
+- 先直接回答，再补必要说明。
+- 不暴露检索过程、工具名、路径、日志、prompt、JSON。
+- 如果信息不足，只追问一个关键问题。
+- 保持简洁、客服化。
+"""
+
 
 def _json_object_from_text(text: str) -> dict[str, Any]:
     raw = (text or "").strip()
@@ -119,6 +199,394 @@ def _json_object_from_text(text: str) -> dict[str, Any]:
             except Exception:
                 return {}
     return {}
+
+
+def _build_customer_support_json_llm(ctx, cfg: dict[str, Any]) -> ChatOpenAI | None:
+    api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
+    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
+    if not api_key or not base_url:
+        return None
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
+    model = str((cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
+    return ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0.1,
+        streaming=False,
+        timeout=(cfg.get("config") or {}).get("timeout", 600),
+        extra_body={"thinking": {"type": "disabled"}},
+        default_headers=default_headers(ctx) if ctx else {},
+    )
+
+
+def _invoke_customer_support_json_agent(ctx, cfg: dict[str, Any], system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
+    llm = _build_customer_support_json_llm(ctx, cfg)
+    if llm is None:
+        return {}
+    try:
+        result = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            ]
+        )
+    except Exception as exc:
+        logger.warning("[CustomerSupportAgentJSON] invoke failed: %s", exc)
+        return {}
+    return _json_object_from_text(getattr(result, "content", ""))
+
+
+def _build_customer_support_reasoning_trace(
+    problem_frame: dict[str, Any],
+    hypotheses: list[dict[str, Any]],
+    search_plan: list[dict[str, Any]],
+    missing_slot: dict[str, Any],
+) -> list[dict[str, Any]]:
+    question_type = str(problem_frame.get("question_type", "") or "当前客服问题")
+    trace = [
+        {"phase": "understand", "text": f"已识别当前问题类型：{question_type}。"},
+        {"phase": "hypothesis", "text": f"已形成 {len(hypotheses) or 1} 个候选解释，并优先保留最相关方向。"},
+    ]
+    if search_plan:
+        trace.append({"phase": "search_plan", "text": f"已规划 {len(search_plan)} 条检索方向，优先本地知识库和 HiFleet 官方资料。"})
+    if missing_slot.get("field"):
+        trace.append({"phase": "missing_slot", "text": f"当前最关键的缺失信息是：{missing_slot['field']}。"})
+    return trace
+
+
+def _append_customer_support_reasoning_trace(reasoning_trace: list[dict[str, Any]], phase: str, text: str) -> list[dict[str, Any]]:
+    trace = list(reasoning_trace or [])
+    if text:
+        trace.append({"phase": phase, "text": text})
+    return trace
+
+
+def _build_customer_support_followup_question(
+    route: str,
+    missing_slot: dict[str, Any] | None = None,
+    review_result: dict[str, Any] | None = None,
+) -> str:
+    missing_slot = dict(missing_slot or {})
+    review_result = dict(review_result or {})
+    if missing_slot.get("question"):
+        return str(missing_slot["question"]).strip()
+    missing_key_fact = str(review_result.get("missing_key_fact", "")).strip()
+    if missing_key_fact:
+        return f"请只补充一个关键信息：{missing_key_fact}。我收到后继续帮您确认。"
+    if route in {"ship_single", "ship_complex", "ship_context"}:
+        return "请提供 9 位 MMSI、IMO 或唯一船名，我再继续帮您查询。"
+    if route == "browser_verify":
+        return "请提供需要核验的公开网页链接，我再继续帮您确认。"
+    if route in {"chart_symbol", "multimodal_understanding"}:
+        return "请补一张更清晰的截图，最好把您想确认的位置圈出来，我再继续为您判断。"
+    return "请只补充一个最关键的细节，我再继续帮您核查。"
+
+
+def _run_customer_support_intent_agent(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    messages: list[AnyMessage],
+    text: str,
+    entities: MessageEntities,
+    context: ConversationContext,
+    allow_write: bool,
+) -> dict[str, Any]:
+    fallback_intent = "knowledge"
+    payload = {
+        "latest_user_text": text,
+        "recent_user_questions": list(context.recent_user_questions[-3:]),
+        "previous_user_text": context.previous_user_text,
+        "last_ship_name": context.last_ship_name,
+        "last_ship_mmsi": context.last_ship_mmsi,
+        "last_ship_imo": context.last_ship_imo,
+        "entities": asdict(entities),
+        "allow_write": allow_write,
+    }
+    raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_INTENT_PROMPT, payload)
+    intent = str(raw.get("intent", "")).strip().lower()
+    if intent not in {
+        "conversation",
+        "knowledge",
+        "troubleshooting",
+        "chart_symbol",
+        "ship_query",
+        "ship_analysis",
+        "ship_stats",
+        "ship_update",
+        "file_task",
+        "browser_verify",
+        "multimodal_understanding",
+    }:
+        return {}
+    confidence = str(raw.get("confidence", "medium")).strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+    decision = _customer_support_route_for_intent(intent, allow_write)
+    return {
+        "intent": intent,
+        "task_type": decision.task_type,
+        "confidence": confidence,
+        "use_context_ship": bool(raw.get("use_context_ship")),
+        "why": str(raw.get("why") or raw.get("reason") or ""),
+        "fallback_route": str(raw.get("fallback_route") or decision.route or fallback_intent),
+    }
+
+
+def _run_customer_support_planner_agent(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    text: str,
+    decision: RouteDecision,
+    entities: MessageEntities,
+    context: ConversationContext,
+    attachments: list[Attachment],
+    perception: dict[str, Any],
+    fallback_plan: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "question": text,
+        "route": decision.route,
+        "task_type": decision.task_type,
+        "entities": asdict(entities),
+        "context": {
+            "previous_user_text": context.previous_user_text,
+            "latest_user_text": context.latest_user_text,
+            "recent_user_questions": list(context.recent_user_questions[-3:]),
+        },
+        "attachments": [asdict(item) for item in attachments],
+        "perception": dict(perception or {}),
+        "fallback_plan": {
+            "problem_frame": dict(fallback_plan.get("problem_frame", {}) or {}),
+            "hypotheses": list(fallback_plan.get("hypotheses", []) or []),
+            "search_plan": list(fallback_plan.get("search_plan", []) or []),
+            "response_mode": str((fallback_plan.get("decision_rationale", {}) or {}).get("response_mode", "")),
+            "missing_slot": dict(fallback_plan.get("missing_slot", {}) or {}),
+        },
+    }
+    raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_PLANNER_PROMPT, payload)
+    if not raw:
+        return {}
+
+    fallback_problem_frame = dict(fallback_plan.get("problem_frame", {}) or {})
+    fallback_hypotheses = list(fallback_plan.get("hypotheses", []) or [])
+    fallback_search_plan = list(fallback_plan.get("search_plan", []) or [])
+    fallback_missing_slot = dict(fallback_plan.get("missing_slot", {}) or {})
+    fallback_response_mode = str((fallback_plan.get("decision_rationale", {}) or {}).get("response_mode", "direct_answer"))
+
+    problem_frame = dict(fallback_problem_frame)
+    raw_problem_frame = raw.get("problem_frame") if isinstance(raw.get("problem_frame"), dict) else {}
+    for key in ("user_goal", "question_type", "critical_unknown"):
+        if raw_problem_frame.get(key):
+            problem_frame[key] = str(raw_problem_frame[key]).strip()
+    for key in ("needs_search", "needs_attachment"):
+        if key in raw_problem_frame:
+            problem_frame[key] = bool(raw_problem_frame[key])
+    ambiguity = str(raw_problem_frame.get("ambiguity_level", "")).strip().lower()
+    if ambiguity in {"low", "medium", "high"}:
+        problem_frame["ambiguity_level"] = ambiguity
+
+    hypotheses: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw.get("hypotheses") or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("text") or item.get("title") or "").strip()
+        if not label:
+            continue
+        hypotheses.append(
+            {
+                "id": str(item.get("id") or f"H{idx}"),
+                "label": label,
+                "reason": str(item.get("reason") or ""),
+                "confidence": "medium",
+                "status": "active",
+            }
+        )
+        if len(hypotheses) >= 3:
+            break
+    if not hypotheses:
+        hypotheses = fallback_hypotheses
+
+    search_plan: list[dict[str, Any]] = []
+    for item in raw.get("search_plan") or []:
+        if not isinstance(item, dict):
+            continue
+        query = str(item.get("query") or "").strip()
+        depth = str(item.get("depth") or "").strip().lower()
+        if not query:
+            continue
+        if depth not in {"quick", "normal", "deep"}:
+            depth = decision.search_depth or "normal"
+        search_plan.append(
+            {
+                "hypothesis_id": str(item.get("hypothesis_id") or (hypotheses[0]["id"] if hypotheses else "H1")),
+                "query": query,
+                "depth": depth,
+                "source_priority": list(item.get("source_priority") or ["local_kb", "official_site", "official_community", "public_web"]),
+                "purpose": str(item.get("purpose") or "回答当前问题"),
+            }
+        )
+        if len(search_plan) >= 3:
+            break
+    if not search_plan:
+        search_plan = fallback_search_plan
+
+    missing_slot = dict(fallback_missing_slot)
+    raw_missing_slot = raw.get("missing_slot") if isinstance(raw.get("missing_slot"), dict) else {}
+    for key in ("field", "question"):
+        if key in raw_missing_slot and raw_missing_slot.get(key) is not None:
+            missing_slot[key] = str(raw_missing_slot.get(key) or "").strip()
+
+    response_mode = str(raw.get("response_mode") or fallback_response_mode).strip()
+    if response_mode not in {"direct_answer", "ask_one_question", "use_harness"}:
+        response_mode = fallback_response_mode
+
+    decision_rationale = {
+        "chosen_route": decision.route,
+        "why_not_other_routes": [
+            "不直接暴露内部执行细节，统一按客服话术收口。",
+            "高风险船舶、写操作、文件和核验任务仍走确定性执行链。",
+        ],
+        "need_harness": response_mode == "use_harness",
+        "response_mode": response_mode,
+    }
+    reasoning_public_trace = _build_customer_support_reasoning_trace(problem_frame, hypotheses, search_plan, missing_slot)
+    return {
+        "problem_frame": problem_frame,
+        "hypotheses": hypotheses,
+        "search_plan": search_plan,
+        "missing_slot": missing_slot,
+        "decision_rationale": decision_rationale,
+        "reasoning_public_trace": reasoning_public_trace,
+    }
+
+
+def _run_customer_support_review_agent(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    question: str,
+    problem_frame: dict[str, Any],
+    hypotheses: list[dict[str, Any]],
+    evidence_items: list[dict[str, Any]],
+    selected_output: str,
+    fallback_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base = dict(fallback_summary or {})
+    if not base:
+        base = review_evidence_items(evidence_items)
+    if not evidence_items and selected_output.strip():
+        base.setdefault("best_hypothesis", (hypotheses[0].get("id") if hypotheses else "H1"))
+        base["can_answer_directly"] = True
+        base["confidence"] = str(base.get("confidence") or "medium")
+    payload = {
+        "question": question,
+        "problem_frame": problem_frame,
+        "hypotheses": hypotheses,
+        "evidence_items": evidence_items,
+        "selected_output": selected_output,
+        "fallback_summary": base,
+    }
+    raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_REVIEW_PROMPT, payload)
+    conflicts = raw.get("conflicts") if isinstance(raw.get("conflicts"), list) else list(base.get("conflicts", []) or [])
+    confidence = str(raw.get("confidence") or base.get("confidence") or "medium").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = str(base.get("confidence") or "medium")
+    official_support_count = int(base.get("official_support_count") or 0)
+    conflict_count = len(conflicts) if conflicts else int(base.get("conflict_count") or 0)
+    can_answer_directly = bool(raw.get("can_answer_directly", base.get("can_answer_directly", bool(selected_output.strip()))))
+    if official_support_count == 0 and conflict_count > 0:
+        can_answer_directly = False
+    if official_support_count == 0 and confidence == "high":
+        confidence = "medium"
+    recommended_style = str(raw.get("recommended_response_style") or ("direct" if can_answer_directly else "ask_one_question")).strip().lower()
+    if recommended_style not in {"direct", "ask_one_question", "conservative"}:
+        recommended_style = "direct" if can_answer_directly else "ask_one_question"
+    return {
+        "best_hypothesis": str(raw.get("best_hypothesis") or base.get("best_hypothesis") or (hypotheses[0].get("id") if hypotheses else "")),
+        "can_answer_directly": can_answer_directly,
+        "confidence": confidence,
+        "conflicts": conflicts,
+        "missing_key_fact": str(raw.get("missing_key_fact") or ""),
+        "recommended_response_style": recommended_style,
+        "support_count": int(base.get("support_count") or len(evidence_items)),
+        "official_support_count": official_support_count,
+        "conflict_count": conflict_count,
+    }
+
+
+def _run_customer_support_response_qa_agent(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    question: str,
+    answer: str,
+    route: str,
+    task_type: str,
+    review_result: dict[str, Any],
+) -> dict[str, Any]:
+    fallback_issues: list[str] = []
+    if any(marker in answer for marker in ("[Query", "AI摘要", "回答指导", "smart_search", ".env", "api_key", "token")):
+        fallback_issues.append("回复混入了内部检索或敏感信息")
+    if len(answer.strip()) > 450:
+        fallback_issues.append("回复偏长")
+    if not answer.strip():
+        fallback_issues.append("没有直接给出可发送的回复")
+    fallback_pass = not fallback_issues
+    payload = {
+        "question": question,
+        "answer": answer,
+        "route": route,
+        "task_type": task_type,
+        "review_result": review_result,
+    }
+    raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_RESPONSE_QA_PROMPT, payload)
+    issues = raw.get("issues") if isinstance(raw.get("issues"), list) else list(fallback_issues)
+    repair_mode = str(raw.get("repair_mode") or ("rewrite" if issues else "none")).strip().lower()
+    if repair_mode not in {"none", "rewrite", "ask_one_question"}:
+        repair_mode = "rewrite" if issues else "none"
+    passed = bool(raw.get("pass", fallback_pass))
+    if issues and repair_mode != "none":
+        passed = False
+    return {"pass": passed, "issues": [str(item) for item in issues], "repair_mode": repair_mode}
+
+
+def _repair_customer_support_answer(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    question: str,
+    answer: str,
+    route: str,
+    task_type: str,
+    missing_slot: dict[str, Any],
+    review_result: dict[str, Any],
+    qa_result: dict[str, Any],
+) -> str:
+    repair_mode = str(qa_result.get("repair_mode", "rewrite")).strip().lower()
+    if repair_mode == "ask_one_question":
+        return _build_customer_support_followup_question(route, missing_slot, review_result)
+    payload = {
+        "question": question,
+        "answer": answer,
+        "route": route,
+        "task_type": task_type,
+        "missing_slot": missing_slot,
+        "review_result": review_result,
+        "qa_result": qa_result,
+    }
+    raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_REPAIR_PROMPT, payload)
+    repaired = str(raw.get("answer") or raw.get("rewritten_answer") or raw.get("content") or "").strip()
+    if repaired:
+        return repaired
+    cleaned = sanitize_customer_output(answer)
+    if cleaned and cleaned != answer:
+        lowered = cleaned.lower()
+        if not any(marker in lowered for marker in ("ai摘要", "[query", "smart_search", "回答指导", "内部分析")):
+            return cleaned
+    return _build_customer_support_followup_question(route, missing_slot, review_result)
 
 
 def _customer_support_route_for_intent(intent: str, allow_write: bool) -> RouteDecision:
@@ -453,6 +921,10 @@ class CustomerSupportState(TypedDict, total=False):
     evidence_items: list[dict[str, Any]]
     evidence_summary: dict[str, Any]
     decision_rationale: dict[str, Any]
+    intent_agent_result: dict[str, Any]
+    planner_agent_result: dict[str, Any]
+    review_agent_result: dict[str, Any]
+    response_qa_result: dict[str, Any]
     missing_slot: dict[str, Any]
     reasoning_public_trace: list[dict[str, Any]]
     final_confidence: str
@@ -462,6 +934,8 @@ class CustomerSupportState(TypedDict, total=False):
     generated_answer: str
     generated_tool_calls: list[str]
     check_result: dict[str, Any]
+    repair_attempted: bool
+    degrade_reason: str
     last_error: dict[str, Any]
     fallback_reason: str
 
@@ -1049,16 +1523,35 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         context = build_conversation_context(messages)
         raw_entities = extract_entities(text)
         attachments = extract_attachments(messages)
-        decision = _classify_customer_support(messages, raw_entities, context)
+        fallback_decision = _classify_customer_support(messages, raw_entities, context)
+        intent_agent_result = _run_customer_support_intent_agent(
+            ctx=ctx,
+            cfg=cfg,
+            messages=messages,
+            text=text,
+            entities=raw_entities,
+            context=context,
+            allow_write=allowed_write,
+        )
+        decision = (
+            _customer_support_route_for_intent(str(intent_agent_result.get("intent", "")), allowed_write)
+            if intent_agent_result.get("intent")
+            else fallback_decision
+        )
         decision = classify_multimodal_message(text, attachments, decision)
         perception_started = time.time()
         perception = _perceive_customer_attachments(messages, attachments, text) if attachments else {}
         perception_ms = int((time.time() - perception_started) * 1000) if attachments else 0
         decision = refine_multimodal_route_with_perception(text, attachments, perception, decision)
+        allow_context_ship = should_use_ship_context(decision.route) and (
+            bool(intent_agent_result.get("use_context_ship"))
+            or bool(raw_entities.mmsi or raw_entities.imo or raw_entities.ship_name)
+            or not bool(intent_agent_result)
+        )
         entities = resolve_entities_with_context(
             raw_entities,
             context,
-            allow_ship_context=should_use_ship_context(decision.route),
+            allow_ship_context=allow_context_ship,
         )
         trace = make_trace(
             decision,
@@ -1068,7 +1561,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         )
         if perception_ms:
             trace.latency_hotspot["perception"] = perception_ms
-        planner_pack = build_customer_support_plan(
+        fallback_planner_pack = build_customer_support_plan(
             text=text,
             decision=decision,
             entities=entities,
@@ -1076,6 +1569,18 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             attachments=attachments,
             perception=perception,
         )
+        planner_agent_result = _run_customer_support_planner_agent(
+            ctx=ctx,
+            cfg=cfg,
+            text=text,
+            decision=decision,
+            entities=entities,
+            context=context,
+            attachments=attachments,
+            perception=perception,
+            fallback_plan=fallback_planner_pack,
+        )
+        planner_pack = planner_agent_result or fallback_planner_pack
         evidence_pack: dict[str, Any] = {}
         if attachments:
             evidence_pack["augmented_text"] = build_multimodal_search_query(
@@ -1085,6 +1590,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 attachments[-1].type,
             )
         trace_payload = asdict(trace)
+        trace_payload["intent_agent"] = dict(intent_agent_result or {})
         trace_payload["planner"] = {
             "problem_frame": dict(planner_pack.get("problem_frame", {}) or {}),
             "hypotheses": list(planner_pack.get("hypotheses", []) or []),
@@ -1112,6 +1618,8 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "entities": trace.entity_resolution,
             "attachments": [asdict(item) for item in attachments],
             "perception_result": perception,
+            "intent_agent_result": dict(intent_agent_result or {}),
+            "planner_agent_result": dict(planner_agent_result or {}),
             "problem_frame": dict(planner_pack.get("problem_frame", {}) or {}),
             "hypotheses": list(planner_pack.get("hypotheses", []) or []),
             "search_plan": list(planner_pack.get("search_plan", []) or []),
@@ -1139,11 +1647,21 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             evidence_items: list[dict[str, Any]] = []
             evidence_summary: dict[str, Any] = {}
             base_route_trace = dict(state.get("route_trace", {}) or {})
+            reasoning_public_trace = list(state.get("reasoning_public_trace", []) or [])
             if response_mode == "ask_one_question" and missing_slot.get("question"):
                 route_trace = dict(base_route_trace)
                 route_trace["check_result"] = {"ask_one_question": True, "missing_slot": missing_slot.get("field", "")}
                 route_trace["answer_confidence"] = "medium"
                 answer = str(missing_slot.get("question", "")).strip()
+                review_result = {
+                    "best_hypothesis": "",
+                    "can_answer_directly": False,
+                    "confidence": "medium",
+                    "conflicts": [],
+                    "missing_key_fact": str(missing_slot.get("field", "")),
+                    "recommended_response_style": "ask_one_question",
+                }
+                reasoning_public_trace = _append_customer_support_reasoning_trace(reasoning_public_trace, "review", "当前信息不足，已改为只追问一个关键问题。")
             elif str(state.get("route", "")) in HARNESSED_ROUTES:
                 answer, route_trace = _execute_customer_support_harness(
                     text=text,
@@ -1157,7 +1675,24 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                     session_id=str(state.get("session_id", "")),
                     run_id=str((state.get("route_trace", {}) or {}).get("run_id", "")),
                 )
-                evidence_summary = {"confidence": str(route_trace.get("answer_confidence", "medium"))}
+                evidence_summary = {
+                    "best_hypothesis": (state.get("hypotheses", [{}]) or [{}])[0].get("id", "H1"),
+                    "support_count": 1 if answer else 0,
+                    "official_support_count": 0,
+                    "conflict_count": 0,
+                    "confidence": str(route_trace.get("answer_confidence", "medium")),
+                    "can_answer_directly": bool(answer),
+                }
+                review_result = _run_customer_support_review_agent(
+                    ctx=ctx,
+                    cfg=cfg,
+                    question=question,
+                    problem_frame=dict(state.get("problem_frame", {}) or {}),
+                    hypotheses=list(state.get("hypotheses", []) or []),
+                    evidence_items=evidence_items,
+                    selected_output=answer,
+                    fallback_summary=evidence_summary,
+                )
             else:
                 answer, route_trace, evidence_items, evidence_summary = _execute_customer_support_planner(
                     question=question,
@@ -1172,10 +1707,30 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                     session_id=str(state.get("session_id", "")),
                     run_id=str((state.get("route_trace", {}) or {}).get("run_id", "")),
                 )
+                review_result = _run_customer_support_review_agent(
+                    ctx=ctx,
+                    cfg=cfg,
+                    question=question,
+                    problem_frame=dict(state.get("problem_frame", {}) or {}),
+                    hypotheses=list(state.get("hypotheses", []) or []),
+                    evidence_items=evidence_items,
+                    selected_output=answer,
+                    fallback_summary=evidence_summary,
+                )
             if base_route_trace.get("planner"):
                 route_trace["planner"] = dict(base_route_trace.get("planner", {}) or {})
+            if base_route_trace.get("intent_agent"):
+                route_trace["intent_agent"] = dict(base_route_trace.get("intent_agent", {}) or {})
+            route_trace["review_agent"] = dict(review_result or {})
+            evidence_summary = {**dict(evidence_summary or {}), **dict(review_result or {})}
             if evidence_summary:
                 route_trace["evidence_summary"] = dict(evidence_summary)
+            if not review_result.get("can_answer_directly", True):
+                answer = _build_customer_support_followup_question(str(state.get("route", "")), missing_slot, review_result)
+                route_trace["fallback_reason"] = route_trace.get("fallback_reason") or "review_requires_followup"
+                reasoning_public_trace = _append_customer_support_reasoning_trace(reasoning_public_trace, "review", "现有证据不足以直接回答，已改为只追问一个关键问题。")
+            else:
+                reasoning_public_trace = _append_customer_support_reasoning_trace(reasoning_public_trace, "review", "已有足够证据支持当前答复，可直接回答。")
             if not answer:
                 raise RuntimeError(route_trace.get("fallback_reason") or "empty_harness_answer")
             return {
@@ -1187,6 +1742,8 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 "check_result": dict(route_trace.get("check_result", {}) or {}),
                 "evidence_items": evidence_items,
                 "evidence_summary": evidence_summary,
+                "review_agent_result": dict(review_result or {}),
+                "reasoning_public_trace": reasoning_public_trace,
                 "final_confidence": str(evidence_summary.get("confidence") or route_trace.get("answer_confidence", "medium")),
             }
         except Exception as exc:
@@ -1223,17 +1780,94 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             ok = True
         else:
             links_ok, invalid_links = validate_links(answer)
-            ok = ok and links_ok
+            review_result = dict(state.get("review_agent_result", {}) or {})
+            qa_result = _run_customer_support_response_qa_agent(
+                ctx=ctx,
+                cfg=cfg,
+                question=str(state.get("task_goal", "") or ""),
+                answer=answer,
+                route=str(state.get("route", "")),
+                task_type=str(state.get("task_type", "")),
+                review_result=review_result,
+            )
+            repair_attempted = bool(state.get("repair_attempted"))
+            degrade_reason = str(state.get("degrade_reason", "") or "")
+            if (not qa_result.get("pass")) and not repair_attempted:
+                repaired_answer = _repair_customer_support_answer(
+                    ctx=ctx,
+                    cfg=cfg,
+                    question=str(state.get("task_goal", "") or ""),
+                    answer=answer,
+                    route=str(state.get("route", "")),
+                    task_type=str(state.get("task_type", "")),
+                    missing_slot=dict(state.get("missing_slot", {}) or {}),
+                    review_result=review_result,
+                    qa_result=qa_result,
+                )
+                if repaired_answer:
+                    answer = repaired_answer.strip()
+                    links_ok, invalid_links = validate_links(answer)
+                    qa_result = _run_customer_support_response_qa_agent(
+                        ctx=ctx,
+                        cfg=cfg,
+                        question=str(state.get("task_goal", "") or ""),
+                        answer=answer,
+                        route=str(state.get("route", "")),
+                        task_type=str(state.get("task_type", "")),
+                        review_result=review_result,
+                    )
+                    repair_attempted = True
+            if not qa_result.get("pass"):
+                answer = _build_customer_support_followup_question(
+                    str(state.get("route", "")),
+                    dict(state.get("missing_slot", {}) or {}),
+                    review_result,
+                )
+                links_ok, invalid_links = validate_links(answer)
+                degrade_reason = degrade_reason or f"qa_{qa_result.get('repair_mode', 'rewrite')}"
+                qa_result = {
+                    **dict(qa_result),
+                    "pass": True,
+                    "issues": list(qa_result.get("issues", []) or []) + ["已降级为单关键问题追问"],
+                    "repair_mode": "ask_one_question",
+                }
+            ok = bool(answer) and links_ok
             check_result = {
                 "harness_driven": str((state.get("decision_rationale", {}) or {}).get("response_mode", "")) == "use_harness",
                 "has_answer": bool(answer),
                 "links_ok": links_ok,
                 "invalid_links": invalid_links,
                 "evidence_count": len(list(state.get("evidence_items", []) or [])),
+                "response_qa_pass": bool(qa_result.get("pass")),
+                "response_qa_issues": list(qa_result.get("issues", []) or []),
                 **dict(state.get("check_result", {}) or {}),
             }
             if invalid_links:
                 trace.fallback_reason = trace.fallback_reason or "invalid_links"
+            trace.check_result = check_result
+            trace.answer_confidence = str(state.get("final_confidence", "") or ("high" if ok else "medium"))
+            return {
+                "phase": "done" if ok else "loop",
+                "status": "success" if ok else state.get("status", ""),
+                "phase_history": list(state.get("phase_history", [])) + ["check"],
+                "generated_answer": answer,
+                "check_result": check_result,
+                "route_trace": {**asdict(trace), "response_qa_result": dict(qa_result or {})},
+                "response_qa_result": dict(qa_result or {}),
+                "repair_attempted": repair_attempted,
+                "degrade_reason": degrade_reason,
+                **(
+                    {}
+                    if ok
+                    else {
+                        "last_error": {
+                            "answer": answer,
+                            "check_result": check_result,
+                        },
+                        "fallback_reason": trace.fallback_reason or "check_failed",
+                    }
+                ),
+            }
         trace.check_result = check_result
         trace.answer_confidence = str(state.get("final_confidence", "") or ("high" if ok else "medium"))
         if ok:
@@ -1272,6 +1906,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         route_trace["loop_count"] = int(state.get("loop_count") or 0)
         route_trace["check_result"] = dict(state.get("check_result", {}) or route_trace.get("check_result", {}))
         route_trace["tool_call_sequence"] = list(state.get("generated_tool_calls", []) or route_trace.get("tool_call_sequence", []))
+        route_trace["response_qa_result"] = dict(state.get("response_qa_result", {}) or route_trace.get("response_qa_result", {}))
         logger.info(
             "[CustomerSupportTrace] run_id=%s session_id=%s route=%s task_type=%s sequence=%s loops=%s check=%s fallback=%s latency=%s confidence=%s",
             route_trace.get("run_id", ""),
@@ -1303,12 +1938,18 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "evidence_items": list(state.get("evidence_items", []) or []),
             "evidence_summary": dict(state.get("evidence_summary", {}) or {}),
             "decision_rationale": dict(state.get("decision_rationale", {}) or {}),
+            "intent_agent_result": dict(state.get("intent_agent_result", {}) or {}),
+            "planner_agent_result": dict(state.get("planner_agent_result", {}) or {}),
+            "review_agent_result": dict(state.get("review_agent_result", {}) or {}),
+            "response_qa_result": dict(state.get("response_qa_result", {}) or {}),
             "missing_slot": dict(state.get("missing_slot", {}) or {}),
             "reasoning_public_trace": list(state.get("reasoning_public_trace", []) or []),
             "final_confidence": str(state.get("final_confidence", "") or route_trace.get("answer_confidence", "medium")),
             "evidence_pack": dict(state.get("evidence_pack", {}) or {}),
             "artifact_links": list(state.get("artifact_links", []) or []),
             "route_trace": route_trace,
+            "repair_attempted": bool(state.get("repair_attempted")),
+            "degrade_reason": state.get("degrade_reason", ""),
             "fallback_reason": state.get("fallback_reason", ""),
         }
 

@@ -3,7 +3,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agents.customer_support_stream_debug import build_customer_support_debug_events
+from agents.customer_support_stream_debug import (
+    DebugRuntimeCursor,
+    build_customer_support_debug_events,
+    build_customer_support_debug_events_from_update,
+)
 
 
 def _events_for(text, attachment=None):
@@ -54,3 +58,45 @@ def test_reference_04_stream_debug_is_safe_methodology():
     assert "不展示内部工具名" in text
     assert "api_key" not in text.lower()
     assert "system prompt" not in text.lower()
+
+
+def test_runtime_update_debug_events_follow_real_plan_state():
+    cursor = DebugRuntimeCursor()
+    update = {
+        "plan": {
+            "route": "knowledge",
+            "task_type": "platform_knowledge",
+            "intent_agent_result": {"intent": "knowledge", "why": "用户在询问平台功能定义"},
+            "reasoning_public_trace": [
+                {"phase": "understand", "text": "已识别当前问题类型：definition。"},
+                {"phase": "search_plan", "text": "已规划 2 条检索方向，优先本地知识库和 HiFleet 官方资料。"},
+            ],
+            "search_plan": [
+                {"query": "HiFleet 绿点是什么意思", "source_priority": ["local_kb", "official_site"]},
+                {"query": "HiFleet 绿点 船舶颜色", "source_priority": ["official_site"]},
+            ],
+        }
+    }
+
+    events = build_customer_support_debug_events_from_update(update, cursor)
+    text = "\n".join(str(item.get("text", "")) for item in events)
+
+    assert any(item["type"] == "message_start" for item in events)
+    assert any(item["type"] == "tool_request" for item in events)
+    assert "意图识别" in text
+    assert "已规划 2 条检索方向" in text
+
+
+def test_runtime_update_debug_events_emit_final_answer():
+    cursor = DebugRuntimeCursor(started=True)
+    update = {
+        "finalize": {
+            "messages": [{"role": "assistant", "content": "HiFleet 绿点一般表示船位状态正常。"}]
+        }
+    }
+
+    events = build_customer_support_debug_events_from_update(update, cursor)
+
+    assert events[0]["type"] == "answer"
+    assert "绿点" in events[0]["text"]
+    assert events[-1]["type"] == "message_end"
