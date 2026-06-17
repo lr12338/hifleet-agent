@@ -1,10 +1,13 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agents.agent import (
+    SENSITIVE_REFUSAL as AGENT_SENSITIVE_REFUSAL,
     _build_customer_support_followup_question,
+    _build_customer_support_agent,
     _customer_support_route_for_intent,
     _execute_customer_support_harness,
     _execute_customer_support_planner,
@@ -16,6 +19,7 @@ from agents.agent import (
     _state_dict_from_model,
     is_sensitive_internal_request,
 )
+from agents.profiles import AgentProfile
 from agents.customer_support_router import (
     Attachment,
     BROWSER_VERIFY_BUNDLE,
@@ -72,6 +76,37 @@ def test_customer_support_state_dict_supports_dataclass_entities():
 
     assert value["mmsi"] == "414726000"
     assert "urls" in value
+
+
+def test_customer_support_agent_imports_guard_refusal_constant():
+    assert AGENT_SENSITIVE_REFUSAL == SENSITIVE_REFUSAL
+
+
+def test_customer_support_standard_graph_runs_post_guard(monkeypatch):
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            return {"messages": [HumanMessage(content="HiFleet 绿点是什么意思"), {"role": "assistant", "content": "绿点表示船位状态正常。"}]}
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r1"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="HiFleet 绿点是什么意思")],
+            "session_id": "s1",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s1"}},
+    )
+
+    assert result["phase"] == "done"
+    assert result["messages"][-1].content == "绿点表示船位状态正常。"
+    assert result["check_result"]["post_guard_applied"] is False
 
 
 def test_sensitive_internal_request_detection():

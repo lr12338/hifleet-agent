@@ -62,7 +62,7 @@ from agents.customer_support_router import (
     should_use_ship_context,
     validate_links,
 )
-from agents.customer_support_guard import sanitize_customer_output
+from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
 from coze_coding_utils.runtime_ctx.context import default_headers
 from llm_config import load_llm_config
 from skills import SkillLoader
