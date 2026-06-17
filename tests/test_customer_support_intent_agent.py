@@ -13,6 +13,7 @@ from agents.agent import (
     _run_customer_support_intent_agent,
     _run_customer_support_response_qa_agent,
     _run_customer_support_review_agent,
+    _state_dict_from_model,
     is_sensitive_internal_request,
 )
 from agents.customer_support_router import (
@@ -62,6 +63,15 @@ def test_customer_support_ship_update_respects_write_policy():
     decision = _customer_support_route_for_intent("ship_update", allow_write=False)
     assert decision.route == "knowledge"
     assert decision.tool_bundle == KNOWLEDGE_BUNDLE
+
+
+def test_customer_support_state_dict_supports_dataclass_entities():
+    entities = extract_entities("查询 MMSI 414726000 船位")
+
+    value = _state_dict_from_model(entities)
+
+    assert value["mmsi"] == "414726000"
+    assert "urls" in value
 
 
 def test_sensitive_internal_request_detection():

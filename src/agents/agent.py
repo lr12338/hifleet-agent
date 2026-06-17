@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -199,6 +199,16 @@ def _json_object_from_text(text: str) -> dict[str, Any]:
             except Exception:
                 return {}
     return {}
+
+
+def _state_dict_from_model(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if is_dataclass(value):
+        return asdict(value)
+    if hasattr(value, "model_dump"):
+        return dict(value.model_dump())
+    return dict(value)
 
 
 def _build_customer_support_json_llm(ctx, cfg: dict[str, Any]) -> ChatOpenAI | None:
@@ -1424,7 +1434,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             context,
             allow_ship_context=should_use_ship_context(decision.route),
         )
-        return decision, dict(entities.model_dump()), [asdict(item) for item in attachments]
+        return decision, _state_dict_from_model(entities), [asdict(item) for item in attachments]
 
     def _extract_final_answer(messages: list[AnyMessage]) -> str:
         for msg in reversed(messages or []):
