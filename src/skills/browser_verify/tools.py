@@ -114,6 +114,20 @@ def _query_keywords(query: str) -> list[str]:
     return [token for token in tokens if token]
 
 
+def _is_hifleet_official_url(url: str) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    return host == "hifleet.com" or host.endswith(".hifleet.com")
+
+
+def _page_match_reason(query: str, title: str, body: str, summary: str = "") -> str:
+    haystack = f"{title} {body[:1000]} {summary}".lower()
+    tokens = [token for token in _query_keywords(query) if len(token) >= 2]
+    matched = [token for token in tokens if token.lower() in haystack]
+    if matched:
+        return "页面标题或正文匹配：" + "、".join(matched[:5])
+    return "HiFleet 官方公开页面"
+
+
 def _preferred_hifleet_candidates(query: str) -> list[dict[str, str]]:
     from skills.knowledge_qa.tools import _is_url_accessible
 
@@ -197,7 +211,8 @@ def _bing_search_candidates(query: str) -> list[dict[str, str]]:
 def _candidate_urls(query: str) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     seen_urls: set[str] = set()
-    for item in _preferred_hifleet_candidates(query) + _bing_search_candidates(query):
+    candidate_sources = _bing_search_candidates(query) + _preferred_hifleet_candidates(query) if _needs_specific_hifleet_page(query) else _preferred_hifleet_candidates(query) + _bing_search_candidates(query)
+    for item in candidate_sources:
         url = item.get("url", "")
         if not url or url in seen_urls:
             continue
@@ -206,6 +221,12 @@ def _candidate_urls(query: str) -> list[dict[str, str]]:
         if len(candidates) >= 5:
             break
     return candidates
+
+
+def _needs_specific_hifleet_page(query: str) -> bool:
+    q = (query or "").lower()
+    markers = ["验证", "核验", "社区", "发布", "详细内容", "今日", "今天", "最新", "长江水位", "浏览器开始记忆"]
+    return any(marker in q for marker in markers)
 
 
 def _extract_json_payload(raw_stdout: str) -> dict[str, object]:
@@ -325,24 +346,37 @@ def _sandbox_hifleet_candidates(query: str) -> list[dict[str, str]]:
 
 
 def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
-    blocks = ["【公开网页深度检索】", f"问题：{query}"]
-    for page in pages[:2]:
-        title = page.get("title") or "公开页面"
+    evidence_pages: list[dict[str, object]] = []
+    for page in pages[:3]:
+        title = page.get("title") or "HiFleet 页面"
         url = page.get("url", "")
         body = page.get("body", "")
         summary = page.get("summary", "")
         if not body and not summary:
             continue
-        excerpt = body or summary
-        excerpt = excerpt[:500].rstrip()
-        blocks.append(f"\n来源：{title}")
-        if excerpt:
-            blocks.append(f"内容摘要：{excerpt}")
-        if url:
-            blocks.append(url)
-    if len(blocks) <= 2:
+        excerpt = _normalize_page_text(body or summary)[:800].rstrip()
+        if not excerpt:
+            continue
+        evidence_pages.append(
+            {
+                "title": title,
+                "url": url,
+                "excerpt": excerpt,
+                "match_reason": _page_match_reason(query, title, body, summary),
+                "official": _is_hifleet_official_url(url),
+            }
+        )
+    if not evidence_pages:
         return NO_HIT_TEXT
-    return "\n".join(blocks)
+    return json.dumps(
+        {
+            "type": "hifleet_browser_evidence",
+            "query": query,
+            "source_scope": "hifleet_official_public_pages",
+            "pages": evidence_pages,
+        },
+        ensure_ascii=False,
+    )
 
 
 @tool
@@ -370,7 +404,9 @@ def agent_browser_deep_search(query: str) -> str:
     if not sanitized_query:
         return NO_HIT_TEXT
 
-    candidates = _sandbox_hifleet_candidates(sanitized_query) or _candidate_urls(sanitized_query)
+    candidates = _candidate_urls(sanitized_query) if _needs_specific_hifleet_page(sanitized_query) else (_sandbox_hifleet_candidates(sanitized_query) or _candidate_urls(sanitized_query))
+    if not candidates:
+        candidates = _sandbox_hifleet_candidates(sanitized_query)
     if not candidates:
         return NO_HIT_TEXT
 

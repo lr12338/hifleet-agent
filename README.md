@@ -9,6 +9,7 @@
 
 详细架构请优先阅读：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
 如果是在其他服务器上部署联调，先看：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`。
+如果需要让远端代码 Agent 快速接手检查和烟测，可直接使用：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`。
 
 ## 1. 核心目录
 
@@ -137,6 +138,8 @@ curl -N -X POST http://127.0.0.1:10123/stream_run \
 
 异地部署联调：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`
 
+远端 Agent 检查提示词：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`
+
 `agent-browser` 受控兜底：`docs/agent_browser_fallback_integration.md`
 
 ## 7. 测试
@@ -156,6 +159,7 @@ npm run build
 
 - 主架构：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`
 - 异地部署联调：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`
+- 远端 Agent 检查提示词：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`
 - `agent-browser` 兜底链：`docs/agent_browser_fallback_integration.md`
 - 外部 API 接入：`docs/API_MULTI_USER_INTEGRATION.md`
 - 后台使用：`docs/ADMIN_BACKEND_SYSTEM_GUIDE.md`

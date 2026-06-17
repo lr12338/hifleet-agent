@@ -204,11 +204,12 @@ def test_agent_browser_deep_search_formats_public_page_results(monkeypatch):
     )
 
     output = agent_browser_deep_search.invoke({"query": "HiFleet 船舶轨迹怎么导出"})
+    payload = json.loads(output)
 
-    assert "公开网页深度检索" in output
-    assert "HiFleet 帮助中心" in output
-    assert "轨迹导出功能说明" in output
-    assert "https://www.hifleet.com/helpcenter/?i18n=zh" in output
+    assert payload["type"] == "hifleet_browser_evidence"
+    assert payload["pages"][0]["title"] == "HiFleet 帮助中心"
+    assert "轨迹导出功能说明" in payload["pages"][0]["excerpt"]
+    assert payload["pages"][0]["url"] == "https://www.hifleet.com/helpcenter/?i18n=zh"
 
 
 def test_agent_browser_deep_search_rejects_invalid_query_characters():
@@ -229,10 +230,11 @@ def test_agent_browser_deep_search_prefers_sandbox_candidates(monkeypatch):
     )
 
     output = agent_browser_deep_search.invoke({"query": "HiFleet 数据服务介绍"})
+    payload = json.loads(output)
 
-    assert "公开网页深度检索" in output
-    assert "HiFleet 数据服务" in output
-    assert "通过 agent-browser 抓取" in output
+    assert payload["type"] == "hifleet_browser_evidence"
+    assert payload["pages"][0]["title"] == "HiFleet 数据服务"
+    assert "通过 agent-browser 抓取" in payload["pages"][0]["excerpt"]
 
 
 def test_preferred_hifleet_candidates_prioritize_helpcenter_for_howto(monkeypatch):
@@ -908,3 +910,95 @@ def test_non_ship_multimodal_route_does_not_reuse_previous_ship_context():
     assert entities.mmsi == ""
     assert entities.imo == ""
     assert entities.ship_name == ""
+
+
+def test_free_user_latest_position_routes_to_knowledge_not_random_ship_query():
+    text = "我是免费用户，为什么在网站上看不到最新的船位？"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+
+    output = execute_knowledge_chain(text, decision, {}, trace)
+
+    assert decision.route == "knowledge"
+    assert decision.task_type == "platform_knowledge"
+    assert "免费账号" in output
+    assert "MMSI:" not in output
+    assert "随机" not in output
+
+
+def test_generic_device_complaint_asks_light_hifleet_context_question():
+    text = "你们这网速太卡了，我电脑都死机了"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+
+    output = execute_knowledge_chain(
+        text,
+        decision,
+        {"smart_search": FakeTool("smart_search", lambda args: "未检索到足够可信的信息")},
+        trace,
+    )
+
+    assert "卡顿发生在哪个 HiFleet 页面" in output
+    assert "清理缓存" not in output
+
+
+def test_official_article_verification_uses_browser_even_when_smart_search_has_generic_site():
+    calls = []
+    smart_search = FakeTool(
+        "smart_search",
+        lambda args: calls.append("smart_search") or "HiFleet 官方社区\nHiFleet 官方社区与产品信息入口\nhttps://www.hifleet.com/wp/communities",
+    )
+    browser_payload = json.dumps(
+        {
+            "type": "hifleet_browser_evidence",
+            "query": "验证 注意！浏览器开始记忆船队“筛选”了 的详细内容",
+            "pages": [
+                {
+                    "title": "注意！浏览器开始记忆船队“筛选”了",
+                    "url": "https://www.hifleet.com/wp/communities/example-filter-memory/",
+                    "excerpt": "HiFleet 网页版新增浏览器记忆船队筛选功能，用户再次打开页面时可保留上一次筛选条件。",
+                    "official": True,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    browser = FakeTool("agent_browser_deep_search", lambda args: calls.append("agent_browser_deep_search") or browser_payload)
+    text = "验证 注意！浏览器开始记忆船队“筛选”了 的详细内容"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+
+    output, evidence_items, evidence_summary = execute_planned_knowledge_chain(
+        text,
+        decision,
+        [{"query": text, "depth": "normal", "hypothesis_id": "H1", "purpose": "核验社区文章"}],
+        {"smart_search": smart_search, "agent_browser_deep_search": browser},
+        trace,
+    )
+
+    assert "agent_browser_deep_search" in calls
+    assert "浏览器记忆船队筛选功能" in output
+    assert "example-filter-memory" in output
+    assert evidence_summary["official_support_count"] >= 1
+    assert trace.reasoning_trace["tool_summary"]["official_source_count"] >= 1
+
+
+def test_sanitize_customer_output_strips_more_search_noise_and_html_placeholders():
+    raw = (
+        "综合摘要：\n"
+        "查询1（验证文章）：这是正文。\n"
+        "[HTMLLINK_0],手机查船更方便\n"
+        "如需更多帮助，请继续补充船名、MMSI、IMO、呼号或直接提问。\n"
+        "下载APP,手机查船更方便,服务电话:400-963-6899,微信:hifleetkhzs"
+    )
+
+    cleaned = sanitize_customer_output(raw)
+
+    assert "综合摘要" not in cleaned
+    assert "查询1" not in cleaned
+    assert "HTMLLINK" not in cleaned
+    assert "下载APP" not in cleaned
+    assert "继续补充船名" not in cleaned

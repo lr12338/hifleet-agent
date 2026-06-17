@@ -97,13 +97,37 @@ CUSTOMER_SUPPORT_INTENT_PROMPT = """你是 HiFleet 客服消息分流器。
 - multimodal_understanding: 图片/语音/视频理解
 
 判断要求:
+- 默认这是 HiFleet 客服场景；但明显闲聊、泛化电脑/网络问题不要硬套 HiFleet。
+- 如果有附件识别结果 perception，应优先结合 perception 判断：截图像海图/地图符号时优先 chart_symbol；截图有 Error/失败/加载异常时优先 troubleshooting；文件/表格类附件优先 file_task。
 - 不要因为出现“船位/更新”就默认 ship_update；像“船位更新很慢”“为什么更新这么慢”属于 knowledge。
 - 对“上面/这艘船/上一条/总结”等强依赖上下文的问题，优先结合上下文理解，不要忽略会话历史。
 - 如果当前问题是船舶追问，但本轮没写船名/MMSI/IMO，只要上下文里已有明确船舶，可以标记 use_context_ship=true。
+- 明确要求修改/上传/更新船舶数据时才标记 ship_update；只是在问平台显示或更新慢时不要标记 ship_update。
 - 避免过度分类，拿不准时优先 knowledge。
 
 JSON 格式:
-{"intent":"knowledge","reason":"一句话","use_context_ship":false}
+{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""}}
+"""
+
+CUSTOMER_SUPPORT_PERCEPTION_PROMPT = """你是 HiFleet 客服附件识别助手。
+只根据用户文字和附件内容做轻量识别，不回答用户问题，只返回 JSON。
+
+识别目标：
+- 判断附件类型和可见内容。
+- 判断是否像 HiFleet 页面、地图/海图、船舶列表、报错弹窗、文件/表格。
+- 如果是地图/海图符号，提取疑似符号、颜色、形状、附近文字。
+- 如果是页面异常，提取 visible_text 和 suspected_issue。
+
+JSON 格式：
+{
+  "attachment_type": "image|audio|video|file|unknown",
+  "visible_text": "string",
+  "summary": "string",
+  "suspected_symbol": "string",
+  "suspected_issue": "string",
+  "is_hifleet_ui": true,
+  "confidence": "high|medium|low"
+}
 """
 
 CUSTOMER_SUPPORT_PLANNER_PROMPT = """你是 HiFleet 客服 Planner Agent。
@@ -248,6 +272,93 @@ def _invoke_customer_support_json_agent(ctx, cfg: dict[str, Any], system_prompt:
     return _json_object_from_text(getattr(result, "content", ""))
 
 
+def _normalize_perception(raw: dict[str, Any], fallback_type: str = "") -> dict[str, Any]:
+    if not raw:
+        return {}
+    confidence = str(raw.get("confidence", "medium")).strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+    return {
+        "attachment_type": str(raw.get("attachment_type") or raw.get("category") or fallback_type or "unknown").strip() or "unknown",
+        "visible_text": str(raw.get("visible_text") or "").strip(),
+        "summary": str(raw.get("summary") or raw.get("observations") or "").strip(),
+        "suspected_symbol": str(raw.get("suspected_symbol") or "").strip(),
+        "suspected_issue": str(raw.get("suspected_issue") or "").strip(),
+        "is_hifleet_ui": bool(raw.get("is_hifleet_ui")),
+        "confidence": confidence,
+    }
+
+
+def _run_customer_support_perception_agent(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    text: str,
+    attachments: list[Attachment],
+) -> dict[str, Any]:
+    if not attachments:
+        return {}
+    heuristic = _heuristic_image_perception(attachments, text)
+    if heuristic:
+        fallback_type = next((item.type for item in attachments if item.type), "")
+        normalized = _normalize_perception(heuristic, fallback_type=fallback_type)
+        normalized["source"] = "heuristic"
+        normalized["is_hifleet_ui"] = True
+        return normalized
+
+    attachment = attachments[-1]
+    if attachment.type == "file":
+        return {
+            "attachment_type": "file",
+            "visible_text": "",
+            "summary": f"用户上传了文件：{attachment.filename or 'attachment'}",
+            "suspected_symbol": "",
+            "suspected_issue": "",
+            "is_hifleet_ui": False,
+            "confidence": "medium",
+            "source": "metadata",
+        }
+
+    if attachment.type not in {"image", "audio", "video"}:
+        return {}
+    if not attachment.url.startswith(("http://", "https://")):
+        return {}
+
+    api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
+    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
+    if not api_key or not base_url:
+        return {}
+
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
+    model = str((cfg.get("config") or {}).get("multimodal_model") or runtime_settings["model"]).strip()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0.0,
+        streaming=False,
+        timeout=(cfg.get("config") or {}).get("timeout", 600),
+        extra_body={"thinking": {"type": "disabled"}},
+        default_headers=default_headers(ctx) if ctx else {},
+    )
+    content: list[dict[str, Any]] = [{"type": "text", "text": f"用户问题：{text}\n请识别附件并只返回 JSON。"}]
+    if attachment.type == "image":
+        content.append({"type": "image_url", "image_url": {"url": attachment.url}})
+    elif attachment.type == "video":
+        content.append({"type": "text", "text": f"视频附件 URL：{attachment.url}"})
+    elif attachment.type == "audio":
+        content.append({"type": "text", "text": f"音频附件 URL：{attachment.url}"})
+    try:
+        result = llm.invoke([SystemMessage(content=CUSTOMER_SUPPORT_PERCEPTION_PROMPT), HumanMessage(content=content)])
+    except Exception as exc:
+        logger.warning("[CustomerSupportPerceptionAgent] invoke failed: %s", exc)
+        return {}
+    normalized = _normalize_perception(_json_object_from_text(getattr(result, "content", "")), fallback_type=attachment.type)
+    if normalized:
+        normalized["source"] = "light_multimodal_agent"
+    return normalized
+
+
 def _build_customer_support_reasoning_trace(
     problem_frame: dict[str, Any],
     hypotheses: list[dict[str, Any]],
@@ -303,6 +414,8 @@ def _run_customer_support_intent_agent(
     entities: MessageEntities,
     context: ConversationContext,
     allow_write: bool,
+    attachments: list[Attachment] | None = None,
+    perception: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fallback_intent = "knowledge"
     llm_context = build_llm_context_window(context)
@@ -315,6 +428,8 @@ def _run_customer_support_intent_agent(
         "last_ship_mmsi": context.last_ship_mmsi,
         "last_ship_imo": context.last_ship_imo,
         "entities": asdict(entities),
+        "attachments": [asdict(item) for item in list(attachments or [])],
+        "perception": dict(perception or {}),
         "allow_write": allow_write,
     }
     raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_INTENT_PROMPT, payload)
@@ -337,12 +452,17 @@ def _run_customer_support_intent_agent(
     if confidence not in {"high", "medium", "low"}:
         confidence = "medium"
     decision = _customer_support_route_for_intent(intent, allow_write)
+    missing_slot = raw.get("missing_slot") if isinstance(raw.get("missing_slot"), dict) else {}
     return {
         "intent": intent,
+        "route": decision.route,
         "task_type": decision.task_type,
+        "tool_bundle": list(decision.tool_bundle or []),
+        "needs_harness": decision.route in HARNESSED_ROUTES,
         "confidence": confidence,
         "use_context_ship": bool(raw.get("use_context_ship")),
-        "why": str(raw.get("why") or raw.get("reason") or ""),
+        "missing_slot": missing_slot,
+        "why": str(raw.get("why") or raw.get("reason_summary") or raw.get("reason") or ""),
         "fallback_route": str(raw.get("fallback_route") or decision.route or fallback_intent),
     }
 
@@ -627,6 +747,30 @@ def _customer_support_route_for_intent(intent: str, allow_write: bool) -> RouteD
     if normalized == "ship_update" and allow_write:
         return RouteDecision("ship_update", "ship_update", SHIP_UPDATE_BUNDLE, "simple", reason="llm intent")
     return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="llm intent")
+
+
+def _guard_customer_support_decision(
+    *,
+    text: str,
+    agent_decision: RouteDecision,
+    fallback_decision: RouteDecision,
+    entities: MessageEntities,
+    attachments: list[Attachment],
+    perception: dict[str, Any],
+) -> tuple[RouteDecision, str]:
+    if fallback_decision.route == "ship_update":
+        return fallback_decision, "write_guard"
+    if fallback_decision.route == "file_task":
+        return fallback_decision, "safety_rule"
+    if fallback_decision.route in {"ship_single", "ship_complex", "ship_context", "ship_stats"} and (
+        entities.mmsi or entities.imo or entities.ship_name or fallback_decision.route in {"ship_stats", "ship_context"}
+    ):
+        return fallback_decision, "safety_rule"
+    if attachments and perception:
+        refined = refine_multimodal_route_with_perception(text, attachments, perception, agent_decision)
+        if refined.route != agent_decision.route:
+            return refined, "perception_guard"
+    return agent_decision, "light_agent"
 
 
 def _customer_support_executor_prompt(profile: AgentProfile, entities: MessageEntities, context: ConversationContext) -> str:
@@ -1424,22 +1568,60 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
     allowed_write = bool((profile.tool_policy or {}).get("allow_write_actions", False))
     guard_fallback = "抱歉，我暂时没能稳定确认这个问题的答案。您可以补充更具体的问题、相关截图，或联系人工客服继续处理。"
 
-    def _classify_customer_support(messages: list[AnyMessage]) -> tuple[RouteDecision, dict[str, Any], list[dict[str, Any]]]:
+    def _classify_customer_support(messages: list[AnyMessage]) -> tuple[RouteDecision, dict[str, Any], list[dict[str, Any]], dict[str, Any], dict[str, Any], str]:
         text = latest_customer_user_text(messages)
         context = build_conversation_context(messages)
         raw_entities = extract_entities(text)
         attachments = extract_attachments(messages)
+        perception = _run_customer_support_perception_agent(ctx=ctx, cfg=cfg, text=text, attachments=attachments) if attachments else {}
+        fallback_decision = classify_message(text, raw_entities, context)
+        fallback_decision = classify_multimodal_message(text, attachments, fallback_decision)
+        if perception:
+            fallback_decision = refine_multimodal_route_with_perception(text, attachments, perception, fallback_decision)
+        intent_agent_result: dict[str, Any] = {}
         if intent_hint:
-            decision = _customer_support_route_for_intent(intent_hint, allowed_write)
+            agent_decision = _customer_support_route_for_intent(intent_hint, allowed_write)
+            decision, route_source = _guard_customer_support_decision(
+                text=text,
+                agent_decision=agent_decision,
+                fallback_decision=fallback_decision,
+                entities=raw_entities,
+                attachments=attachments,
+                perception=perception,
+            )
+            if route_source == "light_agent":
+                route_source = "intent_hint"
         else:
-            decision = classify_message(text, raw_entities, context)
-        decision = classify_multimodal_message(text, attachments, decision)
+            intent_agent_result = _run_customer_support_intent_agent(
+                ctx=ctx,
+                cfg=cfg,
+                messages=messages,
+                text=text,
+                entities=raw_entities,
+                context=context,
+                allow_write=allowed_write,
+                attachments=attachments,
+                perception=perception,
+            )
+            if intent_agent_result and intent_agent_result.get("confidence") != "low":
+                agent_decision = _customer_support_route_for_intent(str(intent_agent_result.get("intent", "knowledge")), allowed_write)
+                decision, route_source = _guard_customer_support_decision(
+                    text=text,
+                    agent_decision=agent_decision,
+                    fallback_decision=fallback_decision,
+                    entities=raw_entities,
+                    attachments=attachments,
+                    perception=perception,
+                )
+            else:
+                decision = fallback_decision
+                route_source = "fallback_rule"
         entities = resolve_entities_with_context(
             raw_entities,
             context,
             allow_ship_context=should_use_ship_context(decision.route),
         )
-        return decision, _state_dict_from_model(entities), [asdict(item) for item in attachments]
+        return decision, _state_dict_from_model(entities), [asdict(item) for item in attachments], perception, intent_agent_result, route_source
 
     def _extract_final_answer(messages: list[AnyMessage]) -> str:
         for msg in reversed(messages or []):
@@ -1490,15 +1672,27 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                     "tool_call_sequence": [],
                     "check_result": {"blocked": True, "pre_guard": True},
                     "answer_confidence": "high",
+                    "reasoning_trace": {"route_source": "safety_rule"},
                 },
             }
-        decision, entities, attachments = _classify_customer_support(messages)
+        decision, entities, attachments, perception, intent_agent_result, route_source = _classify_customer_support(messages)
         trace = make_trace(
             decision,
             MessageEntities(**entities),
             session_id=str(state.get("session_id", "")),
             run_id=str(getattr(ctx, "run_id", "") or ""),
         )
+        trace.reasoning_trace = {
+            "perception_summary": {
+                "summary": str((perception or {}).get("summary", "")),
+                "visible_text": str((perception or {}).get("visible_text", "")),
+                "suspected_symbol": str((perception or {}).get("suspected_symbol", "")),
+                "suspected_issue": str((perception or {}).get("suspected_issue", "")),
+                "confidence": str((perception or {}).get("confidence", "")),
+            },
+            "intent_agent_result": intent_agent_result,
+            "route_source": route_source,
+        }
         return {
             "phase": "route",
             "phase_history": ["route"],
@@ -1509,6 +1703,8 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "tool_bundle": list(decision.tool_bundle or []),
             "entities": entities,
             "attachments": attachments,
+            "perception_result": perception,
+            "intent_agent_result": intent_agent_result,
             "started_at_ms": int(time.time() * 1000),
             "route_trace": asdict(trace),
         }
@@ -1522,6 +1718,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         context = build_conversation_context(messages)
         entities = MessageEntities(**dict(state.get("entities", {}) or {}))
         attachments = [Attachment(**item) if isinstance(item, dict) else item for item in list(state.get("attachments", []) or [])]
+        perception = dict(state.get("perception_result", {}) or {})
         session_id = str(state.get("session_id", ""))
         run_id = str(getattr(ctx, "run_id", "") or "")
         phase_history = list(state.get("phase_history", [])) + ["execute"]
@@ -1535,9 +1732,12 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 entities=entities,
                 context=context,
                 attachments=attachments,
+                perception=perception,
                 session_id=session_id,
                 run_id=run_id,
             )
+            initial_reasoning = dict((state.get("route_trace", {}) or {}).get("reasoning_trace", {}) or {})
+            trace["reasoning_trace"] = {**initial_reasoning, **dict(trace.get("reasoning_trace", {}) or {})}
             return {
                 "phase": "executed",
                 "status": "success",
@@ -1557,9 +1757,12 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 entities=entities,
                 context=context,
                 attachments=attachments,
+                perception=perception,
                 session_id=session_id,
                 run_id=run_id,
             )
+            initial_reasoning = dict((state.get("route_trace", {}) or {}).get("reasoning_trace", {}) or {})
+            trace["reasoning_trace"] = {**initial_reasoning, **dict(trace.get("reasoning_trace", {}) or {})}
             return {
                 "phase": "executed",
                 "status": "success",
@@ -1618,7 +1821,9 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         if not tool_sequence:
             tool_sequence = list(state.get("generated_tool_calls", []) or trace.get("tool_call_sequence", []) or [])
         trace["tool_call_sequence"] = tool_sequence
+        previous_check = dict(trace.get("check_result", {}) or {})
         trace["check_result"] = {
+            **previous_check,
             "has_answer": bool(raw_answer),
             "sanitized": sanitized_answer != raw_answer,
             "links_ok": links_ok,

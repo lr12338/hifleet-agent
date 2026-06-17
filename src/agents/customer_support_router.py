@@ -83,7 +83,7 @@ GENERIC_SHIP_NAME_STOPWORDS = {
 }
 
 HIFLEET_CONTEXT_CLEAR_MARKERS = {"清理上下文", "清空上下文", "重置上下文", "清除上下文", "清空会话", "重置会话"}
-HIFLEET_ACCOUNT_MARKERS = {"免费版", "基础版", "专业版", "账号", "权限", "会员"}
+HIFLEET_ACCOUNT_MARKERS = {"免费", "免费版", "免费用户", "免费账号", "基础版", "专业版", "账号", "权限", "会员"}
 HIFLEET_FEATURE_MARKERS = {
     "hifleet",
     "船队在线",
@@ -105,6 +105,7 @@ HIFLEET_FEATURE_MARKERS = {
 }
 HIFLEET_HOWTO_MARKERS = {"如何", "怎么", "怎样", "为什么", "步骤", "入口", "查询"}
 HIFLEET_PERMISSION_QUERY_MARKERS = {"历史轨迹", "轨迹", "气象预报", "气象导航", "海图", "权限", "能看多久", "几天", "多久前", "可查", "多少天"}
+HIFLEET_POSITION_DISPLAY_MARKERS = {"船位", "最新船位", "实时船位", "位置", "不更新", "看不到最新"}
 GENERIC_CONTEXT_TOKENS = {"如何", "怎么", "怎样", "为什么", "步骤", "查询"}
 
 # 船位概念类词汇（非指定船舶查询，而是平台功能问题）
@@ -162,6 +163,7 @@ class HarnessTrace:
     fallback_reason: str = ""
     latency_hotspot: dict[str, int] = field(default_factory=dict)
     answer_confidence: str = "low"
+    reasoning_trace: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -500,7 +502,7 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
         return RouteDecision("conversation", "conversation_memory", [], "simple", fallback_allowed=False, reason="conversation memory question")
 
     write_markers = ["更新", "上传", "修改", "补录", "update"]
-    troubleshooting_markers = ["异常", "失败", "无法", "上传不了", "上传失败", "不显示", "不刷新", "更新慢", "更新很慢", "更新这么慢", "这么慢", "太慢", "延迟", "收不到", "报错", "告警", "报警", "加载失败"]
+    troubleshooting_markers = ["异常", "失败", "无法", "上传不了", "上传失败", "不显示", "不刷新", "更新慢", "更新很慢", "更新这么慢", "这么慢", "太慢", "延迟", "收不到", "报错", "告警", "报警", "加载失败", "卡顿", "网速", "死机"]
     platform_markers = ["hifleet", "船队在线", "平台", "功能", "教程", "怎么", "如何", "规则", "配置", "帮助", "绿点", "岸基值班"]
     explicit_write_context = any(m in lower for m in ["上传", "补录", "修改", "更新静态", "更新船位"]) or bool(entities.mmsi and re.search(r"(经度|纬度|lon|lat|speed|heading|course|ship_name|船名|呼号|更新时间)", q, flags=re.IGNORECASE))
     is_troubleshooting = any(m in lower for m in troubleshooting_markers)
@@ -512,6 +514,8 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
     # ══ 优先级 1：账号权限类问题（免费版/基础版/专业版 + 功能查询）══
     if has_account_marker and any(marker in q for marker in HIFLEET_PERMISSION_QUERY_MARKERS):
         return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="account permission knowledge")
+    if has_account_marker and any(marker in q for marker in HIFLEET_POSITION_DISPLAY_MARKERS):
+        return RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "simple", search_depth="quick", reason="account position display knowledge")
 
     # ══ 优先级 2：船位/AIS 概念性故障排查（非指定船舶查询）══
     _is_ship_concept_troubleshooting = False
@@ -906,6 +910,10 @@ def _extract_search_answer(search_output: str) -> tuple[str, list[str]]:
     text = normalize_message_text(search_output)
     if not text:
         return "", []
+    browser_payload = _parse_browser_evidence(text)
+    if browser_payload:
+        summary, links, _ = _browser_evidence_to_answer_parts(browser_payload)
+        return summary, links
     parts: list[str] = []
     links: list[str] = []
     for raw_line in text.splitlines():
@@ -964,6 +972,13 @@ def _extract_search_answer(search_output: str) -> tuple[str, list[str]]:
 def _is_hifleet_business_query(question: str) -> bool:
     q = normalize_message_text(question).lower()
     return any(marker in q for marker in HIFLEET_FEATURE_MARKERS) or any(marker in q for marker in HIFLEET_ACCOUNT_MARKERS)
+
+
+def _is_low_hifleet_context_device_complaint(question: str) -> bool:
+    q = normalize_message_text(question).lower()
+    device_markers = ["电脑", "死机", "网速", "卡", "卡顿", "浏览器崩溃", "打不开网页"]
+    hifleet_markers = list(HIFLEET_FEATURE_MARKERS | HIFLEET_ACCOUNT_MARKERS) + ["页面", "按钮", "上传", "船位", "轨迹", "hifleet"]
+    return any(marker in q for marker in device_markers) and not any(marker in q for marker in hifleet_markers)
 
 
 def _rewrite_hifleet_knowledge_query(question: str) -> str:
@@ -1068,6 +1083,16 @@ def _try_direct_hifleet_knowledge_answer(question: str) -> str:
             f"{HIFLEET_ACCOUNT_PAGE_HINT}"
         )
 
+    if ("免费" in q or "免费版" in q or "免费用户" in q) and any(marker in q for marker in ["最新船位", "实时船位", "看不到", "不显示", "船位"]):
+        return (
+            "免费账号在网站上看不到最新船位，通常是因为船位数据存在延迟或部分实时能力受账号权限限制。\n\n"
+            "建议您先这样确认：\n"
+            "1. 刷新页面或重新搜索目标船舶，确认不是页面缓存。\n"
+            "2. 等待一段时间后再查看，免费版显示的数据可能不是完全实时。\n"
+            "3. 到【关于】→【账号】查看当前账号权限范围。\n\n"
+            "如果同一条船长时间没有任何更新，请提供船名或 MMSI，我再帮您核查是否是 AIS 信号或船舶数据问题。"
+        )
+
     if ("区域" in q and any(marker in q for marker in ["历史数据", "过往历史"])) or ("海峡" in q and "历史数据" in q):
         return (
             "如果您要查询 HiFleet 的区域或海峡过往历史数据，可以按两种场景处理：\n"
@@ -1085,6 +1110,10 @@ def _format_general_knowledge_answer(question: str, search_output: str, *, evide
     if direct_answer:
         return format_customer_answer(direct_answer)
     summary, links = _extract_search_answer(search_output)
+    evidence_links = [str(item.get("url", "")).strip() for item in (evidence_items or []) if str(item.get("url", "")).strip()]
+    for link in evidence_links:
+        if link not in links:
+            links.append(link)
     q = normalize_message_text(question).lower()
     if any(marker in q for marker in ["图标", "符号"]) and any(marker in summary for marker in ["未提供", "缺少核心识别要素", "无法开展针对性的联网检索", "补充上传"]):
         return (
@@ -1097,7 +1126,7 @@ def _format_general_knowledge_answer(question: str, search_output: str, *, evide
         supplementary_info = _extract_supplementary_evidence(evidence_items) if evidence_items else ""
         answer_parts = []
         if any(marker in q for marker in ["什么", "什么意思", "是什么", "哪些"]):
-            answer_parts.append(f"根据目前检索到的官方资料，先给您结论：\n{summary}")
+            answer_parts.append(summary)
         elif any(marker in q for marker in ["如何", "怎么", "怎样", "为什么"]):
             answer_parts.append(summary)
         else:
@@ -1106,8 +1135,9 @@ def _format_general_knowledge_answer(question: str, search_output: str, *, evide
         if supplementary_info:
             answer_parts.append(f"\n\n补充说明：\n{supplementary_info}")
         # 官方链接引导
-        if any(link.startswith(HELP_CENTER_URL) or "hifleet.com/wp/communities" in link for link in links):
-            answer_parts.append(f"\n\n如需自助查看，可参考官方帮助中心：{HELP_CENTER_URL}")
+        official_links = [link for link in links if "hifleet.com" in link]
+        if official_links:
+            answer_parts.append(f"\n\n参考链接：{official_links[0]}")
         return format_customer_answer("".join(answer_parts))
     return (
         "我暂时还没有拿到足够明确的官方信息来直接下结论。\n\n"
@@ -1184,6 +1214,50 @@ def _parse_json_blob(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _parse_browser_evidence(text: str) -> dict[str, Any] | None:
+    payload = _parse_json_blob(text)
+    if not payload or payload.get("type") != "hifleet_browser_evidence":
+        return None
+    pages = payload.get("pages")
+    if not isinstance(pages, list) or not pages:
+        return None
+    return payload
+
+
+def _browser_evidence_to_answer_parts(payload: dict[str, Any]) -> tuple[str, list[str], list[dict[str, Any]]]:
+    pages = [page for page in payload.get("pages", []) if isinstance(page, dict)]
+    summary_parts: list[str] = []
+    links: list[str] = []
+    evidence_items: list[dict[str, Any]] = []
+    for page in pages[:3]:
+        title = normalize_message_text(str(page.get("title") or "HiFleet 官方页面"))
+        url = str(page.get("url") or "").strip()
+        excerpt = normalize_message_text(str(page.get("excerpt") or ""))
+        official = bool(page.get("official"))
+        if not excerpt:
+            continue
+        source_type = "official_community" if "wp/communit" in url else "official_site" if official else "public_web"
+        summary_parts.append(f"{title}：{excerpt[:260]}")
+        if url and url not in links:
+            links.append(url)
+        evidence_items.append(
+            {
+                "source_type": source_type,
+                "source_name": "agent_browser_deep_search",
+                "url": url,
+                "snippet": excerpt[:240],
+                "supports": ["H1"],
+                "conflicts": [],
+                "authority": 0.95 if official else 0.6,
+                "relevance": 0.85 if official else 0.55,
+                "query": str(payload.get("query") or ""),
+                "depth": "browser",
+                "title": title,
+            }
+        )
+    return "\n".join(summary_parts[:2]).strip(), links, evidence_items
+
+
 def _summarize_last_departure(raw: str) -> str:
     blob = _parse_json_blob(raw)
     if not blob:
@@ -1249,17 +1323,28 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
 
     depth = decision.search_depth or "quick"
     query = _rewrite_hifleet_knowledge_query(text)
+    outputs: list[str] = []
+    evidence_items: list[dict[str, Any]] = []
     output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
+    outputs.append(output)
+    evidence_items.extend(_evidence_items_from_tool_output(output, source_name="smart_search", query=query, depth=depth, purpose="回答当前客服问题"))
     if depth == "quick" and is_no_hit_text(output):
         trace.fallback_reason = "quick_kb_weak_hit"
         output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": "normal"})
+        outputs.append(output)
+        evidence_items.extend(_evidence_items_from_tool_output(output, source_name="smart_search", query=query, depth="normal", purpose="弱命中后补充官方资料"))
     if "未检索到足够可信" in output and decision.task_type == "platform_troubleshooting":
         trace.fallback_reason = "normal_search_empty"
         output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": "deep"})
+        outputs.append(output)
+        evidence_items.extend(_evidence_items_from_tool_output(output, source_name="smart_search", query=query, depth="deep", purpose="故障排查深度补充"))
     
-    # Fallback to agent_browser_deep_search if smart_search still returns no hits
-    if is_no_hit_text(output) and "agent_browser_deep_search" in tool_map:
-        trace.fallback_reason = "smart_search_empty_agent_browser_fallback"
+    # Verify weak or explicitly official/community/latest questions with browser-captured HiFleet pages.
+    if _needs_browser_verification(text, evidence_items, outputs) and "agent_browser_deep_search" in tool_map:
+        if all(is_no_hit_text(item) for item in outputs):
+            trace.fallback_reason = "smart_search_empty_agent_browser_fallback"
+        else:
+            trace.fallback_reason = trace.fallback_reason or "official_browser_verification"
         browser_output = _invoke_tool(
             tool_map,
             trace,
@@ -1268,10 +1353,19 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         )
         if not is_no_hit_text(browser_output):
             output = browser_output
+            outputs.append(browser_output)
+            evidence_items.extend(_evidence_items_from_tool_output(browser_output, source_name="agent_browser_deep_search", query=query, depth="browser", purpose="受控 HiFleet 官方公开页面核验"))
 
     ok, invalid = validate_links(output)
-    trace.check_result = {"links_ok": ok, "invalid_links": invalid}
-    trace.answer_confidence = "high" if ok and not is_no_hit_text(output) else "medium"
+    evidence_summary = review_evidence_items(evidence_items)
+    trace.check_result = {"links_ok": ok, "invalid_links": invalid, "evidence_count": len(evidence_items), "official_support_count": evidence_summary["official_support_count"], "evidence_summary": evidence_summary}
+    trace.answer_confidence = evidence_summary["confidence"] if ok and not is_no_hit_text(output) else "medium"
+    trace.reasoning_trace = _build_reasoning_trace(
+        text,
+        [{"query": query, "depth": depth}],
+        evidence_items,
+        "先直接回答用户核心问题，再补必要操作步骤或核验来源。",
+    )
     if invalid:
         cleaned = output
         for url in invalid:
@@ -1282,7 +1376,7 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         return _format_route_upload_troubleshooting(output)
     if decision.task_type == "platform_troubleshooting":
         return _format_platform_troubleshooting_answer(text, output)
-    return _format_general_knowledge_answer(text, output)
+    return _format_general_knowledge_answer(text, output, evidence_items=evidence_items)
 
 
 def execute_planned_knowledge_chain(
@@ -1301,24 +1395,17 @@ def execute_planned_knowledge_chain(
         depth = str(item.get("depth", "")).strip() or decision.search_depth or "quick"
         output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
         outputs.append(output)
-        source_type = _guess_evidence_source_type(output)
-        is_hit = not is_no_hit_text(output)
-        evidence_items.append(
-            {
-                "source_type": source_type,
-                "source_name": "smart_search",
-                "url": HELP_CENTER_URL if "helpcenter" in output.lower() else "",
-                "snippet": _extract_search_answer(output)[0][:240],
-                "supports": [str(item.get("hypothesis_id", "H1"))],
-                "conflicts": [],
-                "authority": 0.95 if "hifleet.com" in output.lower() else 0.75,
-                "relevance": 0.9 if is_hit else 0.4,
-                "query": query,
-                "depth": depth,
-                "purpose": str(item.get("purpose", "")),
-            }
+        evidence_items.extend(
+            _evidence_items_from_tool_output(
+                output,
+                source_name="smart_search",
+                query=query,
+                depth=depth,
+                hypothesis_id=str(item.get("hypothesis_id", "H1")),
+                purpose=str(item.get("purpose", "")),
+            )
         )
-        if is_hit and source_type in {"local_kb", "official_site", "official_community"}:
+        if not is_no_hit_text(output) and _guess_evidence_source_type(output) in {"local_kb", "official_site", "official_community"}:
             found_high_quality = True
     # 如果所有查询都未命中，尝试升级搜索深度
     if not found_high_quality and outputs and all(is_no_hit_text(item) for item in outputs):
@@ -1326,23 +1413,22 @@ def execute_planned_knowledge_chain(
         escalated_query = _rewrite_hifleet_knowledge_query(question)
         escalated_output = _invoke_tool(tool_map, trace, "smart_search", {"query": escalated_query, "depth": "deep"})
         outputs.append(escalated_output)
-        evidence_items.append({
-            "source_type": _guess_evidence_source_type(escalated_output),
-            "source_name": "smart_search",
-            "url": "",
-            "snippet": _extract_search_answer(escalated_output)[0][:240],
-            "supports": ["H1"],
-            "conflicts": [],
-            "authority": 0.7,
-            "relevance": 0.7 if not is_no_hit_text(escalated_output) else 0.3,
-            "query": escalated_query,
-            "depth": "deep",
-            "purpose": "升级搜索深度后尝试获取更多信息",
-        })
+        evidence_items.extend(
+            _evidence_items_from_tool_output(
+                escalated_output,
+                source_name="smart_search",
+                query=escalated_query,
+                depth="deep",
+                purpose="升级搜索深度后尝试获取更多信息",
+            )
+        )
     
-    # Fallback to agent_browser_deep_search if deep smart_search still returns no hits
-    if all(is_no_hit_text(item) for item in outputs) and "agent_browser_deep_search" in tool_map:
-        trace.fallback_reason = "smart_search_empty_agent_browser_fallback"
+    # Verify weak or explicitly official/community/latest questions with browser-captured HiFleet pages.
+    if _needs_browser_verification(question, evidence_items, outputs) and "agent_browser_deep_search" in tool_map:
+        if all(is_no_hit_text(item) for item in outputs):
+            trace.fallback_reason = "smart_search_empty_agent_browser_fallback"
+        else:
+            trace.fallback_reason = trace.fallback_reason or "official_browser_verification"
         browser_query = _rewrite_hifleet_knowledge_query(question)
         browser_output = _invoke_tool(
             tool_map,
@@ -1352,19 +1438,15 @@ def execute_planned_knowledge_chain(
         )
         if not is_no_hit_text(browser_output):
             outputs.append(browser_output)
-            evidence_items.append({
-                "source_type": "public_web",
-                "source_name": "agent_browser_deep_search",
-                "url": "",
-                "snippet": _extract_search_answer(browser_output)[0][:240],
-                "supports": ["H1"],
-                "conflicts": [],
-                "authority": 0.6,  # Lower authority for public web results
-                "relevance": 0.6,
-                "query": browser_query,
-                "depth": "deep",
-                "purpose": "受控公开网页深度检索兜底",
-            })
+            evidence_items.extend(
+                _evidence_items_from_tool_output(
+                    browser_output,
+                    source_name="agent_browser_deep_search",
+                    query=browser_query,
+                    depth="browser",
+                    purpose="受控 HiFleet 官方公开页面核验",
+                )
+            )
     # 选择最佳输出：优先匹配高质量结果
     output = _select_best_evidence_output(outputs, evidence_items)
     ok, invalid = validate_links(output)
@@ -1382,8 +1464,15 @@ def execute_planned_knowledge_chain(
         "evidence_count": len(evidence_items),
         "official_support_count": evidence_summary["official_support_count"],
         "multi_query_synthesis": len(queries) > 1,
+        "evidence_summary": evidence_summary,
     }
     trace.answer_confidence = evidence_summary["confidence"]
+    trace.reasoning_trace = _build_reasoning_trace(
+        question,
+        queries,
+        evidence_items,
+        "先给结论，再按必要步骤/说明组织客服回复，最后保留一个官方链接或关键追问。",
+    )
     if "上传" in question and "航线" in question and any(marker in question for marker in ["不了", "失败", "怎么办", "无法"]):
         return _format_route_upload_troubleshooting(output), evidence_items, evidence_summary
     if decision.task_type == "platform_troubleshooting":
@@ -1393,6 +1482,11 @@ def execute_planned_knowledge_chain(
 
 def _format_platform_troubleshooting_answer(question: str, search_output: str) -> str:
     q = normalize_message_text(question).lower()
+    if _is_low_hifleet_context_device_complaint(question):
+        return (
+            "如果是在使用 HiFleet 页面时出现卡顿、无响应或浏览器异常，可能和网络、浏览器缓存、页面资源加载有关。\n\n"
+            "请先告诉我一个关键信息：卡顿发生在哪个 HiFleet 页面或点击了哪个操作？我再按对应功能帮您排查。"
+        )
     if any(marker in q for marker in ["error", "报错", "异常", "加载失败", "打不开", "不显示"]):
         return (
             "从当前信息看，这更像是 HiFleet 页面或网络加载异常，不是海图符号本身的问题。\n\n"
@@ -1456,6 +1550,14 @@ def build_multimodal_search_query(text: str, perception: dict[str, Any], route: 
 
 
 def _guess_evidence_source_type(output: str) -> str:
+    browser_payload = _parse_browser_evidence(output)
+    if browser_payload:
+        pages = browser_payload.get("pages") or []
+        if any(isinstance(page, dict) and "wp/communit" in str(page.get("url", "")) for page in pages):
+            return "official_community"
+        if any(isinstance(page, dict) and page.get("official") for page in pages):
+            return "official_site"
+        return "public_web"
     lowered = (output or "").lower()
     if "helpcenter" in lowered or "www.hifleet.com" in lowered:
         return "official_site"
@@ -1466,12 +1568,111 @@ def _guess_evidence_source_type(output: str) -> str:
     return "public_web"
 
 
+def _evidence_items_from_tool_output(
+    output: str,
+    *,
+    source_name: str,
+    query: str,
+    depth: str,
+    hypothesis_id: str = "H1",
+    purpose: str = "",
+) -> list[dict[str, Any]]:
+    browser_payload = _parse_browser_evidence(output)
+    if browser_payload:
+        _, _, items = _browser_evidence_to_answer_parts(browser_payload)
+        for item in items:
+            item["supports"] = [hypothesis_id]
+            item["purpose"] = purpose or "官方公开页面核验"
+            item["query"] = item.get("query") or query
+            item["depth"] = depth
+        return items
+
+    source_type = _guess_evidence_source_type(output)
+    is_hit = not is_no_hit_text(output)
+    summary, links = _extract_search_answer(output)
+    url = links[0] if links else (HELP_CENTER_URL if "helpcenter" in output.lower() else "")
+    authority = 0.95 if source_type in {"local_kb", "official_site", "official_community"} else 0.55
+    return [
+        {
+            "source_type": source_type,
+            "source_name": source_name,
+            "url": url,
+            "snippet": summary[:240],
+            "supports": [hypothesis_id],
+            "conflicts": [],
+            "authority": authority,
+            "relevance": 0.9 if is_hit else 0.3,
+            "query": query,
+            "depth": depth,
+            "purpose": purpose,
+        }
+    ]
+
+
+def _needs_browser_verification(question: str, evidence_items: list[dict[str, Any]], outputs: list[str]) -> bool:
+    q = normalize_message_text(question).lower()
+    strong_markers = [
+        "验证",
+        "核验",
+        "社区",
+        "官网",
+        "官方",
+        "发布",
+        "详细内容",
+        "今日",
+        "今天",
+        "最新",
+        "长江水位",
+        "浏览器开始记忆",
+    ]
+    if any(marker in q for marker in strong_markers):
+        return True
+    if all(is_no_hit_text(output) for output in outputs):
+        return True
+    has_official = any(item.get("source_type") in {"local_kb", "official_site", "official_community"} and item.get("relevance", 0) >= 0.7 for item in evidence_items)
+    return not has_official and any(marker in q for marker in ["如何", "怎么", "使用", "功能", "报错", "入口", "图标", "圆圈"])
+
+
+def _build_reasoning_trace(
+    question: str,
+    queries: list[dict[str, Any]],
+    evidence_items: list[dict[str, Any]],
+    answer_plan: str,
+) -> dict[str, Any]:
+    official_count = sum(1 for item in evidence_items if item.get("source_type") in {"official_site", "official_community", "local_kb"})
+    query_values: list[str] = []
+    for item in queries:
+        query = str(item.get("query", "")).strip()
+        if query and query not in query_values:
+            query_values.append(query)
+    snippets: list[str] = []
+    for item in evidence_items:
+        snippet = normalize_message_text(str(item.get("snippet", "")))
+        if snippet and snippet not in snippets:
+            snippets.append(snippet[:120])
+    return {
+        "intent_summary": f"用户想了解：{normalize_message_text(question)[:80]}",
+        "search_plan": query_values[:5],
+        "tool_summary": {
+            "searched_query_count": len(query_values),
+            "referenced_doc_count": len(evidence_items),
+            "official_source_count": official_count,
+        },
+        "evidence_summary": snippets[:3],
+        "answer_plan": answer_plan,
+    }
+
+
 def _select_best_evidence_output(outputs: list[str], evidence_items: list[dict[str, Any]]) -> str:
     """从多次搜索结果中选择最佳输出：优先高质量源，其次高相关度。"""
     if not outputs:
         return ""
     if len(outputs) == 1:
         return outputs[0]
+    # Browser-verified official pages are preferred for community/article/latest verification tasks.
+    for i, item in enumerate(evidence_items):
+        if i < len(outputs) and item.get("source_name") == "agent_browser_deep_search" and item.get("source_type") in {"official_site", "official_community"} and not is_no_hit_text(outputs[i]):
+            return outputs[i]
     # 优先返回本地知识库或官方站点的结果
     high_quality_sources = {"local_kb", "official_site", "official_community"}
     for i, item in enumerate(evidence_items):

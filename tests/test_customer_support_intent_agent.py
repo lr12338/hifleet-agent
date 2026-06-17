@@ -12,6 +12,7 @@ from agents.agent import (
     _execute_customer_support_harness,
     _execute_customer_support_planner,
     _heuristic_image_perception,
+    _run_customer_support_perception_agent,
     _repair_customer_support_answer,
     _run_customer_support_intent_agent,
     _run_customer_support_response_qa_agent,
@@ -115,6 +116,111 @@ def test_customer_support_standard_graph_runs_post_guard(monkeypatch):
     assert "绿点表示船位状态正常" in result["messages"][-1].content
     assert result["check_result"]["post_guard_applied"] is False
     assert result["generated_tool_calls"] == ["smart_search"]
+
+
+def test_customer_support_graph_uses_light_agent_after_perception(monkeypatch):
+    smart_search = FakeTool("smart_search", lambda args: "安全水域浮标 Safe Water Mark，表示周围为可航水域。")
+    inspect = FakeTool("inspect_media_attachment", lambda args: '{"category":"image"}')
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [inspect, smart_search])
+    monkeypatch.setattr(
+        "agents.agent._run_customer_support_perception_agent",
+        lambda **kwargs: {
+            "attachment_type": "image",
+            "summary": "HiFleet 海图上有红色圆形标志",
+            "suspected_symbol": "安全水域浮标",
+            "confidence": "high",
+            "source": "test",
+        },
+    )
+    monkeypatch.setattr(
+        "agents.agent._run_customer_support_intent_agent",
+        lambda **kwargs: {
+            "intent": "chart_symbol",
+            "route": "chart_symbol",
+            "task_type": "chart_symbol",
+            "tool_bundle": MULTIMODAL_BUNDLE,
+            "confidence": "high",
+            "needs_harness": False,
+            "use_context_ship": False,
+            "why": "perception shows chart symbol",
+        },
+    )
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            raise AssertionError("chart_symbol route should execute planner/harness path")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r1"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["multimodal_support", "knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=[
+                        {"type": "image_url", "image_url": {"url": "https://example.com/chart.png"}},
+                        {"type": "text", "text": "这个圆圈是什么"},
+                    ]
+                )
+            ],
+            "session_id": "s-light-agent",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-light-agent"}},
+    )
+
+    assert result["route"] == "chart_symbol"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "light_agent"
+    assert result["route_trace"]["reasoning_trace"]["perception_summary"]["suspected_symbol"] == "安全水域浮标"
+    assert "安全水域浮标" in result["messages"][-1].content
+
+
+def test_customer_support_graph_write_guard_overrides_light_agent(monkeypatch):
+    position = FakeTool("upload_ship_position", lambda args: "更新成功")
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position])
+    monkeypatch.setattr("agents.agent._run_customer_support_perception_agent", lambda **kwargs: {})
+    monkeypatch.setattr(
+        "agents.agent._run_customer_support_intent_agent",
+        lambda **kwargs: {
+            "intent": "knowledge",
+            "route": "knowledge",
+            "task_type": "platform_knowledge",
+            "tool_bundle": KNOWLEDGE_BUNDLE,
+            "confidence": "high",
+            "needs_harness": False,
+            "use_context_ship": False,
+            "why": "bad lightweight guess",
+        },
+    )
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            raise AssertionError("ship_update guard should not delegate")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r1"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["hifleet_ship_service"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="请更新船位 MMSI 414726000 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30")],
+            "session_id": "s-write-guard",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-write-guard"}},
+    )
+
+    assert result["route"] == "ship_update"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_guard"
 
 
 def test_sensitive_internal_request_detection():
@@ -332,6 +438,58 @@ def test_customer_support_intent_agent_uses_compressed_context_payload(monkeypat
     assert captured["payload"]["context_summary"]
     assert "当前问题" in captured["payload"]["context_summary"]
     assert all("..." not in item or len(item) <= 93 for item in captured["payload"]["recent_user_questions"])
+
+
+def test_customer_support_intent_agent_payload_includes_attachments_and_perception(monkeypatch):
+    captured = {}
+
+    def fake_json_agent(ctx, cfg, system_prompt, payload):
+        captured["payload"] = payload
+        return {
+            "intent": "chart_symbol",
+            "confidence": "high",
+            "reason_summary": "截图里是海图符号咨询",
+            "use_context_ship": False,
+        }
+
+    monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", fake_json_agent)
+    attachment = Attachment(type="image", url="https://example.com/chart.png", filename="chart.png")
+    perception = {
+        "attachment_type": "image",
+        "summary": "HiFleet 海图上有红色圆形标志",
+        "suspected_symbol": "安全水域浮标",
+        "confidence": "high",
+    }
+
+    result = _run_customer_support_intent_agent(
+        ctx=None,
+        cfg={"config": {}},
+        messages=[HumanMessage(content="这个圆圈是什么")],
+        text="这个圆圈是什么",
+        entities=extract_entities("这个圆圈是什么"),
+        context=build_conversation_context([HumanMessage(content="这个圆圈是什么")]),
+        allow_write=True,
+        attachments=[attachment],
+        perception=perception,
+    )
+
+    assert result["intent"] == "chart_symbol"
+    assert result["route"] == "chart_symbol"
+    assert captured["payload"]["attachments"][0]["type"] == "image"
+    assert captured["payload"]["perception"]["suspected_symbol"] == "安全水域浮标"
+
+
+def test_perception_agent_returns_file_metadata_without_llm():
+    perception = _run_customer_support_perception_agent(
+        ctx=None,
+        cfg={"config": {}},
+        text="帮我分析这个文件",
+        attachments=[Attachment(type="file", url="https://example.com/a.xlsx", filename="a.xlsx")],
+    )
+
+    assert perception["attachment_type"] == "file"
+    assert perception["confidence"] == "medium"
+    assert perception["source"] == "metadata"
 
 
 def test_customer_support_review_agent_blocks_conflicting_public_only_evidence(monkeypatch):
