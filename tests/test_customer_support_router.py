@@ -193,6 +193,7 @@ def test_agent_browser_output_is_sanitized_for_customer():
 
 
 def test_agent_browser_deep_search_formats_public_page_results(monkeypatch):
+    monkeypatch.setattr("skills.browser_verify.tools._sandbox_hifleet_candidates", lambda query: [])
     monkeypatch.setattr(
         "skills.browser_verify.tools._candidate_urls",
         lambda query: [{"url": "https://www.hifleet.com/helpcenter/?i18n=zh", "title": "HiFleet 帮助中心", "summary": "官方说明"}],
@@ -214,6 +215,24 @@ def test_agent_browser_deep_search_rejects_invalid_query_characters():
     output = agent_browser_deep_search.invoke({"query": "HiFleet; rm -rf /"})
 
     assert "未检索到足够可信的信息" in output
+
+
+def test_agent_browser_deep_search_prefers_sandbox_candidates(monkeypatch):
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._sandbox_hifleet_candidates",
+        lambda query: [{"url": "https://www.hifleet.com/data/index.html", "title": "HiFleet 数据服务", "summary": "来自沙盒候选", "source": "sandbox_python", "query": query}],
+    )
+    monkeypatch.setattr("skills.browser_verify.tools._candidate_urls", lambda query: [])
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._browser_capture_page_text",
+        lambda url: ("HiFleet 数据服务", "这里是通过 agent-browser 抓取的 HiFleet 数据服务正文。"),
+    )
+
+    output = agent_browser_deep_search.invoke({"query": "HiFleet 数据服务介绍"})
+
+    assert "公开网页深度检索" in output
+    assert "HiFleet 数据服务" in output
+    assert "通过 agent-browser 抓取" in output
 
 
 def test_preferred_hifleet_candidates_prioritize_helpcenter_for_howto(monkeypatch):

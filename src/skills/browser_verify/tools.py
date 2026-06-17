@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 from urllib.parse import quote_plus, urlparse
@@ -10,11 +11,14 @@ from urllib.parse import quote_plus, urlparse
 import requests
 from langchain.tools import tool
 
+from skills.employee_workspace.tools import ARTIFACT_ROOT, _prepare_job_dir, _run_in_docker
+
 logger = logging.getLogger(__name__)
 
 AGENT_BROWSER_SESSION = "hifleet-cs-fallback"
 AGENT_BROWSER_TIMEOUT_SEC = 25
 AGENT_BROWSER_MAX_BODY_CHARS = 4000
+PY_SANDBOX_SEARCH_NETWORK_MODE = os.getenv("HIFLEET_PY_SANDBOX_BROWSER_NETWORK_MODE", "bridge").strip() or "bridge"
 NO_HIT_TEXT = "未检索到足够可信的信息"
 BING_SEARCH_URL = "https://www.bing.com/search"
 REQUESTS_HEADERS = {"User-Agent": "HiFleetCustomerSupport/1.0"}
@@ -204,6 +208,122 @@ def _candidate_urls(query: str) -> list[dict[str, str]]:
     return candidates
 
 
+def _extract_json_payload(raw_stdout: str) -> dict[str, object]:
+    value = (raw_stdout or "").strip()
+    if not value:
+        return {}
+    candidates = re.findall(r"\{.*\}", value, flags=re.DOTALL)
+    for item in reversed(candidates):
+        try:
+            payload = json.loads(item)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _sandbox_search_script(query: str) -> str:
+    query_literal = json.dumps(query, ensure_ascii=False)
+    preferred_literal = json.dumps(PREFERRED_HIFLEET_PAGES, ensure_ascii=False)
+    return f"""import json
+import re
+import urllib.parse
+import urllib.request
+from html import unescape
+from urllib.parse import urlparse
+
+QUERY = {query_literal}
+HEADERS = {{"User-Agent": "HiFleetCustomerSupportSandbox/1.0"}}
+PREFERRED = {preferred_literal}
+
+def fetch(url: str) -> str:
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+def clean(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def allowed(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "hifleet.com" or host.endswith(".hifleet.com")
+
+candidates = []
+seen = set()
+for item in PREFERRED:
+    url = str(item.get("url", "")).strip()
+    if url and allowed(url) and url not in seen:
+        candidates.append({"url": url, "title": item.get("title", ""), "summary": "", "source": "sandbox_preferred"})
+        seen.add(url)
+
+bing_query = f'site:hifleet.com "HiFleet" "{{QUERY}}"'
+search_url = "https://www.bing.com/search?q=" + urllib.parse.quote_plus(bing_query) + "&count=6&setlang=en"
+try:
+    html = fetch(search_url)
+except Exception:
+    html = ""
+
+for match in re.finditer(r'<li class="b_algo".*?<h2><a href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p>(.*?)</p>)?.*?</li>', html, flags=re.IGNORECASE | re.DOTALL):
+    url = clean(match.group(1) or "")
+    if not url or not allowed(url) or url in seen:
+        continue
+    title = clean(match.group(2) or "") or "HiFleet 页面"
+    summary = clean(match.group(3) or "")
+    candidates.append({"url": url, "title": title, "summary": summary[:400], "source": "sandbox_bing"})
+    seen.add(url)
+    if len(candidates) >= 5:
+        break
+
+print(json.dumps({"candidates": candidates[:5]}, ensure_ascii=False))
+"""
+
+
+def _sandbox_hifleet_candidates(query: str) -> list[dict[str, str]]:
+    try:
+        ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+        job_dir, _, _, script_path = _prepare_job_dir()
+        script_path.write_text(_sandbox_search_script(query), encoding="utf-8")
+        runtime = _run_in_docker(
+            job_dir,
+            network_mode=PY_SANDBOX_SEARCH_NETWORK_MODE,
+            extra_env={"PYTHONIOENCODING": "utf-8"},
+        )
+        if int(runtime.get("exit_code", 1)) != 0:
+            logger.warning("sandbox hifleet search failed: %s", runtime.get("stderr", ""))
+            return []
+        payload = _extract_json_payload(str(runtime.get("stdout", "")))
+        items = payload.get("candidates") if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            return []
+        normalized: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", "")).strip()
+            if not _is_public_http_url(url) or "hifleet.com" not in url.lower() or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            normalized.append(
+                {
+                    "url": url,
+                    "title": str(item.get("title", "")).strip() or "HiFleet 页面",
+                    "summary": _normalize_page_text(str(item.get("summary", "")).strip()),
+                    "source": str(item.get("source", "sandbox_python")).strip() or "sandbox_python",
+                    "query": query,
+                }
+            )
+            if len(normalized) >= 5:
+                break
+        return normalized
+    except Exception as exc:
+        logger.warning("sandbox hifleet search error: %s", exc)
+        return []
+
+
 def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
     blocks = ["【公开网页深度检索】", f"问题：{query}"]
     for page in pages[:2]:
@@ -250,7 +370,7 @@ def agent_browser_deep_search(query: str) -> str:
     if not sanitized_query:
         return NO_HIT_TEXT
 
-    candidates = _candidate_urls(sanitized_query)
+    candidates = _sandbox_hifleet_candidates(sanitized_query) or _candidate_urls(sanitized_query)
     if not candidates:
         return NO_HIT_TEXT
 

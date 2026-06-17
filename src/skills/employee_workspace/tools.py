@@ -242,30 +242,39 @@ def _copy_input_file(source_path: str, input_dir: Path) -> str:
     return copied_name
 
 
-def _run_in_docker(job_dir: Path, input_file_name: str = "") -> dict[str, Any]:
+def _run_in_docker(
+    job_dir: Path,
+    input_file_name: str = "",
+    *,
+    network_mode: str = "none",
+    extra_env: Dict[str, str] | None = None,
+) -> dict[str, Any]:
     client = docker.from_env()
     script_path_in_container, output_dir_in_container, input_path_in_container = _container_paths(job_dir, input_file_name=input_file_name)
     container = None
     started = time.time()
     try:
         image_name = _resolve_sandbox_image(client)
+        environment = {
+            "ARTIFACT_DIR": output_dir_in_container,
+            "INPUT_FILE": input_path_in_container,
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+        if extra_env:
+            environment.update({str(key): str(value) for key, value in extra_env.items()})
         container = client.containers.run(
             image=image_name,
             command=["python", script_path_in_container],
             detach=True,
-            network_mode="none",
+            network_mode=network_mode,
             read_only=True,
             mem_limit=DOCKER_MEM_LIMIT,
             cpu_quota=DOCKER_CPU_QUOTA,
             user=DOCKER_USER,
             working_dir=f"{SANDBOX_VOLUME_MOUNT.rstrip('/')}/{job_dir.name}",
             volumes=_mount_spec(),
-            environment={
-                "ARTIFACT_DIR": output_dir_in_container,
-                "INPUT_FILE": input_path_in_container,
-                "PYTHONNOUSERSITE": "1",
-                "PYTHONUNBUFFERED": "1",
-            },
+            environment=environment,
             tmpfs={"/tmp": "rw,noexec,nosuid,size=64m"},
         )
         wait_result = container.wait(timeout=SANDBOX_TIMEOUT_SEC)
