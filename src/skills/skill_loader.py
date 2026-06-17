@@ -126,7 +126,7 @@ class SkillLoader:
             "employee_workspace": ["download_public_file_to_artifact", "inspect_tabular_file", "run_sandboxed_python"],
             "multimodal_support": ["inspect_media_attachment"],
             "customer_workspace": ["inspect_customer_file", "upload_customer_artifact"],
-            "browser_verify": ["verify_public_page"],
+            "browser_verify": ["verify_public_page", "agent_browser_deep_search"],
         }
 
         if skill_name not in TOOL_MAP:

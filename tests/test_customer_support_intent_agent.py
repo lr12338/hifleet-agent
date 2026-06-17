@@ -83,16 +83,23 @@ def test_customer_support_agent_imports_guard_refusal_constant():
 
 
 def test_customer_support_standard_graph_runs_post_guard(monkeypatch):
+    smart_search = FakeTool(
+        "smart_search",
+        lambda args: "【优先匹配 - FAQ/标准回复】\n绿点表示船位状态正常。\nhttps://www.hifleet.com/helpcenter/?i18n=zh",
+    )
+    agent_browser = FakeTool("agent_browser_deep_search", lambda args: "未检索到足够可信的信息")
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [smart_search, agent_browser])
+
     class FakeStandardAgent:
         def invoke(self, payload, context=None):
-            return {"messages": [HumanMessage(content="HiFleet 绿点是什么意思"), {"role": "assistant", "content": "绿点表示船位状态正常。"}]}
+            raise AssertionError("customer_support knowledge route should not delegate to standard_agent")
 
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
     graph = _build_customer_support_agent(
         ctx=SimpleNamespace(run_id="r1"),
         cfg={"config": {}},
         workspace_path=str(Path(__file__).resolve().parents[1]),
-        profile=AgentProfile(profile_id="customer_support", skills=["knowledge_qa"]),
+        profile=AgentProfile(profile_id="customer_support", skills=["knowledge_qa", "browser_verify"]),
     )
 
     result = graph.invoke(
@@ -105,8 +112,9 @@ def test_customer_support_standard_graph_runs_post_guard(monkeypatch):
     )
 
     assert result["phase"] == "done"
-    assert result["messages"][-1].content == "绿点表示船位状态正常。"
+    assert "绿点表示船位状态正常" in result["messages"][-1].content
     assert result["check_result"]["post_guard_applied"] is False
+    assert result["generated_tool_calls"] == ["smart_search"]
 
 
 def test_sensitive_internal_request_detection():
@@ -161,7 +169,7 @@ def test_customer_support_new_skills_are_registered():
     tools = SkillLoader.get_tools_by_skill_names(["multimodal_support", "customer_workspace", "browser_verify"])
     names = {tool.name for tool in tools}
 
-    assert {"inspect_media_attachment", "inspect_customer_file", "upload_customer_artifact", "verify_public_page"} <= names
+    assert {"inspect_media_attachment", "inspect_customer_file", "upload_customer_artifact", "verify_public_page", "agent_browser_deep_search"} <= names
 
 
 def test_hifleet_community_is_registered_as_official_search_source():
@@ -288,6 +296,42 @@ def test_customer_support_intent_agent_enforces_write_policy(monkeypatch):
 
     assert result["intent"] == "ship_update"
     assert result["task_type"] == "platform_knowledge"
+
+
+def test_customer_support_intent_agent_uses_compressed_context_payload(monkeypatch):
+    captured = {}
+
+    def fake_json_agent(ctx, cfg, system_prompt, payload):
+        captured["payload"] = payload
+        return {
+            "intent": "knowledge",
+            "confidence": "high",
+            "use_context_ship": False,
+            "why": "压缩上下文后仍可判断为知识问题",
+        }
+
+    monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", fake_json_agent)
+    messages = [
+        HumanMessage(content="hifleet平台上传不了航线怎么办"),
+        HumanMessage(content="今天上海天气怎么样"),
+    ]
+    context = build_conversation_context(messages)
+
+    result = _run_customer_support_intent_agent(
+        ctx=None,
+        cfg={"config": {}},
+        messages=messages,
+        text="今天上海天气怎么样",
+        entities=extract_entities("今天上海天气怎么样"),
+        context=context,
+        allow_write=False,
+    )
+
+    assert result["intent"] == "knowledge"
+    assert captured["payload"]["previous_user_text"] == ""
+    assert captured["payload"]["context_summary"]
+    assert "当前问题" in captured["payload"]["context_summary"]
+    assert all("..." not in item or len(item) <= 93 for item in captured["payload"]["recent_user_questions"])
 
 
 def test_customer_support_review_agent_blocks_conflicting_public_only_evidence(monkeypatch):

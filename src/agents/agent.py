@@ -33,6 +33,7 @@ from agents.customer_support_router import (
     MULTIMODAL_BUNDLE,
     SHIP_QUERY_BUNDLE,
     answer_conversation_memory,
+    build_llm_context_window,
     build_customer_support_plan,
     build_multimodal_search_query,
     build_conversation_context,
@@ -304,10 +305,12 @@ def _run_customer_support_intent_agent(
     allow_write: bool,
 ) -> dict[str, Any]:
     fallback_intent = "knowledge"
+    llm_context = build_llm_context_window(context)
     payload = {
         "latest_user_text": text,
-        "recent_user_questions": list(context.recent_user_questions[-3:]),
-        "previous_user_text": context.previous_user_text,
+        "recent_user_questions": list(llm_context["recent_user_questions"]),
+        "previous_user_text": llm_context["previous_user_text"],
+        "context_summary": llm_context["context_summary"],
         "last_ship_name": context.last_ship_name,
         "last_ship_mmsi": context.last_ship_mmsi,
         "last_ship_imo": context.last_ship_imo,
@@ -356,15 +359,17 @@ def _run_customer_support_planner_agent(
     perception: dict[str, Any],
     fallback_plan: dict[str, Any],
 ) -> dict[str, Any]:
+    llm_context = build_llm_context_window(context)
     payload = {
         "question": text,
         "route": decision.route,
         "task_type": decision.task_type,
         "entities": asdict(entities),
         "context": {
-            "previous_user_text": context.previous_user_text,
+            "previous_user_text": llm_context["previous_user_text"],
             "latest_user_text": context.latest_user_text,
-            "recent_user_questions": list(context.recent_user_questions[-3:]),
+            "recent_user_questions": list(llm_context["recent_user_questions"]),
+            "context_summary": llm_context["context_summary"],
         },
         "attachments": [asdict(item) for item in attachments],
         "perception": dict(perception or {}),
@@ -1508,6 +1513,71 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "route_trace": asdict(trace),
         }
 
+    def execute_node(state: CustomerSupportState) -> dict[str, Any]:
+        route = str(state.get("route", "") or "")
+        task_type = str(state.get("task_type", "") or "")
+        tool_bundle = list(state.get("tool_bundle", []) or [])
+        messages = list(state.get("messages", []) or [])
+        text = latest_customer_user_text(messages)
+        context = build_conversation_context(messages)
+        entities = MessageEntities(**dict(state.get("entities", {}) or {}))
+        attachments = [Attachment(**item) if isinstance(item, dict) else item for item in list(state.get("attachments", []) or [])]
+        session_id = str(state.get("session_id", ""))
+        run_id = str(getattr(ctx, "run_id", "") or "")
+        phase_history = list(state.get("phase_history", [])) + ["execute"]
+
+        if route in HARNESSED_ROUTES:
+            answer, trace = _execute_customer_support_harness(
+                text=text,
+                route=route,
+                task_type=task_type,
+                tool_bundle=tool_bundle,
+                entities=entities,
+                context=context,
+                attachments=attachments,
+                session_id=session_id,
+                run_id=run_id,
+            )
+            return {
+                "phase": "executed",
+                "status": "success",
+                "phase_history": phase_history,
+                "messages": [AIMessage(content=answer)],
+                "generated_answer": answer,
+                "generated_tool_calls": list(trace.get("tool_call_sequence", []) or []),
+                "route_trace": trace,
+            }
+
+        if route in {"knowledge", "chart_symbol", "multimodal_understanding", "conversation"}:
+            answer, trace, _evidence_items, _evidence_summary = _execute_customer_support_planner(
+                question=text,
+                route=route,
+                task_type=task_type,
+                tool_bundle=tool_bundle,
+                entities=entities,
+                context=context,
+                attachments=attachments,
+                session_id=session_id,
+                run_id=run_id,
+            )
+            return {
+                "phase": "executed",
+                "status": "success",
+                "phase_history": phase_history,
+                "messages": [AIMessage(content=answer)],
+                "generated_answer": answer,
+                "generated_tool_calls": list(trace.get("tool_call_sequence", []) or []),
+                "route_trace": trace,
+            }
+
+        route_trace = dict(state.get("route_trace", {}) or {})
+        route_trace["fallback_reason"] = route_trace.get("fallback_reason") or "unsupported_execute_route"
+        return {
+            "phase": "delegate_pending",
+            "phase_history": phase_history,
+            "route_trace": route_trace,
+        }
+
     def delegate_node(state: CustomerSupportState) -> dict[str, Any]:
         if state.get("phase") == "done" and state.get("messages"):
             return dict(state)
@@ -1545,6 +1615,8 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         if not sanitized_answer or not links_ok:
             sanitized_answer = guard_fallback
         trace = dict(state.get("route_trace", {}) or {})
+        if not tool_sequence:
+            tool_sequence = list(state.get("generated_tool_calls", []) or trace.get("tool_call_sequence", []) or [])
         trace["tool_call_sequence"] = tool_sequence
         trace["check_result"] = {
             "has_answer": bool(raw_answer),
@@ -1599,15 +1671,22 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
     def route_after_entry(state: CustomerSupportState) -> str:
         if state.get("phase") == "done":
             return "finalize"
-        return "delegate"
+        return "execute"
+
+    def route_after_execute(state: CustomerSupportState) -> str:
+        if state.get("phase") == "delegate_pending":
+            return "delegate"
+        return "check"
 
     graph = StateGraph(CustomerSupportState)
     graph.add_node("route", route_node)
+    graph.add_node("execute", execute_node)
     graph.add_node("delegate", delegate_node)
     graph.add_node("check", check_node)
     graph.add_node("finalize", finalize_node)
     graph.add_edge(START, "route")
-    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "finalize": "finalize"})
+    graph.add_conditional_edges("route", route_after_entry, {"execute": "execute", "finalize": "finalize"})
+    graph.add_conditional_edges("execute", route_after_execute, {"delegate": "delegate", "check": "check"})
     graph.add_edge("delegate", "check")
     graph.add_edge("check", "finalize")
     graph.add_edge("finalize", END)

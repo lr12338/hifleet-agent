@@ -1,4 +1,5 @@
 import sys
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -36,6 +37,12 @@ from agents.customer_support_router import (
 )
 from agents.customer_support_guard import sanitize_customer_output
 from langchain_core.messages import AIMessage, HumanMessage
+from skills.browser_verify.tools import (
+    PREFERRED_HIFLEET_PAGES,
+    _candidate_urls,
+    _preferred_hifleet_candidates,
+    agent_browser_deep_search,
+)
 
 
 class FakeTool:
@@ -47,6 +54,204 @@ class FakeTool:
     def invoke(self, args):
         self.calls.append(args)
         return self.handler(args)
+
+
+def test_knowledge_chain_falls_back_to_agent_browser_when_smart_search_empty():
+    """Test that execute_knowledge_chain falls back to agent_browser_deep_search when smart_search returns no hits."""
+    call_sequence = []
+    
+    def smart_search_handler(args):
+        call_sequence.append("smart_search")
+        return "未检索到足够可信的信息"
+    
+    def browser_search_handler(args):
+        call_sequence.append("agent_browser_deep_search")
+        return "【互联网搜索结果】\n根据公开资料，HiFleet平台支持船舶轨迹查询功能..."
+    
+    smart_search = FakeTool("smart_search", smart_search_handler)
+    agent_browser = FakeTool("agent_browser_deep_search", browser_search_handler)
+    
+    text = "HiFleet 船舶轨迹怎么导出"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities, session_id="s1")
+    
+    tool_map = {
+        "smart_search": smart_search,
+        "agent_browser_deep_search": agent_browser,
+    }
+    output = execute_knowledge_chain(text, decision, tool_map, trace)
+    
+    # Verify tool call sequence
+    assert call_sequence == ["smart_search", "agent_browser_deep_search"]
+    assert trace.fallback_reason == "smart_search_empty_agent_browser_fallback"
+    assert "公开资料" in output or "互联网搜索" in output
+    
+
+def test_knowledge_chain_does_not_call_browser_when_smart_search_succeeds():
+    """Test that agent_browser_deep_search is NOT called when smart_search returns valid results."""
+    call_sequence = []
+    
+    def smart_search_handler(args):
+        call_sequence.append("smart_search")
+        return "【优先匹配 - FAQ/标准回复】\n导出轨迹：在船舶详情页点击'导出轨迹'按钮..."
+    
+    def browser_search_handler(args):
+        call_sequence.append("agent_browser_deep_search")
+        return "【互联网搜索结果】\nShould not be called"
+    
+    smart_search = FakeTool("smart_search", smart_search_handler)
+    agent_browser = FakeTool("agent_browser_deep_search", browser_search_handler)
+    
+    text = "HiFleet 船舶轨迹怎么导出"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities, session_id="s1")
+    
+    tool_map = {
+        "smart_search": smart_search,
+        "agent_browser_deep_search": agent_browser,
+    }
+    output = execute_knowledge_chain(text, decision, tool_map, trace)
+    
+    # Verify browser was NOT called
+    assert call_sequence == ["smart_search"]
+    assert trace.fallback_reason is None or trace.fallback_reason != "smart_search_empty_agent_browser_fallback"
+    assert "导出轨迹" in output
+
+
+def test_planned_knowledge_chain_falls_back_to_agent_browser():
+    """Test that execute_planned_knowledge_chain falls back to agent_browser_deep_search."""
+    call_sequence = []
+    
+    def smart_search_handler(args):
+        call_sequence.append(f"smart_search_{args.get('depth', 'unknown')}")
+        return "未检索到足够可信的信息"
+    
+    def browser_search_handler(args):
+        call_sequence.append("agent_browser_deep_search")
+        return "【互联网搜索结果】\n根据公开技术资料，该功能需要升级账户..."
+    
+    smart_search = FakeTool("smart_search", smart_search_handler)
+    agent_browser = FakeTool("agent_browser_deep_search", browser_search_handler)
+    
+    text = "HiFleet API 调用频率限制是多少"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities, session_id="s1")
+    
+    tool_map = {
+        "smart_search": smart_search,
+        "agent_browser_deep_search": agent_browser,
+    }
+    search_plan = [{"query": "API 频率限制", "depth": "quick", "hypothesis_id": "H1", "purpose": "测试"}]
+    
+    output, evidence_items, evidence_summary = execute_planned_knowledge_chain(
+        text, decision, search_plan, tool_map, trace
+    )
+    
+    # Verify fallback occurred
+    assert "agent_browser_deep_search" in call_sequence
+    assert trace.fallback_reason == "smart_search_empty_agent_browser_fallback"
+    
+    # Verify evidence item was added
+    browser_evidence = [e for e in evidence_items if e.get("source_name") == "agent_browser_deep_search"]
+    assert len(browser_evidence) == 1
+    assert browser_evidence[0]["source_type"] == "public_web"
+    assert browser_evidence[0]["authority"] == 0.6
+
+
+def test_agent_browser_output_is_sanitized_for_customer():
+    """Test that agent_browser_deep_search output does not expose internal details to customer."""
+    def browser_search_handler(args):
+        # Simulate output that might contain internal details
+        return json.dumps({
+            "ok": True,
+            "query": "test",
+            "skill_content_preview": "Internal CLI output...",
+            "note": "This is a controlled deep search fallback."
+        })
+    
+    agent_browser = FakeTool("agent_browser_deep_search", browser_search_handler)
+    
+    text = "HiFleet 新功能"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities, session_id="s1")
+    
+    tool_map = {
+        "smart_search": FakeTool("smart_search", lambda args: "未检索到足够可信的信息"),
+        "agent_browser_deep_search": agent_browser,
+    }
+    output = execute_knowledge_chain(text, decision, tool_map, trace)
+    
+    # Sanitize and verify no internal paths/commands exposed
+    sanitized = sanitize_customer_output(output)
+    assert "subprocess" not in sanitized
+    assert "/usr/bin" not in sanitized
+    assert "agent-browser CLI" not in sanitized or "公开资料" in sanitized
+
+
+def test_agent_browser_deep_search_formats_public_page_results(monkeypatch):
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._candidate_urls",
+        lambda query: [{"url": "https://www.hifleet.com/helpcenter/?i18n=zh", "title": "HiFleet 帮助中心", "summary": "官方说明"}],
+    )
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._browser_capture_page_text",
+        lambda url: ("HiFleet 帮助中心", "这里是帮助中心正文摘要，包含轨迹导出功能说明。"),
+    )
+
+    output = agent_browser_deep_search.invoke({"query": "HiFleet 船舶轨迹怎么导出"})
+
+    assert "公开网页深度检索" in output
+    assert "HiFleet 帮助中心" in output
+    assert "轨迹导出功能说明" in output
+    assert "https://www.hifleet.com/helpcenter/?i18n=zh" in output
+
+
+def test_agent_browser_deep_search_rejects_invalid_query_characters():
+    output = agent_browser_deep_search.invoke({"query": "HiFleet; rm -rf /"})
+
+    assert "未检索到足够可信的信息" in output
+
+
+def test_preferred_hifleet_candidates_prioritize_helpcenter_for_howto(monkeypatch):
+    monkeypatch.setattr("skills.browser_verify.tools._is_public_http_url", lambda url: True)
+    monkeypatch.setattr("skills.knowledge_qa.tools._is_url_accessible", lambda url: True)
+
+    candidates = _preferred_hifleet_candidates("HiFleet 帮助中心怎么登录账号")
+
+    assert candidates
+    assert candidates[0]["url"] == "https://www.hifleet.com/helpcenter/?i18n=en"
+    assert any(item["url"] == "https://www.hifleet.com/account/index.html?type=account" for item in candidates)
+
+
+def test_candidate_urls_merge_preferred_hifleet_pages_before_bing(monkeypatch):
+    preferred = [
+        {"url": "https://www.hifleet.com/helpcenter/?i18n=en", "title": "HiFleet Help Center EN", "summary": "", "source": "preferred_hifleet", "query": "q"}
+    ]
+    bing = [
+        {"url": "https://www.hifleet.com/data/index.html", "title": "HiFleet 数据服务", "summary": "来自 Bing", "source": "bing", "query": "q"}
+    ]
+    monkeypatch.setattr("skills.browser_verify.tools._preferred_hifleet_candidates", lambda query: preferred)
+    monkeypatch.setattr("skills.browser_verify.tools._bing_search_candidates", lambda query: bing)
+
+    candidates = _candidate_urls("q")
+
+    assert candidates[0]["source"] == "preferred_hifleet"
+    assert candidates[0]["url"] == "https://www.hifleet.com/helpcenter/?i18n=en"
+    assert candidates[1]["source"] == "bing"
+
+
+def test_preferred_hifleet_pages_cover_requested_urls():
+    urls = {item["url"] for item in PREFERRED_HIFLEET_PAGES}
+
+    assert "https://www.hifleet.com/" in urls
+    assert "https://www.hifleet.com/data/index.html" in urls
+    assert "https://www.hifleet.com/helpcenter/?i18n=en" in urls
+    assert "https://www.hifleet.com/account/index.html?type=account" in urls
+    assert "https://www.hifleet.com/wp/communities" in urls or "https://www.hifleet.com/wp/community/" in urls
 
 
 def test_platform_question_kb_first_then_search_fallback():
@@ -371,6 +576,39 @@ def test_ai_troubleshooting_reply_does_not_pollute_ship_context():
     assert context.last_ship_name == ""
     assert entities.ship_name == ""
     assert decision.task_type == "platform_troubleshooting"
+
+
+def test_conversation_context_compresses_and_filters_irrelevant_history():
+    messages = [
+        HumanMessage(content="帮我看看租船AI入口在哪里，顺便介绍一下数据服务页面"),
+        HumanMessage(content="我还想知道帮助中心英文版入口"),
+        HumanMessage(content="另外上周问过船位问题先不用管"),
+        HumanMessage(content="账号登录入口在哪"),
+    ]
+    context = build_conversation_context(messages)
+
+    assert context.previous_user_text in {
+        "帮我看看租船AI入口在哪里，顺便介绍一下数据服务页面",
+        "我还想知道帮助中心英文版入口",
+    }
+    assert context.relevant_recent_user_questions
+    assert "另外上周问过船位问题先不用管" not in context.relevant_recent_user_questions
+    assert all("船位问题" not in item for item in context.relevant_recent_user_questions)
+    assert "最近相关问题" in context.context_summary
+
+
+def test_irrelevant_old_context_does_not_force_platform_troubleshooting_route():
+    messages = [
+        HumanMessage(content="hifleet平台上传不了航线怎么办"),
+        HumanMessage(content="今天上海天气怎么样"),
+    ]
+    context = build_conversation_context(messages)
+    text = "今天上海天气怎么样"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities, context)
+
+    assert decision.route == "knowledge"
+    assert decision.task_type == "platform_knowledge"
 
 
 def test_platform_troubleshooting_phrase_is_not_misclassified_as_write():

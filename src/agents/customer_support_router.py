@@ -27,10 +27,10 @@ HIFLEET_ACCOUNT_PAGE_HINT = "可在【关于】→【账号】里查看当前账
 TaskType = str
 Route = str
 
-KNOWLEDGE_BUNDLE = ["smart_search"]
+KNOWLEDGE_BUNDLE = ["smart_search", "agent_browser_deep_search"]
 MULTIMODAL_BUNDLE = ["inspect_media_attachment", "smart_search"]
 FILE_BUNDLE = ["inspect_customer_file", "upload_customer_artifact"]
-BROWSER_VERIFY_BUNDLE = ["verify_public_page", "smart_search"]
+BROWSER_VERIFY_BUNDLE = ["verify_public_page", "smart_search", "agent_browser_deep_search"]
 SHIP_QUERY_BUNDLE = ["ship_search", "get_ship_position", "get_ship_archive", "get_psc_records"]
 SHIP_STATS_BUNDLE = [
     "get_area_traffic",
@@ -50,7 +50,7 @@ SHIP_VOYAGE_BUNDLE = [
     "get_current_stop",
 ]
 SHIP_UPDATE_BUNDLE = ["ship_search", "upload_ship_position", "update_ship_static_info"]
-BROWSER_FALLBACK_BUNDLE = ["smart_search"]
+BROWSER_FALLBACK_BUNDLE = ["smart_search", "agent_browser_deep_search"]
 
 HIGH_COST_CAPABILITIES_BY_TASK = {
     "platform_knowledge": [],
@@ -105,6 +105,7 @@ HIFLEET_FEATURE_MARKERS = {
 }
 HIFLEET_HOWTO_MARKERS = {"如何", "怎么", "怎样", "为什么", "步骤", "入口", "查询"}
 HIFLEET_PERMISSION_QUERY_MARKERS = {"历史轨迹", "轨迹", "气象预报", "气象导航", "海图", "权限", "能看多久", "几天", "多久前", "可查", "多少天"}
+GENERIC_CONTEXT_TOKENS = {"如何", "怎么", "怎样", "为什么", "步骤", "查询"}
 
 # 船位概念类词汇（非指定船舶查询，而是平台功能问题）
 SHIP_CONCEPT_TROUBLESHOOTING_PATTERNS = [
@@ -168,6 +169,9 @@ class ConversationContext:
     latest_user_text: str = ""
     previous_user_text: str = ""
     recent_user_questions: list[str] = field(default_factory=list)
+    compressed_recent_user_questions: list[str] = field(default_factory=list)
+    relevant_recent_user_questions: list[str] = field(default_factory=list)
+    context_summary: str = ""
     last_ship_name: str = ""
     last_ship_mmsi: str = ""
     last_ship_imo: str = ""
@@ -261,6 +265,88 @@ def _clean_ship_name_candidate(value: str) -> str:
     return candidate[:80]
 
 
+def _compress_context_text(text: str, max_chars: int = 90) -> str:
+    value = normalize_message_text(text)
+    if not value:
+        return ""
+    value = re.sub(r"https?://[^\s]+", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    if len(value) <= max_chars:
+        return value
+    cut = value[:max_chars].rstrip(" ，。；;,.!?！？:")
+    return cut + "..."
+
+
+def _context_topic_tokens(text: str) -> set[str]:
+    normalized = normalize_message_text(text).lower()
+    if not normalized:
+        return set()
+    tokens: set[str] = set()
+    for marker in (
+        HIFLEET_ACCOUNT_MARKERS
+        | HIFLEET_FEATURE_MARKERS
+        | HIFLEET_HOWTO_MARKERS
+        | HIFLEET_PERMISSION_QUERY_MARKERS
+        | HIFLEET_CONTEXT_CLEAR_MARKERS
+        | {"船位", "轨迹", "挂靠", "航次", "海图", "图标", "符号", "截图", "文件", "表格", "报告", "上传", "下载", "账号", "权限", "社区", "官网"}
+    ):
+        if marker and marker.lower() in normalized:
+            tokens.add(marker.lower())
+    tokens.update(re.findall(r"\b\d{7,9}\b", normalized))
+    return tokens
+
+
+def _select_relevant_questions(previous_questions: list[str], latest: str, *, limit: int = 4) -> list[str]:
+    if not previous_questions:
+        return []
+    latest_tokens = _context_topic_tokens(latest)
+    allow_history_fallback = any(marker in latest for marker in ["上面", "上述", "刚才", "上一条", "总结", "这艘船", "该船"]) or not latest
+    scored: list[tuple[int, int, str]] = []
+    for idx, item in enumerate(previous_questions):
+        compressed = _compress_context_text(item)
+        if not compressed:
+            continue
+        item_tokens = _context_topic_tokens(item)
+        shared_tokens = latest_tokens & item_tokens
+        significant_overlap = shared_tokens - GENERIC_CONTEXT_TOKENS
+        overlap = len(significant_overlap)
+        score = overlap * 3
+        if latest and any(marker in latest for marker in ["上面", "上述", "刚才", "上一条", "总结", "这艘船", "该船"]):
+            score += 2
+        if overlap > 0 and any(token in item.lower() for token in ["mmsi", "imo", "船名", "hifleet", "船队在线"]):
+            score += 1
+        scored.append((score, idx, compressed))
+
+    ranked = [(score, idx, item) for score, idx, item in sorted(scored, key=lambda value: (value[0], value[1]), reverse=True) if score > 0]
+    if ranked:
+        selected = sorted(ranked[:limit], key=lambda value: value[1])
+        ordered = []
+        for _, _, item in selected:
+            if item and item not in ordered:
+                ordered.append(item)
+        return ordered[-limit:]
+    if allow_history_fallback:
+        fallback = [_compress_context_text(item) for item in previous_questions[-limit:] if _compress_context_text(item)]
+        ordered = []
+        for item in fallback:
+            if item and item not in ordered:
+                ordered.append(item)
+        return ordered[-limit:]
+    return []
+
+
+def _build_context_summary(latest: str, relevant_questions: list[str], last_ship_name: str, last_ship_mmsi: str, last_ship_imo: str) -> str:
+    parts: list[str] = []
+    if relevant_questions:
+        parts.append("最近相关问题：" + " / ".join(relevant_questions[-3:]))
+    ship_bits = [bit for bit in [last_ship_name, f"MMSI {last_ship_mmsi}" if last_ship_mmsi else "", f"IMO {last_ship_imo}" if last_ship_imo else ""] if bit]
+    if ship_bits:
+        parts.append("最近船舶上下文：" + "，".join(ship_bits))
+    if not parts and latest:
+        parts.append("当前问题：" + _compress_context_text(latest))
+    return "；".join(parts)[:300]
+
+
 def build_conversation_context(messages: list[AnyMessage]) -> ConversationContext:
     user_texts: list[str] = []
     last_ship_name = ""
@@ -310,16 +396,32 @@ def build_conversation_context(messages: list[AnyMessage]) -> ConversationContex
                 last_ship_source = text
 
     latest = user_texts[-1] if user_texts else ""
-    previous = user_texts[-2] if len(user_texts) >= 2 else ""
+    previous_questions = user_texts[:-1]
+    compressed_recent_questions = [_compress_context_text(item) for item in previous_questions if _compress_context_text(item)]
+    relevant_recent_questions = _select_relevant_questions(previous_questions, latest)
+    previous = relevant_recent_questions[-1] if relevant_recent_questions else (compressed_recent_questions[-1] if compressed_recent_questions else "")
     return ConversationContext(
         latest_user_text=latest,
         previous_user_text=previous,
-        recent_user_questions=user_texts[:-1],
+        recent_user_questions=previous_questions,
+        compressed_recent_user_questions=compressed_recent_questions[-8:],
+        relevant_recent_user_questions=relevant_recent_questions,
+        context_summary=_build_context_summary(latest, relevant_recent_questions, last_ship_name, last_ship_mmsi, last_ship_imo),
         last_ship_name=last_ship_name,
         last_ship_mmsi=last_ship_mmsi,
         last_ship_imo=last_ship_imo,
         last_ship_source=last_ship_source,
     )
+
+
+def build_llm_context_window(context: ConversationContext, *, limit: int = 3) -> dict[str, Any]:
+    relevant_questions = list(context.relevant_recent_user_questions[-limit:])
+    previous_user_text = relevant_questions[-1] if relevant_questions else ""
+    return {
+        "previous_user_text": previous_user_text,
+        "recent_user_questions": relevant_questions,
+        "context_summary": context.context_summary,
+    }
 
 
 def extract_entities(text: str) -> MessageEntities:
@@ -383,6 +485,7 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
     q = normalize_message_text(text)
     lower = q.lower()
     context = context or ConversationContext()
+    relevant_context_text = " ".join(context.relevant_recent_user_questions or [])
     has_hifleet_feature = any(marker in lower for marker in HIFLEET_FEATURE_MARKERS)
     has_account_marker = any(marker in q for marker in HIFLEET_ACCOUNT_MARKERS)
     is_howto = any(marker in q for marker in HIFLEET_HOWTO_MARKERS)
@@ -420,7 +523,7 @@ def classify_message(text: str, entities: MessageEntities, context: Conversation
         return RouteDecision("knowledge", "platform_troubleshooting", KNOWLEDGE_BUNDLE, "simple", search_depth="normal", reason="ship concept troubleshooting (not specific ship)")
 
     # ══ 优先级 3：平台故障排查（明确 troubleshooting 标记 + 平台关键词）══
-    if is_troubleshooting and (any(m in lower for m in platform_markers) or any(m in context.previous_user_text.lower() for m in platform_markers)):
+    if is_troubleshooting and (any(m in lower for m in platform_markers) or any(m in relevant_context_text.lower() for m in platform_markers)):
         return RouteDecision("knowledge", "platform_troubleshooting", KNOWLEDGE_BUNDLE, "simple", search_depth="normal", reason="platform troubleshooting")
 
     # ══ 优先级 4：HiFleet 功能查询（平台特性 + howto + 无明确船舶实体）══
@@ -636,7 +739,7 @@ def build_customer_support_plan(
     problem_frame = {
         "user_goal": text or context.latest_user_text or "回答当前客服问题",
         "question_type": question_type,
-        "needs_context": bool(context.previous_user_text),
+        "needs_context": bool(context.context_summary),
         "needs_attachment": decision.route in {"chart_symbol", "multimodal_understanding", "file_task"},
         "needs_search": decision.route in {"knowledge", "chart_symbol", "multimodal_understanding", "browser_verify"},
         "ambiguity_level": "high" if missing_slot else ("medium" if len(hypotheses) > 1 else "low"),
@@ -767,7 +870,8 @@ def answer_conversation_memory(text: str, context: ConversationContext) -> str:
             "4. 审查时主要看三点：来源是否可信，结论是否能被多个线索支持，链接是否可访问。涉及截图时，还会把图中可见特征和检索到的符号定义互相核对。\n\n"
             "5. 最终回复不展示内部工具、日志或原始过程，只给客户可执行结论：先结论，再解释原因，再给操作建议；信息不够时只追问一个最关键问题。"
         )
-    if not context.recent_user_questions:
+    history_items = context.relevant_recent_user_questions or context.compressed_recent_user_questions or context.recent_user_questions
+    if not history_items:
         return "当前会话里还没有可总结的上一轮问题。"
     if any(m in q for m in ["哪个船", "哪一个船", "这艘船", "该船", "上一个我问的是哪个船"]):
         if context.last_ship_name or context.last_ship_mmsi or context.last_ship_imo:
@@ -775,7 +879,7 @@ def answer_conversation_memory(text: str, context: ConversationContext) -> str:
             return "你上面查询的船舶是" + "，".join(ship_bits) + "。"
         return "当前会话里没有识别到明确的船舶标识。"
     lines = []
-    for idx, item in enumerate(context.recent_user_questions[-8:], start=1):
+    for idx, item in enumerate(history_items[-8:], start=1):
         lines.append(f"{idx}. {item}")
     return "你上面主要问了这些问题：\n" + "\n".join(lines)
 
@@ -1152,6 +1256,18 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
     if "未检索到足够可信" in output and decision.task_type == "platform_troubleshooting":
         trace.fallback_reason = "normal_search_empty"
         output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": "deep"})
+    
+    # Fallback to agent_browser_deep_search if smart_search still returns no hits
+    if is_no_hit_text(output) and "agent_browser_deep_search" in tool_map:
+        trace.fallback_reason = "smart_search_empty_agent_browser_fallback"
+        browser_output = _invoke_tool(
+            tool_map,
+            trace,
+            "agent_browser_deep_search",
+            {"query": query},
+        )
+        if not is_no_hit_text(browser_output):
+            output = browser_output
 
     ok, invalid = validate_links(output)
     trace.check_result = {"links_ok": ok, "invalid_links": invalid}
@@ -1223,6 +1339,32 @@ def execute_planned_knowledge_chain(
             "depth": "deep",
             "purpose": "升级搜索深度后尝试获取更多信息",
         })
+    
+    # Fallback to agent_browser_deep_search if deep smart_search still returns no hits
+    if all(is_no_hit_text(item) for item in outputs) and "agent_browser_deep_search" in tool_map:
+        trace.fallback_reason = "smart_search_empty_agent_browser_fallback"
+        browser_query = _rewrite_hifleet_knowledge_query(question)
+        browser_output = _invoke_tool(
+            tool_map,
+            trace,
+            "agent_browser_deep_search",
+            {"query": browser_query},
+        )
+        if not is_no_hit_text(browser_output):
+            outputs.append(browser_output)
+            evidence_items.append({
+                "source_type": "public_web",
+                "source_name": "agent_browser_deep_search",
+                "url": "",
+                "snippet": _extract_search_answer(browser_output)[0][:240],
+                "supports": ["H1"],
+                "conflicts": [],
+                "authority": 0.6,  # Lower authority for public web results
+                "relevance": 0.6,
+                "query": browser_query,
+                "depth": "deep",
+                "purpose": "受控公开网页深度检索兜底",
+            })
     # 选择最佳输出：优先匹配高质量结果
     output = _select_best_evidence_output(outputs, evidence_items)
     ok, invalid = validate_links(output)

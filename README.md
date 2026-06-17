@@ -8,6 +8,7 @@
 - `employee_assistant`：内部数字员工 Agent，面向员工和后台，支持知识问答、业务工具、文件检查和受控 Python 分析。
 
 详细架构请优先阅读：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
+如果是在其他服务器上部署联调，先看：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`。
 
 ## 1. 核心目录
 
@@ -134,7 +135,9 @@ curl -N -X POST http://127.0.0.1:10123/stream_run \
 
 使用手册：`docs/ADMIN_BACKEND_SYSTEM_GUIDE.md`。
 
-开发者总览：`docs/ADMIN_PLATFORM_DEVELOPER_GUIDE.md`。
+异地部署联调：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`
+
+`agent-browser` 受控兜底：`docs/agent_browser_fallback_integration.md`
 
 ## 7. 测试
 
@@ -152,7 +155,8 @@ npm run build
 ## 8. 文档入口
 
 - 主架构：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`
+- 异地部署联调：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`
+- `agent-browser` 兜底链：`docs/agent_browser_fallback_integration.md`
 - 外部 API 接入：`docs/API_MULTI_USER_INTEGRATION.md`
 - 后台使用：`docs/ADMIN_BACKEND_SYSTEM_GUIDE.md`
-- 后台开发：`docs/ADMIN_PLATFORM_DEVELOPER_GUIDE.md`
 - 知识库维护：`docs/KNOWLEDGE_BASE_GUIDE.md`
