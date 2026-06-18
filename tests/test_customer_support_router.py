@@ -38,7 +38,7 @@ from agents.customer_support_router import (
     _rewrite_hifleet_knowledge_query,
 )
 from agents.customer_support_guard import sanitize_customer_output
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from skills.browser_verify.tools import (
     PREFERRED_HIFLEET_PAGES,
     _candidate_urls,
@@ -58,109 +58,150 @@ class FakeTool:
         return self.handler(args)
 
 
-def test_knowledge_chain_falls_back_to_agent_browser_when_smart_search_empty():
-    """Test that execute_knowledge_chain falls back to agent_browser_deep_search when smart_search returns no hits."""
+def test_knowledge_chain_escalates_to_web_search_agent_browser():
     call_sequence = []
-    
-    def smart_search_handler(args):
-        call_sequence.append("smart_search")
-        return "未检索到足够可信的信息"
-    
-    def browser_search_handler(args):
-        call_sequence.append("agent_browser_deep_search")
-        return "【互联网搜索结果】\n根据公开资料，HiFleet平台支持船舶轨迹查询功能..."
-    
-    smart_search = FakeTool("smart_search", smart_search_handler)
-    agent_browser = FakeTool("agent_browser_deep_search", browser_search_handler)
+
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: call_sequence.append("local_kb_search") or json.dumps(
+            {"tool": "local_kb_search", "status": "ok", "can_answer": False, "should_continue": True, "items": [], "summary": "no hit"},
+            ensure_ascii=False,
+        ),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: call_sequence.append("web_search") or json.dumps(
+            {
+                "tool": "web_search",
+                "query": args["query"],
+                "status": "ok",
+                "can_answer": False,
+                "should_continue": True,
+                "continue_with": "agent_browser",
+                "summary": "需要抓取正文",
+                "items": [{"title": "HiFleet 轨迹", "url": "https://www.hifleet.com/wp/communities/fleet/export", "snippet": "摘要不足", "is_hifleet_official": True}],
+                "best_urls": ["https://www.hifleet.com/wp/communities/fleet/export"],
+                "trace": {"result_profile": {"result_count": 1, "official_count": 1}, "request_profile": {}, "used_ark_fallback": False},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: call_sequence.append("web_search_agent_browser") or json.dumps(
+            {
+                "tool": "web_search_agent_browser",
+                "status": "ok",
+                "can_answer": True,
+                "pages": [
+                    {
+                        "title": "HiFleet 轨迹导出",
+                        "url": "https://www.hifleet.com/wp/communities/fleet/export",
+                        "excerpt": "HiFleet 平台支持在船舶详情页查看并导出船舶轨迹。",
+                        "official": True,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
     
     text = "HiFleet 船舶轨迹怎么导出"
     entities = extract_entities(text)
     decision = classify_message(text, entities)
     trace = make_trace(decision, entities, session_id="s1")
     
-    tool_map = {
-        "smart_search": smart_search,
-        "agent_browser_deep_search": agent_browser,
-    }
+    tool_map = {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser}
     output = execute_knowledge_chain(text, decision, tool_map, trace)
-    
-    # Verify tool call sequence
-    assert call_sequence == ["smart_search", "agent_browser_deep_search"]
-    assert trace.fallback_reason == "smart_search_empty_agent_browser_fallback"
-    assert "公开资料" in output or "互联网搜索" in output
+
+    assert call_sequence == ["local_kb_search", "web_search", "web_search_agent_browser"]
+    assert trace.reasoning_trace["retrieval_trace"]["t2_tool"] == "web_search_agent_browser"
+    assert "轨迹" in output
     
 
-def test_knowledge_chain_does_not_call_browser_when_smart_search_succeeds():
-    """Test that agent_browser_deep_search is NOT called when smart_search returns valid results."""
+def test_knowledge_chain_stops_when_local_kb_can_answer():
     call_sequence = []
-    
-    def smart_search_handler(args):
-        call_sequence.append("smart_search")
-        return "【优先匹配 - FAQ/标准回复】\n导出轨迹：在船舶详情页点击'导出轨迹'按钮..."
-    
-    def browser_search_handler(args):
-        call_sequence.append("agent_browser_deep_search")
-        return "【互联网搜索结果】\nShould not be called"
-    
-    smart_search = FakeTool("smart_search", smart_search_handler)
-    agent_browser = FakeTool("agent_browser_deep_search", browser_search_handler)
+
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: call_sequence.append("local_kb_search") or json.dumps(
+            {
+                "tool": "local_kb_search",
+                "status": "ok",
+                "can_answer": True,
+                "should_continue": False,
+                "items": [{"title": "轨迹导出", "content": "导出轨迹：在船舶详情页点击导出轨迹按钮。", "source_type": "faq", "score": 0.95}],
+                "summary": "hit",
+            },
+            ensure_ascii=False,
+        ),
+    )
+    web_search = FakeTool("web_search", lambda args: call_sequence.append("web_search") or "{}")
     
     text = "HiFleet 船舶轨迹怎么导出"
     entities = extract_entities(text)
     decision = classify_message(text, entities)
     trace = make_trace(decision, entities, session_id="s1")
     
-    tool_map = {
-        "smart_search": smart_search,
-        "agent_browser_deep_search": agent_browser,
-    }
+    tool_map = {"local_kb_search": local_kb, "web_search": web_search}
     output = execute_knowledge_chain(text, decision, tool_map, trace)
-    
-    # Verify browser was NOT called
-    assert call_sequence == ["smart_search"]
-    assert trace.fallback_reason is None or trace.fallback_reason != "smart_search_empty_agent_browser_fallback"
+
+    assert call_sequence == ["local_kb_search"]
     assert "导出轨迹" in output
 
 
-def test_planned_knowledge_chain_falls_back_to_agent_browser():
-    """Test that execute_planned_knowledge_chain falls back to agent_browser_deep_search."""
+def test_planned_knowledge_chain_escalates_to_web_search_agent_browser():
     call_sequence = []
-    
-    def smart_search_handler(args):
-        call_sequence.append(f"smart_search_{args.get('depth', 'unknown')}")
-        return "未检索到足够可信的信息"
-    
-    def browser_search_handler(args):
-        call_sequence.append("agent_browser_deep_search")
-        return "【互联网搜索结果】\n根据公开技术资料，该功能需要升级账户..."
-    
-    smart_search = FakeTool("smart_search", smart_search_handler)
-    agent_browser = FakeTool("agent_browser_deep_search", browser_search_handler)
+
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: call_sequence.append("local_kb_search") or json.dumps({"tool": "local_kb_search", "can_answer": False, "should_continue": True, "items": []}, ensure_ascii=False),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: call_sequence.append("web_search") or json.dumps(
+            {
+                "tool": "web_search",
+                "query": args["query"],
+                "can_answer": False,
+                "should_continue": True,
+                "continue_with": "agent_browser",
+                "items": [{"title": "API", "url": "https://www.hifleet.com/data/index.html", "snippet": "候选页面", "is_hifleet_official": True}],
+                "best_urls": ["https://www.hifleet.com/data/index.html"],
+                "trace": {"result_profile": {"result_count": 1, "official_count": 1}, "request_profile": {}, "used_ark_fallback": False},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: call_sequence.append("web_search_agent_browser") or json.dumps(
+            {
+                "tool": "web_search_agent_browser",
+                "can_answer": True,
+                "pages": [{"title": "HiFleet 数据服务", "url": "https://www.hifleet.com/data/index.html", "excerpt": "公开页面包含 API 数据服务说明。", "official": True}],
+            },
+            ensure_ascii=False,
+        ),
+    )
     
     text = "HiFleet API 调用频率限制是多少"
     entities = extract_entities(text)
     decision = classify_message(text, entities)
     trace = make_trace(decision, entities, session_id="s1")
     
-    tool_map = {
-        "smart_search": smart_search,
-        "agent_browser_deep_search": agent_browser,
-    }
+    tool_map = {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser}
     search_plan = [{"query": "API 频率限制", "depth": "quick", "hypothesis_id": "H1", "purpose": "测试"}]
     
     output, evidence_items, evidence_summary = execute_planned_knowledge_chain(
         text, decision, search_plan, tool_map, trace
     )
     
-    # Verify fallback occurred
-    assert "agent_browser_deep_search" in call_sequence
-    assert trace.fallback_reason == "smart_search_empty_agent_browser_fallback"
-    
-    # Verify evidence item was added
-    browser_evidence = [e for e in evidence_items if e.get("source_name") == "agent_browser_deep_search"]
+    assert call_sequence == ["local_kb_search", "web_search", "web_search_agent_browser"]
+
+    browser_evidence = [e for e in evidence_items if e.get("source_name") == "web_search_agent_browser"]
     assert len(browser_evidence) == 1
-    assert browser_evidence[0]["source_type"] == "public_web"
-    assert browser_evidence[0]["authority"] == 0.6
+    assert browser_evidence[0]["source_type"] == "official_site"
 
 
 def test_agent_browser_output_is_sanitized_for_customer():
@@ -295,10 +336,10 @@ def test_platform_question_kb_first_then_search_fallback():
     assert trace.check_result["links_ok"] is True
 
 
-def test_knowledge_quick_kb_falls_back_to_normal_when_weak():
+def test_knowledge_chain_compat_smart_search_does_not_drive_main_sequence():
     smart_search = FakeTool(
         "smart_search",
-        lambda args: "未找到精确的FAQ匹配" if args["depth"] == "quick" else "【优先匹配 - FAQ/标准回复】\n标准答案",
+        lambda args: "未找到精确的FAQ匹配",
     )
     text = "HiFleet 绿点是什么意思"
     entities = extract_entities(text)
@@ -307,10 +348,8 @@ def test_knowledge_quick_kb_falls_back_to_normal_when_weak():
 
     output = execute_knowledge_chain(text, decision, {"smart_search": smart_search}, trace)
 
-    assert [c["depth"] for c in smart_search.calls] == ["quick", "normal"]
-    assert "标准答案" in output
-    assert trace.fallback_reason == "quick_kb_weak_hit"
-    assert "优先匹配" not in output
+    assert [c["depth"] for c in smart_search.calls] == ["quick"]
+    assert trace.reasoning_trace["retrieval_trace"]["t1_eval_decision"] == "compat_smart_search"
     assert "回答指导" not in output
 
 
@@ -536,59 +575,113 @@ def test_authoritative_data_query_does_not_rewrite_into_hifleet_product_query():
     assert _generate_knowledge_expansion_query("今日长江水位", classify_message("今日长江水位", extract_entities("今日长江水位"))) == "今日长江水位 长江海事局 交通运输部"
 
 
-def test_authoritative_data_short_circuit_skips_browser_and_keeps_public_query(monkeypatch):
-    def smart_search_handler(args):
-        return "长江海事局发布今日长江水位数据。"
-
-    smart_search = FakeTool("smart_search", smart_search_handler)
-    agent_browser = FakeTool("agent_browser_deep_search", lambda args: "Should not be called")
+def test_authoritative_data_short_circuit_skips_browser_and_keeps_public_query():
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps({"tool": "local_kb_search", "can_answer": False, "should_continue": True, "items": []}, ensure_ascii=False),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: json.dumps(
+            {
+                "tool": "web_search",
+                "query": args["query"],
+                "can_answer": True,
+                "should_continue": False,
+                "continue_with": "none",
+                "summary": "命中权威公共页面且包含明确事实",
+                "items": [
+                    {
+                        "title": "长江水位日报",
+                        "url": "https://cj.msa.gov.cn/water/2026-06-18.html",
+                        "summary": "2026-06-18 长江水位 12.3 米",
+                        "snippet": "2026-06-18 长江水位 12.3 米",
+                        "authority_level": 1,
+                        "is_authoritative": True,
+                    }
+                ],
+                "best_urls": ["https://cj.msa.gov.cn/water/2026-06-18.html"],
+                "trace": {
+                    "request_profile": {"Filter": {"NeedContent": False, "NeedUrl": True, "AuthInfoLevel": 0}},
+                    "result_profile": {"result_count": 1, "authoritative_count": 1},
+                    "used_ark_fallback": False,
+                },
+            },
+            ensure_ascii=False,
+        ),
+    )
+    browser = FakeTool("web_search_agent_browser", lambda args: "Should not be called")
     text = "今日长江水位"
     entities = extract_entities(text)
     decision = classify_message(text, entities)
     trace = make_trace(decision, entities, session_id="s1")
 
-    monkeypatch.setattr(
-        "agents.customer_support_router._read_structured_search_trace",
-        lambda query, depth: {
-            "t0_kb_hit": False,
-            "t1_query": query,
-            "t1_payload_meta": {
-                "Query": query,
-                "SearchType": "web",
-                "Count": 5,
-                "NeedSummary": True,
-                "ContentFormats": "text",
-                "Filter": {"NeedContent": False, "NeedUrl": True, "AuthInfoLevel": 0},
-            },
-            "t1_source_count": 1,
-            "t1_official_source_count": 1,
-            "t1_used_ark_fallback": False,
-            "items": [
-                {
-                    "title": "长江水位日报",
-                    "url": "https://cj.msa.gov.cn/water/2026-06-18.html",
-                    "summary": "2026-06-18 长江水位 12.3 米",
-                    "snippet": "2026-06-18 长江水位 12.3 米",
-                    "authority_level": 1,
-                }
-            ],
-            "summary": "2026-06-18 长江水位 12.3 米",
-        },
-    )
+    output = execute_knowledge_chain(text, decision, {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser}, trace)
 
-    output = execute_knowledge_chain(
-        text,
-        decision,
-        {"smart_search": smart_search, "agent_browser_deep_search": agent_browser},
-        trace,
-    )
-
-    assert smart_search.calls == [{"query": "今日长江水位", "depth": "quick"}]
-    assert agent_browser.calls == []
+    assert local_kb.calls == [{"query": "今日长江水位"}]
+    assert web_search.calls[0]["query"] == "今日长江水位"
+    assert browser.calls == []
     assert trace.reasoning_trace["retrieval_trace"]["t1_eval_decision"] == "short_circuit"
     assert trace.reasoning_trace["retrieval_trace"]["t2_triggered"] is False
     assert trace.reasoning_trace["retrieval_trace"]["t1_payload_meta"]["Filter"].get("Sites") in {None, ""}
     assert "长江水位" in output
+
+
+def test_specific_satellite_ais_query_does_not_answer_from_weak_local_kb():
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps(
+            {
+                "tool": "local_kb_search",
+                "can_answer": False,
+                "should_continue": True,
+                "items": [
+                    {
+                        "title": "航运数据与API服务",
+                        "content": "HiFleet可提供船位实时AIS、历史AIS、历史航次、靠离港、船舶档案、港口、海图、气象等数据，并支持API、SDK、分析报告和行业解决方案。",
+                        "source_type": "wiki",
+                        "score": 0.58,
+                    },
+                    {
+                        "title": "账号注册与登录",
+                        "content": "点击页面右上角‘登录’后可免费注册，支持用户名注册、手机验证码注册和微信扫码注册。",
+                        "source_type": "faq",
+                        "score": 0.52,
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: json.dumps(
+            {
+                "tool": "web_search",
+                "query": args["query"],
+                "can_answer": False,
+                "should_continue": True,
+                "continue_with": "none",
+                "summary": "未命中足够具体的资料",
+                "items": [],
+                "best_urls": [],
+                "trace": {"request_profile": {"Filter": {"Sites": "hifleet.com"}}, "result_profile": {"result_count": 0}, "used_ark_fallback": False},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    text = "我想详细了解一下，Hifleet卫星AIS数据情况，有多少颗在轨AIS卫星？每日接收数据是多少？"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+
+    output = execute_knowledge_chain(text, decision, {"local_kb_search": local_kb, "web_search": web_search}, trace)
+
+    assert "免费注册" not in output
+    assert "下载APP" not in output
+    assert "HiFleet可提供船位实时AIS、历史AIS" not in output
+    assert trace.check_result["evidence_count"] == 0
+    assert trace.reasoning_trace["retrieval_trace"]["t1_source_count"] == 0
 
 
 def test_execute_knowledge_chain_prefers_understanding_primary_query(monkeypatch):
@@ -711,6 +804,27 @@ def test_ai_troubleshooting_reply_does_not_pollute_ship_context():
     assert context.last_ship_name == ""
     assert entities.ship_name == ""
     assert decision.task_type == "platform_troubleshooting"
+
+
+def test_conversation_context_reads_ship_entity_from_compressed_summary():
+    messages = [
+        SystemMessage(content="请用中文回复。"),
+        SystemMessage(
+            content=(
+                "历史上下文摘要：\n"
+                "用户此前咨询过：查询 MMSI 123456789 船位\n"
+                "最近确认的船舶实体：MMSI 123456789\n"
+                "除非用户明确引用历史，否则优先按当前最新问题独立处理。"
+            )
+        ),
+        HumanMessage(content="这艘船历史轨迹呢"),
+    ]
+
+    context = build_conversation_context(messages)
+    entities = resolve_entities_with_context(extract_entities(messages[-1].content), context)
+
+    assert context.last_ship_mmsi == "123456789"
+    assert entities.mmsi == "123456789"
 
 
 def test_conversation_context_compresses_and_filters_irrelevant_history():
@@ -1058,28 +1172,44 @@ def test_generic_device_complaint_asks_light_hifleet_context_question():
     assert "清理缓存" not in output
 
 
-def test_official_article_verification_uses_browser_even_when_smart_search_has_generic_site():
+def test_official_article_verification_uses_web_search_agent_browser_for_specific_page():
     calls = []
-    smart_search = FakeTool(
-        "smart_search",
-        lambda args: calls.append("smart_search") or "HiFleet 官方社区\nHiFleet 官方社区与产品信息入口\nhttps://www.hifleet.com/wp/communities",
+    local_kb = FakeTool("local_kb_search", lambda args: calls.append("local_kb_search") or json.dumps({"tool": "local_kb_search", "can_answer": False, "should_continue": True, "items": []}, ensure_ascii=False))
+    web_search = FakeTool(
+        "web_search",
+        lambda args: calls.append("web_search") or json.dumps(
+            {
+                "tool": "web_search",
+                "query": args["query"],
+                "can_answer": False,
+                "should_continue": True,
+                "continue_with": "agent_browser",
+                "items": [{"title": "注意！浏览器开始记忆船队“筛选”了", "url": "https://www.hifleet.com/wp/communities/example-filter-memory/", "snippet": "摘要不足", "is_hifleet_official": True}],
+                "best_urls": ["https://www.hifleet.com/wp/communities/example-filter-memory/"],
+                "trace": {"request_profile": {}, "result_profile": {"result_count": 1, "official_count": 1}, "used_ark_fallback": False},
+            },
+            ensure_ascii=False,
+        ),
     )
-    browser_payload = json.dumps(
-        {
-            "type": "hifleet_browser_evidence",
-            "query": "验证 注意！浏览器开始记忆船队“筛选”了 的详细内容",
-            "pages": [
-                {
-                    "title": "注意！浏览器开始记忆船队“筛选”了",
-                    "url": "https://www.hifleet.com/wp/communities/example-filter-memory/",
-                    "excerpt": "HiFleet 网页版新增浏览器记忆船队筛选功能，用户再次打开页面时可保留上一次筛选条件。",
-                    "official": True,
-                }
-            ],
-        },
-        ensure_ascii=False,
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: calls.append("web_search_agent_browser") or json.dumps(
+            {
+                "tool": "web_search_agent_browser",
+                "query": args["query"],
+                "can_answer": True,
+                "pages": [
+                    {
+                        "title": "注意！浏览器开始记忆船队“筛选”了",
+                        "url": "https://www.hifleet.com/wp/communities/example-filter-memory/",
+                        "excerpt": "HiFleet 网页版新增浏览器记忆船队筛选功能，用户再次打开页面时可保留上一次筛选条件。",
+                        "official": True,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
     )
-    browser = FakeTool("agent_browser_deep_search", lambda args: calls.append("agent_browser_deep_search") or browser_payload)
     text = "验证 注意！浏览器开始记忆船队“筛选”了 的详细内容"
     entities = extract_entities(text)
     decision = classify_message(text, entities)
@@ -1089,16 +1219,15 @@ def test_official_article_verification_uses_browser_even_when_smart_search_has_g
         text,
         decision,
         [{"query": text, "depth": "normal", "hypothesis_id": "H1", "purpose": "核验社区文章"}],
-        {"smart_search": smart_search, "agent_browser_deep_search": browser},
+        {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser},
         trace,
     )
 
-    assert "agent_browser_deep_search" in calls
+    assert calls == ["local_kb_search", "web_search", "web_search_agent_browser"]
     assert "浏览器记忆船队筛选功能" in output
     assert "example-filter-memory" in output
     assert evidence_summary["official_support_count"] >= 1
     assert trace.reasoning_trace["tool_summary"]["official_source_count"] >= 1
-
 
 def test_sanitize_customer_output_strips_more_search_noise_and_html_placeholders():
     raw = (

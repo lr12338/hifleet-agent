@@ -18,9 +18,11 @@ from agents.agent import (
     _run_customer_support_response_qa_agent,
     _run_customer_support_review_agent,
     _state_dict_from_model,
+    _windowed_messages,
     is_sensitive_internal_request,
 )
 from agents.profiles import AgentProfile
+from agents.profiles import get_profile
 from agents.customer_support_router import (
     Attachment,
     BROWSER_VERIFY_BUNDLE,
@@ -37,7 +39,7 @@ from agents.customer_support_router import (
 from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
 from skills.skill_loader import SkillLoader
 from skills.knowledge_qa.tools import HIFLEET_COMMUNITY_URL, HIFLEET_SITES
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 
 class FakeTool:
@@ -77,6 +79,43 @@ def test_customer_support_state_dict_supports_dataclass_entities():
 
     assert value["mmsi"] == "414726000"
     assert "urls" in value
+
+
+def test_windowed_messages_compresses_long_history_to_summary_and_latest_user():
+    history = [SystemMessage(content="请用中文回复。")]
+    for idx in range(10):
+        history.append(HumanMessage(content=f"历史无关问题 {idx}"))
+        history.append(AIMessage(content="综合摘要：\n查询1（旧问题）：请下载APP,手机查船更方便 smart_search"))
+    latest = HumanMessage(content="Hifleet卫星AIS数据情况，有多少颗在轨AIS卫星？每日接收数据是多少？")
+
+    messages = _windowed_messages(history, [latest])
+    contents = [str(getattr(msg, "content", "")) for msg in messages]
+
+    assert len(messages) == 3
+    assert isinstance(messages[0], SystemMessage)
+    assert isinstance(messages[1], SystemMessage)
+    assert isinstance(messages[2], HumanMessage)
+    assert "历史上下文摘要" in contents[1]
+    assert contents[-1] == latest.content
+    assert "综合摘要" not in contents[1]
+    assert "查询1" not in contents[1]
+    assert "下载APP" not in contents[1]
+    assert "smart_search" not in contents[1]
+
+
+def test_windowed_messages_preserves_ship_entity_in_compressed_summary():
+    history = [
+        SystemMessage(content="请用中文回复。"),
+        HumanMessage(content="查询 MMSI 123456789 船位"),
+        AIMessage(content="当前船位查询完成。"),
+    ]
+    latest = HumanMessage(content="这艘船历史轨迹呢")
+
+    messages = _windowed_messages(history * 4, [latest])
+    summary = next(str(msg.content) for msg in messages if isinstance(msg, SystemMessage) and "历史上下文摘要" in str(msg.content))
+
+    assert "MMSI 123456789" in summary
+    assert messages[-1].content == latest.content
 
 
 def test_customer_support_agent_imports_guard_refusal_constant():
@@ -276,6 +315,16 @@ def test_customer_support_new_skills_are_registered():
     names = {tool.name for tool in tools}
 
     assert {"inspect_media_attachment", "inspect_customer_file", "upload_customer_artifact", "verify_public_page", "agent_browser_deep_search"} <= names
+
+
+def test_employee_assistant_profile_loads_three_layer_knowledge_and_browser_bridge():
+    profile = get_profile("employee_assistant")
+    tools = SkillLoader.get_tools_by_skill_names(profile.skills)
+    names = {tool.name for tool in tools}
+
+    assert {"local_kb_search", "web_search", "web_search_agent_browser"} <= names
+    assert {"verify_public_page", "agent_browser_deep_search"} <= names
+    assert "smart_search" not in names
 
 
 def test_hifleet_community_is_registered_as_official_search_source():

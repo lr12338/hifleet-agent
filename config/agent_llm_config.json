@@ -32,7 +32,9 @@
     "get_port_detail",
     "upload_ship_position",
     "update_ship_static_info",
-    "smart_search",
+    "local_kb_search",
+    "web_search",
+    "web_search_agent_browser",
     "download_public_file_to_artifact",
     "inspect_tabular_file",
     "run_sandboxed_python"

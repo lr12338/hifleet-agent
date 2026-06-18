@@ -277,13 +277,18 @@ def format_web_result(web_results: dict) -> str:
     if web_results.get("summary"):
         parts.append(f"\n综合摘要：{web_results['summary'][:1000]}")
     for item in web_results.get("items", []):
-        parts.append(f"\n**{item['title']}** {item['authority_label']}")
-        if item["snippet"]:
+        authority_label = item.get("authority_label")
+        if authority_label is None and item.get("authority") is not None:
+            authority_label = get_authority_label(float(item["authority"]))
+        if authority_label is None:
+            authority_label = "🔴 待验证"
+        parts.append(f"\n**{item['title']}** {authority_label}")
+        if item.get("snippet"):
             parts.append(f"摘要: {item['snippet'][:300]}")
         if item.get("site_name"):
             parts.append(f"站点: {item['site_name']}")
         if item.get("publish_time"):
             parts.append(f"发布时间: {item['publish_time']}")
-        if item["url"]:
+        if item.get("url"):
             parts.append(f"🔗 {item['url']}")
     return "\n".join(parts)

@@ -43,7 +43,8 @@
       "skills": [
         "knowledge_qa",
         "hifleet_ship_service",
-        "employee_workspace"
+        "employee_workspace",
+        "browser_verify"
       ],
       "prompt_file": "config/profiles/employee_assistant.md",
       "max_iterations": 12,
@@ -53,7 +54,8 @@
         "allow_file_tools": true,
         "allow_python": true,
         "allow_write_actions": true,
-        "prefer_search_before_answer": true
+        "prefer_search_before_answer": true,
+        "allow_browser_verify": true
       },
       "disabled_tools": []
     }

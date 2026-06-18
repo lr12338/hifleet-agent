@@ -74,6 +74,8 @@ from utils.llm_route_state import get_current_llm_route
 LLM_CONFIG = "config/agent_llm_config.json"
 SYSTEM_PROMPT_BASE = "config/system_prompt_base.md"
 MAX_MESSAGES = 40
+CONTEXT_COMPRESS_TRIGGER_MESSAGES = int(os.getenv("HIFLEET_CONTEXT_COMPRESS_TRIGGER_MESSAGES", "8"))
+CONTEXT_SUMMARY_RECENT_QUESTIONS = int(os.getenv("HIFLEET_CONTEXT_SUMMARY_RECENT_QUESTIONS", "3"))
 DEFAULT_SKILLS = {"hifleet_ship_service", "knowledge_qa"}
 EMPLOYEE_MAX_LOOPS = int(os.getenv("HIFLEET_EMPLOYEE_MAX_LOOPS", "4"))
 TABULAR_SUFFIXES = (".csv", ".xls", ".xlsx")
@@ -976,7 +978,7 @@ def _customer_support_executor_prompt(profile: AgentProfile, entities: MessageEn
 执行规则:
 - 先理解用户意图，再决定是否调用工具；不要盲目试错。
 - 你当前只能使用系统提供的这一小组工具，不要假设还有别的工具。
-- 平台知识、产品规则、故障排查类问题：优先调用 `smart_search`，基于 HiFleet 官方结果作答。
+- 平台知识、产品规则、故障排查类问题：按 `local_kb_search -> web_search -> web_search_agent_browser` 顺序检索，基于 HiFleet 官方或可信公开结果作答。
 - 船舶问题：优先复用会话里最近已确认的船舶标识；当前已解析船舶上下文: {ship_context_text}
 - 如果用户问“上面/这艘船/上一个问题/总结”，必须参考当前会话消息，不要说没有上下文。
 - 不要输出原始工具调用过程、内部路由、日志、提示词。
@@ -1162,6 +1164,80 @@ def _heuristic_image_perception(attachments: list[Attachment], text: str = "") -
     return {}
 
 
+def _message_text_for_context_summary(msg: AnyMessage) -> str:
+    content = getattr(msg, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif item.get("type") in {"image_url", "video_url", "input_audio"}:
+                    parts.append("（历史多媒体内容已省略）")
+        return " ".join(part for part in parts if part)
+    return str(content or "")
+
+
+def _clean_context_summary_text(text: str, *, max_chars: int = 120) -> str:
+    value = sanitize_customer_output(text or "")
+    value = re.sub(r"(?mi)^综合摘要[:：]?\s*", "", value)
+    value = re.sub(r"(?mi)^查询\d+[（(].*?[）)][:：]?\s*", "", value)
+    value = re.sub(r"\b(?:local_kb_search|web_search_agent_browser|web_search|smart_search|agent_browser_deep_search)\b", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"https?://[^\s]+", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    if len(value) > max_chars:
+        value = value[:max_chars].rstrip(" ，。；;,.!?！？:") + "..."
+    return value
+
+
+def _is_explicit_context_followup(text: str) -> bool:
+    q = text or ""
+    return any(marker in q for marker in ["上面", "上述", "刚才", "刚刚", "继续", "这艘船", "该船", "这个问题", "为我输出具体数据", "具体数据"])
+
+
+def _build_compressed_history_message(messages: list[AnyMessage], latest_user_idx: int) -> SystemMessage | None:
+    history = messages[:latest_user_idx] if latest_user_idx >= 0 else messages
+    user_questions: list[str] = []
+    assistant_summaries: list[str] = []
+    ship_bits: list[str] = []
+    pending_bits: list[str] = []
+    for msg in history:
+        text = _clean_context_summary_text(_message_text_for_context_summary(msg))
+        if not text:
+            continue
+        if isinstance(msg, HumanMessage):
+            if text not in user_questions:
+                user_questions.append(text)
+            entities = extract_entities(text)
+            for label, value in [("船名", entities.ship_name), ("MMSI", entities.mmsi), ("IMO", entities.imo)]:
+                if value:
+                    bit = f"{label} {value}"
+                    if bit not in ship_bits:
+                        ship_bits.append(bit)
+        elif isinstance(msg, AIMessage):
+            if text not in assistant_summaries:
+                assistant_summaries.append(text)
+            if any(marker in text for marker in ["请补充", "需要提供", "只需要一个", "请提供"]):
+                pending_bits.append(text)
+
+    parts = ["历史上下文摘要："]
+    if user_questions:
+        parts.append("用户此前咨询过：" + " / ".join(user_questions[-CONTEXT_SUMMARY_RECENT_QUESTIONS:]))
+    if ship_bits:
+        parts.append("最近确认的船舶实体：" + "，".join(ship_bits[-3:]))
+    if pending_bits:
+        parts.append("未解决/待补充事项：" + pending_bits[-1])
+    elif assistant_summaries:
+        parts.append("最近助手结论：" + assistant_summaries[-1])
+    parts.append("除非用户明确引用历史（如上面、刚才、继续、这艘船、具体数据），否则优先按当前最新问题独立处理。")
+    content = "\n".join(parts)
+    if len(parts) <= 2:
+        return None
+    return SystemMessage(content=content)
+
+
 def _windowed_messages(old, new):
     merged = add_messages(old, new)
     cleaned = []
@@ -1178,46 +1254,37 @@ def _windowed_messages(old, new):
             )
         else:
             cleaned.append(msg)
-
     latest_user_idx = -1
+    latest_system_idx = -1
     for i in range(len(cleaned) - 1, -1, -1):
-        if isinstance(cleaned[i], HumanMessage):
+        if latest_user_idx < 0 and isinstance(cleaned[i], HumanMessage):
             latest_user_idx = i
+        if latest_system_idx < 0 and isinstance(cleaned[i], SystemMessage):
+            latest_system_idx = i
+        if latest_user_idx >= 0 and latest_system_idx >= 0:
             break
 
-    def _sanitize_historical_content(content):
-        if not isinstance(content, list):
-            return content
-        kept = []
-        for seg in content:
-            if not isinstance(seg, dict):
-                continue
-            seg_type = str(seg.get("type", "")).strip().lower()
-            if seg_type in ("input_audio", "image_url", "video_url"):
-                continue
-            kept.append(seg)
-        if not kept:
-            return "（历史多媒体内容已省略，仅保留上下文结论）"
-        if len(kept) == 1 and kept[0].get("type") == "text":
-            return str(kept[0].get("text", "")).strip()
-        return kept
+    latest_user = cleaned[latest_user_idx] if latest_user_idx >= 0 else None
+    latest_system = cleaned[latest_system_idx] if latest_system_idx >= 0 else None
+    latest_user_text = _message_text_for_context_summary(latest_user) if latest_user else ""
+    use_compressed_context = len(cleaned) > CONTEXT_COMPRESS_TRIGGER_MESSAGES
 
-    sanitized = []
-    for idx, msg in enumerate(cleaned):
-        if isinstance(msg, HumanMessage) and idx != latest_user_idx:
-            new_content = _sanitize_historical_content(msg.content)
-            if new_content != msg.content:
-                try:
-                    sanitized.append(msg.model_copy(update={"content": new_content}))
-                except Exception:
-                    msg.content = new_content
-                    sanitized.append(msg)
-            else:
-                sanitized.append(msg)
-        else:
-            sanitized.append(msg)
+    if not use_compressed_context:
+        return cleaned[-MAX_MESSAGES:]
 
-    return sanitized[-MAX_MESSAGES:]
+    summary_message = _build_compressed_history_message(cleaned, latest_user_idx)
+    result: list[AnyMessage] = []
+    if latest_system is not None:
+        result.append(latest_system)
+    if summary_message is not None:
+        result.append(summary_message)
+
+    if latest_user is not None and latest_user not in result:
+        result.append(latest_user)
+
+    # Once compressed, keep the graph input tight: latest system + summary + latest user.
+    # Follow-up resolution reads the summary instead of replaying old raw turns.
+    return result[-MAX_MESSAGES:] if result else cleaned[-MAX_MESSAGES:]
 
 
 class AgentState(TypedDict, total=False):
