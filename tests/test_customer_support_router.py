@@ -591,6 +591,58 @@ def test_authoritative_data_short_circuit_skips_browser_and_keeps_public_query(m
     assert "长江水位" in output
 
 
+def test_execute_knowledge_chain_prefers_understanding_primary_query(monkeypatch):
+    smart_search = FakeTool("smart_search", lambda args: "这是检索结果")
+    agent_browser = FakeTool("agent_browser_deep_search", lambda args: "Should not be called")
+    text = "Hifleet筛选船队有记忆功能吗"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities, session_id="s2")
+    trace.reasoning_trace = {
+        "understanding_result": {
+            "query_type": "hifleet_product",
+            "rewritten_user_need": "用户想确认 HiFleet 平台中筛选船队后，筛选条件是否会被记住并在下次继续生效",
+            "search_keywords": ["hifleet", "筛选船队", "记忆功能"],
+            "search_query_candidates": ["hifleet 筛选船队 记忆功能", "HiFleet 船队筛选 条件记忆"],
+            "should_prefer_local_kb": True,
+            "should_limit_to_hifleet_sites": True,
+        }
+    }
+
+    monkeypatch.setattr(
+        "agents.customer_support_router._read_structured_search_trace",
+        lambda query, depth: {
+            "t0_kb_hit": False,
+            "t1_query": query,
+            "t1_payload_meta": {
+                "Query": query,
+                "SearchType": "web",
+                "Count": 5,
+                "NeedSummary": True,
+                "ContentFormats": "text",
+                "Filter": {"NeedContent": False, "NeedUrl": True, "AuthInfoLevel": 0, "Sites": "hifleet.com"},
+            },
+            "t1_source_count": 1,
+            "t1_official_source_count": 0,
+            "t1_used_ark_fallback": False,
+            "items": [],
+            "summary": "",
+        },
+    )
+    monkeypatch.setattr("agents.customer_support_router._evaluate_t1_results", lambda *args, **kwargs: {"decision": "short_circuit", "reason": "enough", "best_urls": [], "fallback_reason": "t1_short_circuit_default"})
+
+    execute_knowledge_chain(
+        text,
+        decision,
+        {"smart_search": smart_search, "agent_browser_deep_search": agent_browser},
+        trace,
+    )
+
+    assert smart_search.calls[0]["query"] == "hifleet 筛选船队 记忆功能"
+    assert trace.reasoning_trace["retrieval_trace"]["understanding_primary_query"] == "hifleet 筛选船队 记忆功能"
+    assert trace.reasoning_trace["understanding_summary"]["query_type"] == "hifleet_product"
+
+
 def test_history_track_permission_answer_is_concise_and_domain_correct():
     question = "基础版的历史轨迹可查多久前的"
     entities = extract_entities(question)

@@ -698,6 +698,7 @@ def _planner_search_plan(
     perception: dict[str, Any],
     attachments: list[Attachment],
     hypotheses: list[dict[str, Any]],
+    understanding_result: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     source_priority = ["local_kb", "official_site", "official_community", "public_web"]
     if decision.route == "conversation":
@@ -730,11 +731,11 @@ def _planner_search_plan(
         return [{"hypothesis_id": "H1", "query": text, "depth": decision.search_depth or "normal", "source_priority": source_priority, "purpose": "核验官方网页与公开信息"}]
     if decision.route == "knowledge":
         # 多角度检索：主查询 + 补充角度，确保覆盖平台功能、使用场景、常见问题
-        primary_query = _rewrite_hifleet_knowledge_query(text)
+        primary_query = _understanding_primary_query(understanding_result, text)
         primary_depth = decision.search_depth or "quick"
         plan = [{"hypothesis_id": "H1", "query": primary_query, "depth": primary_depth, "source_priority": source_priority, "purpose": "从知识库和官方资料回答核心问题"}]
         # 生成补充检索词
-        expansion_query = _generate_knowledge_expansion_query(text, decision)
+        expansion_query = _generate_knowledge_expansion_query(text, decision, understanding_result)
         if expansion_query and expansion_query != primary_query:
             plan.append({"hypothesis_id": "H2", "query": expansion_query, "depth": "normal", "source_priority": source_priority, "purpose": "补充产品能力和使用场景信息"})
         return plan
@@ -748,11 +749,12 @@ def build_customer_support_plan(
     context: ConversationContext,
     attachments: list[Attachment],
     perception: dict[str, Any],
+    understanding_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     missing_slot = _planner_missing_slot(decision, entities, attachments, perception)
     question_type = _planner_question_type(decision)
     hypotheses = _planner_hypotheses(decision, perception)
-    search_plan = _planner_search_plan(text, decision, perception, attachments, hypotheses)
+    search_plan = _planner_search_plan(text, decision, perception, attachments, hypotheses, understanding_result)
     response_mode = "use_harness" if decision.route in HARNESSED_ROUTES else "direct_answer"
     if missing_slot and decision.route in PLANNER_DIRECT_ROUTES:
         response_mode = "ask_one_question"
@@ -1010,6 +1012,30 @@ def _build_authoritative_data_expansion_query(question: str) -> str:
     return q
 
 
+def _understanding_primary_query(understanding_result: dict[str, Any] | None, fallback_text: str) -> str:
+    result = dict(understanding_result or {})
+    candidates = result.get("search_query_candidates")
+    if isinstance(candidates, list):
+        for item in candidates:
+            query = normalize_message_text(str(item or ""))
+            if query:
+                return query
+    return _rewrite_hifleet_knowledge_query(fallback_text)
+
+
+def _understanding_summary_for_trace(understanding_result: dict[str, Any] | None) -> dict[str, Any]:
+    result = dict(understanding_result or {})
+    candidates = list(result.get("search_query_candidates", []) or [])
+    return {
+        "query_type": str(result.get("query_type", "")),
+        "rewritten_user_need": str(result.get("rewritten_user_need", "")),
+        "search_keywords": list(result.get("search_keywords", []) or []),
+        "understanding_primary_query": str(candidates[0] if candidates else ""),
+        "should_prefer_local_kb": bool(result.get("should_prefer_local_kb")),
+        "should_limit_to_hifleet_sites": bool(result.get("should_limit_to_hifleet_sites")),
+    }
+
+
 def _rewrite_hifleet_knowledge_query(question: str) -> str:
     """Rewrite query to add HiFleet product context for better KB retrieval."""
     q = normalize_message_text(question)
@@ -1029,8 +1055,14 @@ def _rewrite_hifleet_knowledge_query(question: str) -> str:
     return q
 
 
-def _generate_knowledge_expansion_query(text: str, decision: RouteDecision) -> str:
+def _generate_knowledge_expansion_query(text: str, decision: RouteDecision, understanding_result: dict[str, Any] | None = None) -> str:
     """Generate a complementary search query from a different angle."""
+    result = dict(understanding_result or {})
+    candidates = list(result.get("search_query_candidates", []) or [])
+    if len(candidates) >= 2:
+        query = normalize_message_text(str(candidates[1] or ""))
+        if query:
+            return query
     q = normalize_message_text(text).lower()
     if _looks_like_authoritative_data_query(text):
         return _build_authoritative_data_expansion_query(text)
@@ -1594,11 +1626,17 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         trace.answer_confidence = "high"
         return format_customer_answer(direct_answer)
 
-    depth = decision.search_depth or "quick"
-    query = _rewrite_hifleet_knowledge_query(text)
+    understanding_result = dict((trace.reasoning_trace or {}).get("understanding_result", {}) or {})
+    understanding_summary = _understanding_summary_for_trace(understanding_result)
+    depth = decision.search_depth or ("normal" if understanding_summary.get("query_type") in {"authoritative_public_data", "shipping_general_knowledge", "hifleet_troubleshooting"} else "quick")
+    query = _understanding_primary_query(understanding_result, text)
     outputs: list[str] = []
     evidence_items: list[dict[str, Any]] = []
     retrieval_trace: dict[str, Any] = {
+        "understanding_query_type": understanding_summary.get("query_type", ""),
+        "understanding_keywords": list(understanding_summary.get("search_keywords", []) or []),
+        "understanding_primary_query": understanding_summary.get("understanding_primary_query", ""),
+        "understanding_rewritten_need": understanding_summary.get("rewritten_user_need", ""),
         "t0_kb_hit": False,
         "t1_query": query,
         "t1_payload_meta": {},
@@ -1675,7 +1713,7 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
             {
                 "query": query,
                 "target_urls": "\n".join(retrieval_trace["t2_target_urls"]),
-                "site_hint": "hifleet.com" if _looks_like_hifleet_product_query(text) else "",
+                "site_hint": "hifleet.com" if understanding_summary.get("should_limit_to_hifleet_sites") or _looks_like_hifleet_product_query(text) else "",
             },
         )
         if not is_no_hit_text(browser_output):
@@ -1696,6 +1734,7 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         evidence_items,
         "先直接回答用户核心问题，再补必要操作步骤或核验来源。",
     )
+    trace.reasoning_trace["understanding_summary"] = understanding_summary
     trace.reasoning_trace["retrieval_trace"] = retrieval_trace
     if invalid:
         cleaned = output
@@ -1717,12 +1756,20 @@ def execute_planned_knowledge_chain(
     tool_map: dict[str, Any],
     trace: HarnessTrace,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
-    queries = search_plan or [{"query": _rewrite_hifleet_knowledge_query(question), "depth": decision.search_depth or "quick", "hypothesis_id": "H1", "purpose": "回答当前问题"}]
+    understanding_result = dict((trace.reasoning_trace or {}).get("understanding_result", {}) or {})
+    understanding_summary = _understanding_summary_for_trace(understanding_result)
+    primary_query = _understanding_primary_query(understanding_result, question)
+    default_depth = decision.search_depth or ("normal" if understanding_summary.get("query_type") in {"authoritative_public_data", "shipping_general_knowledge", "hifleet_troubleshooting"} else "quick")
+    queries = search_plan or [{"query": primary_query, "depth": default_depth, "hypothesis_id": "H1", "purpose": "回答当前问题"}]
     outputs: list[str] = []
     evidence_items: list[dict[str, Any]] = []
     found_high_quality = False
     structured_trace: dict[str, Any] = {}
     retrieval_trace: dict[str, Any] = {
+        "understanding_query_type": understanding_summary.get("query_type", ""),
+        "understanding_keywords": list(understanding_summary.get("search_keywords", []) or []),
+        "understanding_primary_query": understanding_summary.get("understanding_primary_query", ""),
+        "understanding_rewritten_need": understanding_summary.get("rewritten_user_need", ""),
         "t0_kb_hit": False,
         "t1_query": "",
         "t1_payload_meta": {},
@@ -1735,7 +1782,7 @@ def execute_planned_knowledge_chain(
         "t2_target_urls": [],
     }
     for item in queries:
-        query = str(item.get("query", "")).strip() or _rewrite_hifleet_knowledge_query(question)
+        query = str(item.get("query", "")).strip() or primary_query
         depth = str(item.get("depth", "")).strip() or decision.search_depth or "quick"
         output = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
         outputs.append(output)
@@ -1760,7 +1807,7 @@ def execute_planned_knowledge_chain(
     # 如果所有查询都未命中，尝试升级搜索深度
     if not found_high_quality and outputs and all(is_no_hit_text(item) for item in outputs):
         trace.fallback_reason = trace.fallback_reason or "all_queries_weak_hit"
-        escalated_query = _rewrite_hifleet_knowledge_query(question)
+        escalated_query = primary_query
         escalated_output = _invoke_tool(tool_map, trace, "smart_search", {"query": escalated_query, "depth": "deep"})
         outputs.append(escalated_output)
         evidence_items.extend(
@@ -1799,7 +1846,7 @@ def execute_planned_knowledge_chain(
         else:
             trace.fallback_reason = str(t1_eval.get("fallback_reason") or trace.fallback_reason or "official_browser_verification")
         retrieval_trace["t2_triggered"] = True
-        browser_query = _rewrite_hifleet_knowledge_query(question)
+        browser_query = primary_query
         browser_output = _invoke_tool(
             tool_map,
             trace,
@@ -1807,7 +1854,7 @@ def execute_planned_knowledge_chain(
             {
                 "query": browser_query,
                 "target_urls": "\n".join(retrieval_trace["t2_target_urls"]),
-                "site_hint": "hifleet.com" if _looks_like_hifleet_product_query(question) else "",
+                "site_hint": "hifleet.com" if understanding_summary.get("should_limit_to_hifleet_sites") or _looks_like_hifleet_product_query(question) else "",
             },
         )
         if not is_no_hit_text(browser_output):
@@ -1850,6 +1897,7 @@ def execute_planned_knowledge_chain(
         evidence_items,
         "先给结论，再按必要步骤/说明组织客服回复，最后保留一个官方链接或关键追问。",
     )
+    trace.reasoning_trace["understanding_summary"] = understanding_summary
     trace.reasoning_trace["retrieval_trace"] = retrieval_trace
     if "上传" in question and "航线" in question and any(marker in question for marker in ["不了", "失败", "怎么办", "无法"]):
         return _format_route_upload_troubleshooting(output), evidence_items, evidence_summary

@@ -402,18 +402,26 @@ def test_customer_support_intent_agent_enforces_write_policy(monkeypatch):
 
     assert result["intent"] == "ship_update"
     assert result["task_type"] == "platform_knowledge"
+    assert result["rewritten_user_need"] == "帮我更新这条船的船位"
+    assert result["search_query_candidates"]
 
 
 def test_customer_support_intent_agent_uses_compressed_context_payload(monkeypatch):
     captured = {}
 
-    def fake_json_agent(ctx, cfg, system_prompt, payload):
+    def fake_json_agent(ctx, cfg, system_prompt, payload, model_override=""):
         captured["payload"] = payload
         return {
             "intent": "knowledge",
             "confidence": "high",
             "use_context_ship": False,
             "why": "压缩上下文后仍可判断为知识问题",
+            "rewritten_user_need": "用户想了解今天上海天气情况",
+            "query_type": "shipping_general_knowledge",
+            "search_keywords": ["今天", "上海天气"],
+            "search_query_candidates": ["今天 上海天气"],
+            "should_prefer_local_kb": False,
+            "should_limit_to_hifleet_sites": False,
         }
 
     monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", fake_json_agent)
@@ -438,18 +446,27 @@ def test_customer_support_intent_agent_uses_compressed_context_payload(monkeypat
     assert captured["payload"]["context_summary"]
     assert "当前问题" in captured["payload"]["context_summary"]
     assert all("..." not in item or len(item) <= 93 for item in captured["payload"]["recent_user_questions"])
+    assert result["query_type"] == "shipping_general_knowledge"
+    assert result["search_query_candidates"][0] == "今天 上海天气"
 
 
 def test_customer_support_intent_agent_payload_includes_attachments_and_perception(monkeypatch):
     captured = {}
 
-    def fake_json_agent(ctx, cfg, system_prompt, payload):
+    def fake_json_agent(ctx, cfg, system_prompt, payload, model_override=""):
         captured["payload"] = payload
         return {
             "intent": "chart_symbol",
             "confidence": "high",
             "reason_summary": "截图里是海图符号咨询",
             "use_context_ship": False,
+            "rewritten_user_need": "用户想确认截图中的海图圆圈符号含义",
+            "query_type": "multimodal_symbol",
+            "search_keywords": ["HiFleet 海图", "红色圆圈", "符号含义"],
+            "search_query_candidates": ["HiFleet 海图 红色圆圈 符号含义"],
+            "needs_multimodal_grounding": True,
+            "should_prefer_local_kb": False,
+            "should_limit_to_hifleet_sites": False,
         }
 
     monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", fake_json_agent)
@@ -477,6 +494,44 @@ def test_customer_support_intent_agent_payload_includes_attachments_and_percepti
     assert result["route"] == "chart_symbol"
     assert captured["payload"]["attachments"][0]["type"] == "image"
     assert captured["payload"]["perception"]["suspected_symbol"] == "安全水域浮标"
+    assert result["needs_multimodal_grounding"] is True
+    assert result["query_type"] == "multimodal_symbol"
+
+
+def test_customer_support_intent_agent_returns_understanding_fields(monkeypatch):
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "intent": "knowledge",
+            "confidence": "high",
+            "reason_summary": "用户在询问 HiFleet 平台功能细节",
+            "use_context_ship": False,
+            "rewritten_user_need": "用户想确认 HiFleet 平台中筛选船队后，筛选条件是否会被记住并在下次继续生效",
+            "query_type": "hifleet_product",
+            "search_keywords": ["hifleet", "筛选船队", "记忆功能"],
+            "search_query_candidates": ["hifleet 筛选船队 记忆功能", "HiFleet 船队筛选 条件记忆"],
+            "needs_multimodal_grounding": False,
+            "should_prefer_local_kb": True,
+            "should_limit_to_hifleet_sites": True,
+        },
+    )
+
+    result = _run_customer_support_intent_agent(
+        ctx=None,
+        cfg={"config": {}},
+        messages=[HumanMessage(content="Hifleet筛选船队有记忆功能吗")],
+        text="Hifleet筛选船队有记忆功能吗",
+        entities=extract_entities("Hifleet筛选船队有记忆功能吗"),
+        context=build_conversation_context([HumanMessage(content="Hifleet筛选船队有记忆功能吗")]),
+        allow_write=True,
+    )
+
+    assert result["rewritten_user_need"].startswith("用户想确认")
+    assert result["query_type"] == "hifleet_product"
+    assert result["search_keywords"] == ["hifleet", "筛选船队", "记忆功能"]
+    assert result["search_query_candidates"][0] == "hifleet 筛选船队 记忆功能"
+    assert result["should_prefer_local_kb"] is True
+    assert result["should_limit_to_hifleet_sites"] is True
 
 
 def test_perception_agent_returns_file_metadata_without_llm():

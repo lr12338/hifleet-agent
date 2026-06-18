@@ -66,7 +66,7 @@ from agents.customer_support_router import (
 )
 from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
 from coze_coding_utils.runtime_ctx.context import default_headers
-from llm_config import load_llm_config
+from llm_config import DEFAULT_MULTIMODAL_MODEL, load_llm_config
 from skills import SkillLoader
 from storage.memory.memory_saver import get_memory_saver
 from utils.llm_route_state import get_current_llm_route
@@ -81,8 +81,17 @@ TABULAR_SUFFIXES = (".csv", ".xls", ".xlsx")
 logger = logging.getLogger(__name__)
 
 
-CUSTOMER_SUPPORT_INTENT_PROMPT = """你是 HiFleet 客服消息分流器。
-请根据当前用户最后一条消息和可见会话上下文，判断客服意图，并只返回 JSON。
+CUSTOMER_SUPPORT_UNDERSTANDING_PROMPT = """你是 HiFleet 客服系统的需求理解 agent。
+你的任务不是回答用户，而是基于用户最后一条消息、可见会话上下文、附件信息与附件识别结果 perception（如果有），输出结构化 JSON，供后续路由、知识库检索和联网检索使用。
+
+你必须同时完成以下任务：
+1. 判断当前请求的主要意图
+2. 将用户原话重构为更清晰、可检索的需求描述
+3. 提炼 2 到 5 个高价值检索关键词
+4. 生成 1 到 3 条适合检索的 query
+5. 判断该问题是否应优先本地知识库
+6. 判断联网检索时是否应限制到 HiFleet 官方站点
+7. 如果信息不足，只指出一个最关键缺失项
 
 可选 intent:
 - conversation: 总结上文、回看上一条问题、询问上一个船舶
@@ -97,17 +106,68 @@ CUSTOMER_SUPPORT_INTENT_PROMPT = """你是 HiFleet 客服消息分流器。
 - browser_verify: 需要验证公开网页或 HiFleet 官方社区信息
 - multimodal_understanding: 图片/语音/视频理解
 
-判断要求:
+query_type 只允许：
+- hifleet_product
+- hifleet_troubleshooting
+- authoritative_public_data
+- shipping_general_knowledge
+- ship_query
+- multimodal_symbol
+- file_task
+- browser_verify
+
+规则：
 - 默认这是 HiFleet 客服场景；但明显闲聊、泛化电脑/网络问题不要硬套 HiFleet。
+- 如果有附件，必须优先结合附件和 perception 理解用户真实诉求。
 - 如果有附件识别结果 perception，应优先结合 perception 判断：截图像海图/地图符号时优先 chart_symbol；截图有 Error/失败/加载异常时优先 troubleshooting；文件/表格类附件优先 file_task。
 - 不要因为出现“船位/更新”就默认 ship_update；像“船位更新很慢”“为什么更新这么慢”属于 knowledge。
 - 对“上面/这艘船/上一条/总结”等强依赖上下文的问题，优先结合上下文理解，不要忽略会话历史。
 - 如果当前问题是船舶追问，但本轮没写船名/MMSI/IMO，只要上下文里已有明确船舶，可以标记 use_context_ship=true。
 - 明确要求修改/上传/更新船舶数据时才标记 ship_update；只是在问平台显示或更新慢时不要标记 ship_update。
 - 避免过度分类，拿不准时优先 knowledge。
+- 如果问题是公共权威数据查询，例如今日长江水位、指数、运价、政策、法规更新，不要强行加 HiFleet，不要建议限制到 HiFleet 官方站点。
+- 如果问题是 HiFleet 平台功能、产品介绍、权限、配置、教程、帮助、常见故障，关键词必须保留具体功能词，不要泛化成“产品功能 使用说明”。
+- search_keywords 应尽量短，偏名词短语，不要写成长句。
+- search_query_candidates 应适合直接用于知识库检索或搜索引擎检索，优先关键词组合，不要简单复读原问题。
+- rewritten_user_need 要表达“用户真正想确认什么”，不是复述，也不是回答。
+- 若附件是海图/符号截图，优先考虑 chart_symbol 或 multimodal_understanding，不要误判为普通 knowledge。
+- 若附件或文字显示是页面报错、上传失败、功能异常，优先考虑 troubleshooting。
+
+query_type 判定规则：
+- HiFleet 功能、产品、入口、权限、教程、帮助中心、社区文章 -> hifleet_product
+- HiFleet 上传失败、加载失败、不显示、延迟、报错、异常 -> hifleet_troubleshooting
+- 今日/今天/最新/最近的水位、运价、指数、政策、官方公告 -> authoritative_public_data
+- 航运常识、AIS 原理、海事术语、通用行业知识 -> shipping_general_knowledge
+- 船位、档案、PSC、航次等船舶实体查询 -> ship_query
+- 图片中的海图符号、颜色、标志识别 -> multimodal_symbol
+- 文件分析任务 -> file_task
+- 公开网页内容核验 -> browser_verify
+
+Few-shot:
+输入：Hifleet筛选船队有记忆功能吗
+输出：
+{"intent":"knowledge","confidence":"high","reason_summary":"用户在询问 HiFleet 平台具体功能细节","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户想确认 HiFleet 平台中筛选船队后，筛选条件是否会被记住并在下次继续生效","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能","HiFleet 船队筛选 条件记忆","HiFleet 筛选船队 是否保留筛选条件"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true}
+
+输入：今日长江水位
+输出：
+{"intent":"knowledge","confidence":"high","reason_summary":"用户在查询公共权威实时数据","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户想获取今天的长江水位官方数据和可核验来源","query_type":"authoritative_public_data","search_keywords":["今日","长江水位","长江海事局","交通运输部"],"search_query_candidates":["今日长江水位 长江海事局 交通运输部","今天长江水位 官方公告","长江水位 今日 官方数据"],"needs_multimodal_grounding":false,"should_prefer_local_kb":false,"should_limit_to_hifleet_sites":false}
+
+输入：智能视频监控
+输出：
+{"intent":"knowledge","confidence":"medium","reason_summary":"HiFleet 客服语境下是产品能力咨询","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户想了解 HiFleet 智能视频监控产品的功能和使用场景","query_type":"hifleet_product","search_keywords":["hifleet","智能视频监控","功能"],"search_query_candidates":["hifleet 智能视频监控","HiFleet 智能视频监控 功能","HiFleet 视频监控 使用场景"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true}
+
+输入：这个红色圆圈是什么意思（附海图截图）
+输出：
+{"intent":"chart_symbol","confidence":"high","reason_summary":"用户在询问海图符号含义","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户想确认截图中的海图符号具体含义","query_type":"multimodal_symbol","search_keywords":["HiFleet 海图","红色圆圈","符号含义"],"search_query_candidates":["HiFleet 海图 红色圆圈 符号含义","海图 红色圆圈 标志","HiFleet 海图 符号 识别"],"needs_multimodal_grounding":true,"should_prefer_local_kb":false,"should_limit_to_hifleet_sites":false}
+
+输出要求：
+- 只返回 JSON
+- 不要输出 Markdown
+- 不要解释
+- 不要补充任何 JSON 之外的文本
 
 JSON 格式:
-{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""}}
+{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true}
 """
 
 CUSTOMER_SUPPORT_PERCEPTION_PROMPT = """你是 HiFleet 客服附件识别助手。
@@ -237,13 +297,13 @@ def _state_dict_from_model(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
-def _build_customer_support_json_llm(ctx, cfg: dict[str, Any]) -> ChatOpenAI | None:
+def _build_customer_support_json_llm(ctx, cfg: dict[str, Any], model_override: str = "") -> ChatOpenAI | None:
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
     base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
     if not api_key or not base_url:
         return None
     runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
-    model = str((cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
+    model = str(model_override or (cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
     try:
         headers = default_headers(ctx) if ctx else {}
     except Exception:
@@ -260,8 +320,8 @@ def _build_customer_support_json_llm(ctx, cfg: dict[str, Any]) -> ChatOpenAI | N
     )
 
 
-def _invoke_customer_support_json_agent(ctx, cfg: dict[str, Any], system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
-    llm = _build_customer_support_json_llm(ctx, cfg)
+def _invoke_customer_support_json_agent(ctx, cfg: dict[str, Any], system_prompt: str, payload: dict[str, Any], model_override: str = "") -> dict[str, Any]:
+    llm = _build_customer_support_json_llm(ctx, cfg, model_override=model_override)
     if llm is None:
         return {}
     try:
@@ -275,6 +335,104 @@ def _invoke_customer_support_json_agent(ctx, cfg: dict[str, Any], system_prompt:
         logger.warning("[CustomerSupportAgentJSON] invoke failed: %s", exc)
         return {}
     return _json_object_from_text(getattr(result, "content", ""))
+
+
+UNDERSTANDING_QUERY_TYPES = {
+    "hifleet_product",
+    "hifleet_troubleshooting",
+    "authoritative_public_data",
+    "shipping_general_knowledge",
+    "ship_query",
+    "multimodal_symbol",
+    "file_task",
+    "browser_verify",
+}
+
+
+def _dedupe_short_strings(values: list[Any], limit: int) -> list[str]:
+    items: list[str] = []
+    for value in values or []:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            continue
+        if text not in items:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _infer_understanding_defaults(intent: str, route: str, text: str) -> dict[str, Any]:
+    normalized_text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if intent == "troubleshooting":
+        query_type = "hifleet_troubleshooting"
+    elif intent in {"ship_query", "ship_analysis", "ship_stats", "ship_update"}:
+        query_type = "ship_query"
+    elif intent == "chart_symbol":
+        query_type = "multimodal_symbol"
+    elif intent == "file_task":
+        query_type = "file_task"
+    elif intent == "browser_verify":
+        query_type = "browser_verify"
+    else:
+        query_type = "hifleet_product" if route == "knowledge" else "shipping_general_knowledge"
+
+    primary_query = normalized_text
+    if route == "knowledge" and normalized_text:
+        try:
+            from agents.customer_support_router import _rewrite_hifleet_knowledge_query
+
+            primary_query = _rewrite_hifleet_knowledge_query(normalized_text)
+        except Exception:
+            primary_query = normalized_text
+    prefer_local_kb = query_type in {"hifleet_product", "hifleet_troubleshooting"}
+    limit_hifleet_sites = query_type in {"hifleet_product", "hifleet_troubleshooting"}
+    if query_type == "authoritative_public_data":
+        prefer_local_kb = False
+        limit_hifleet_sites = False
+    return {
+        "rewritten_user_need": normalized_text,
+        "query_type": query_type,
+        "search_keywords": [],
+        "search_query_candidates": [primary_query] if primary_query else [],
+        "needs_multimodal_grounding": intent in {"chart_symbol", "multimodal_understanding"},
+        "should_prefer_local_kb": prefer_local_kb,
+        "should_limit_to_hifleet_sites": limit_hifleet_sites,
+    }
+
+
+def _normalize_customer_support_understanding_result(raw: dict[str, Any], *, text: str, intent: str, route: str) -> dict[str, Any]:
+    defaults = _infer_understanding_defaults(intent, route, text)
+    query_type = str(raw.get("query_type") or defaults["query_type"]).strip().lower()
+    if query_type not in UNDERSTANDING_QUERY_TYPES:
+        query_type = defaults["query_type"]
+
+    search_keywords = _dedupe_short_strings(raw.get("search_keywords") if isinstance(raw.get("search_keywords"), list) else [], 5)
+    search_keywords = [item[:12] for item in search_keywords if item[:12]]
+
+    query_candidates = _dedupe_short_strings(raw.get("search_query_candidates") if isinstance(raw.get("search_query_candidates"), list) else [], 3)
+    if not query_candidates:
+        query_candidates = list(defaults["search_query_candidates"])
+
+    rewritten_user_need = str(raw.get("rewritten_user_need") or defaults["rewritten_user_need"]).strip() or defaults["rewritten_user_need"]
+
+    prefer_local_kb = bool(raw.get("should_prefer_local_kb", defaults["should_prefer_local_kb"]))
+    limit_hifleet_sites = bool(raw.get("should_limit_to_hifleet_sites", defaults["should_limit_to_hifleet_sites"]))
+    if query_type == "authoritative_public_data":
+        prefer_local_kb = False
+        limit_hifleet_sites = False
+    elif query_type not in {"hifleet_product", "hifleet_troubleshooting"}:
+        limit_hifleet_sites = False
+
+    return {
+        "rewritten_user_need": rewritten_user_need,
+        "query_type": query_type,
+        "search_keywords": search_keywords,
+        "search_query_candidates": query_candidates,
+        "needs_multimodal_grounding": bool(raw.get("needs_multimodal_grounding", defaults["needs_multimodal_grounding"])),
+        "should_prefer_local_kb": prefer_local_kb,
+        "should_limit_to_hifleet_sites": limit_hifleet_sites,
+    }
 
 
 def _normalize_perception(raw: dict[str, Any], fallback_type: str = "") -> dict[str, Any]:
@@ -437,7 +595,13 @@ def _run_customer_support_intent_agent(
         "perception": dict(perception or {}),
         "allow_write": allow_write,
     }
-    raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_INTENT_PROMPT, payload)
+    raw = _invoke_customer_support_json_agent(
+        ctx,
+        cfg,
+        CUSTOMER_SUPPORT_UNDERSTANDING_PROMPT,
+        payload,
+        model_override=str((cfg.get("config") or {}).get("customer_support_understanding_model") or DEFAULT_MULTIMODAL_MODEL).strip() or DEFAULT_MULTIMODAL_MODEL,
+    )
     intent = str(raw.get("intent", "")).strip().lower()
     if intent not in {
         "conversation",
@@ -458,6 +622,7 @@ def _run_customer_support_intent_agent(
         confidence = "medium"
     decision = _customer_support_route_for_intent(intent, allow_write)
     missing_slot = raw.get("missing_slot") if isinstance(raw.get("missing_slot"), dict) else {}
+    understanding_result = _normalize_customer_support_understanding_result(raw, text=text, intent=intent, route=decision.route)
     return {
         "intent": intent,
         "route": decision.route,
@@ -468,6 +633,13 @@ def _run_customer_support_intent_agent(
         "use_context_ship": bool(raw.get("use_context_ship")),
         "missing_slot": missing_slot,
         "why": str(raw.get("why") or raw.get("reason_summary") or raw.get("reason") or ""),
+        "rewritten_user_need": understanding_result["rewritten_user_need"],
+        "query_type": understanding_result["query_type"],
+        "search_keywords": understanding_result["search_keywords"],
+        "search_query_candidates": understanding_result["search_query_candidates"],
+        "needs_multimodal_grounding": understanding_result["needs_multimodal_grounding"],
+        "should_prefer_local_kb": understanding_result["should_prefer_local_kb"],
+        "should_limit_to_hifleet_sites": understanding_result["should_limit_to_hifleet_sites"],
         "fallback_route": str(raw.get("fallback_route") or decision.route or fallback_intent),
     }
 
@@ -504,6 +676,14 @@ def _run_customer_support_planner_agent(
             "search_plan": list(fallback_plan.get("search_plan", []) or []),
             "response_mode": str((fallback_plan.get("decision_rationale", {}) or {}).get("response_mode", "")),
             "missing_slot": dict(fallback_plan.get("missing_slot", {}) or {}),
+        },
+        "understanding_result": {
+            "rewritten_user_need": str((fallback_plan.get("understanding_result", {}) or {}).get("rewritten_user_need", "")),
+            "query_type": str((fallback_plan.get("understanding_result", {}) or {}).get("query_type", "")),
+            "search_keywords": list(((fallback_plan.get("understanding_result", {}) or {}).get("search_keywords", []) or [])),
+            "search_query_candidates": list(((fallback_plan.get("understanding_result", {}) or {}).get("search_query_candidates", []) or [])),
+            "should_prefer_local_kb": bool((fallback_plan.get("understanding_result", {}) or {}).get("should_prefer_local_kb")),
+            "should_limit_to_hifleet_sites": bool((fallback_plan.get("understanding_result", {}) or {}).get("should_limit_to_hifleet_sites")),
         },
     }
     raw = _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_PLANNER_PROMPT, payload)
@@ -600,6 +780,7 @@ def _run_customer_support_planner_agent(
         "missing_slot": missing_slot,
         "decision_rationale": decision_rationale,
         "reasoning_public_trace": reasoning_public_trace,
+        "understanding_result": dict(payload.get("understanding_result") or {}),
     }
 
 
@@ -841,6 +1022,7 @@ def _execute_customer_support_harness(
     context: ConversationContext,
     attachments: list[Attachment] | None = None,
     perception: dict[str, Any] | None = None,
+    understanding_result: dict[str, Any] | None = None,
     session_id: str = "",
     run_id: str = "",
 ) -> tuple[str, dict[str, Any]]:
@@ -860,6 +1042,7 @@ def _execute_customer_support_harness(
         trace.check_result = {"conversation_context_used": True}
         trace.answer_confidence = "high"
     elif route == "knowledge":
+        trace.reasoning_trace["understanding_result"] = dict(understanding_result or {})
         answer = execute_knowledge_chain(text, decision, tool_map, trace)
     elif route in {"chart_symbol", "multimodal_understanding"}:
         answer = execute_multimodal_chain(text, attachments or [], perception or {}, decision, tool_map, trace)
@@ -892,6 +1075,7 @@ def _execute_customer_support_planner(
     search_plan: list[dict[str, Any]] | None = None,
     attachments: list[Attachment] | None = None,
     perception: dict[str, Any] | None = None,
+    understanding_result: dict[str, Any] | None = None,
     session_id: str = "",
     run_id: str = "",
 ) -> tuple[str, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -912,6 +1096,7 @@ def _execute_customer_support_planner(
         return answer, asdict(trace), [], {"confidence": "high", "can_answer_directly": True}
 
     if route == "knowledge":
+        trace.reasoning_trace["understanding_result"] = dict(understanding_result or {})
         answer, evidence_items, evidence_summary = execute_planned_knowledge_chain(
             question=question,
             decision=decision,
@@ -1081,6 +1266,7 @@ class CustomerSupportState(TypedDict, total=False):
     entities: dict[str, Any]
     attachments: list[dict[str, Any]]
     perception_result: dict[str, Any]
+    understanding_result: dict[str, Any]
     problem_frame: dict[str, Any]
     hypotheses: list[dict[str, Any]]
     search_plan: list[dict[str, Any]]
@@ -1703,6 +1889,14 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 "confidence": str((perception or {}).get("confidence", "")),
             },
             "intent_agent_result": intent_agent_result,
+            "understanding_summary": {
+                "query_type": str((intent_agent_result or {}).get("query_type", "")),
+                "rewritten_user_need": str((intent_agent_result or {}).get("rewritten_user_need", "")),
+                "search_keywords": list((intent_agent_result or {}).get("search_keywords", []) or []),
+                "understanding_primary_query": str(((intent_agent_result or {}).get("search_query_candidates", []) or [""])[0] or ""),
+                "should_prefer_local_kb": bool((intent_agent_result or {}).get("should_prefer_local_kb")),
+                "should_limit_to_hifleet_sites": bool((intent_agent_result or {}).get("should_limit_to_hifleet_sites")),
+            },
             "route_source": route_source,
         }
         return {
@@ -1716,6 +1910,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "entities": entities,
             "attachments": attachments,
             "perception_result": perception,
+            "understanding_result": intent_agent_result,
             "intent_agent_result": intent_agent_result,
             "started_at_ms": int(time.time() * 1000),
             "route_trace": asdict(trace),
@@ -1731,6 +1926,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         entities = MessageEntities(**dict(state.get("entities", {}) or {}))
         attachments = [Attachment(**item) if isinstance(item, dict) else item for item in list(state.get("attachments", []) or [])]
         perception = dict(state.get("perception_result", {}) or {})
+        understanding_result = dict(state.get("understanding_result", {}) or {})
         session_id = str(state.get("session_id", ""))
         run_id = str(getattr(ctx, "run_id", "") or "")
         phase_history = list(state.get("phase_history", [])) + ["execute"]
@@ -1745,6 +1941,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 context=context,
                 attachments=attachments,
                 perception=perception,
+                understanding_result=understanding_result,
                 session_id=session_id,
                 run_id=run_id,
             )
@@ -1770,6 +1967,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 context=context,
                 attachments=attachments,
                 perception=perception,
+                understanding_result=understanding_result,
                 session_id=session_id,
                 run_id=run_id,
             )

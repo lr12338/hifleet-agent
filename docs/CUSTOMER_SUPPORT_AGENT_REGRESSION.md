@@ -20,6 +20,11 @@
 12. 最终输出脱敏与链接校验
 13. `/stream_run` 调试流事件
 
+本轮需要特别关注两条新主线：
+
+- 首步“需求理解 agent”是否稳定产出结构化 understanding 契约
+- `knowledge_qa` 是否按 `local_kb_search -> web_search -> web_search_agent_browser` 顺序受控升级
+
 ## 2. 当前测试入口
 
 全量客服相关最小回归：
@@ -38,7 +43,20 @@ PYTHONPATH=src .venv-test/bin/python -m pytest -q \
 ./.venv-test/bin/python -m pytest tests/test_customer_support_intent_agent.py -q
 ```
 
+知识检索三工具最小验证：
+
+```bash
+./.venv-test/bin/python -m pytest tests/test_smart_search_tools.py -q
+```
+
 每次上线前应记录当前远端实际结果，不要沿用历史 passed 数。若服务器依赖环境暂时无法跑 pytest，至少执行 `python3 -m py_compile` 检查核心客服链路文件，并在发布记录中说明 pytest 阻塞原因。
+
+当前已知环境阻塞：
+
+- `.venv-test` 缺少 `docker` Python 包
+- `browser_verify` skill 导入失败
+- 因此完整 `router` 测试集可能被环境卡住
+- `tests/test_customer_support_intent_agent.py` 中与本次需求理解 agent 直接相关的新增/修改用例应单独保证通过
 
 ## 3. 主链验收标准
 
@@ -61,9 +79,16 @@ PYTHONPATH=src .venv-test/bin/python -m pytest -q \
 
 ### 4.1 知识问答
 
-- `smart_search` 高置信命中时，不应再触发不必要的 `agent_browser_deep_search`
+- 本地 FAQ 强命中时，应在 `local_kb_search` 停止
+- `web_search` 命中具体事实页时，不应再触发不必要的 browser
 - 用户要求验证官方/社区/今日/最新内容时，即使 `smart_search` 有泛化结果，也应触发 browser 官方核验
 - `agent_browser_deep_search` 返回结构化 evidence 后，最终回复不能暴露内部 CLI、日志、路径、JSON
+
+新增重点：
+
+- `search_query_candidates[0]` 应优先成为知识链主查询
+- 产品问题才允许 HiFleet `Sites` 过滤
+- 公共权威数据问题不能被错误改写成 HiFleet 产品搜索
 
 ### 4.2 多轮上下文
 
@@ -71,12 +96,21 @@ PYTHONPATH=src .venv-test/bin/python -m pytest -q \
 - “上面 / 上一条 / 这艘船 / 总结”类追问应能复用相关历史
 - intent/planner 看到的上下文应来自压缩后的相关窗口，而不是原始长历史
 
-### 4.3 轻量 perception + intent agent 路由
+### 4.3 轻量 perception + 需求理解 agent 路由
 
 - `这个圆圈是什么` + HiFleet 海图截图，应优先基于 `perception_result` 判断为 `chart_symbol` 或 `platform_knowledge`
 - `请分析这张图片` + Error 弹窗，应优先判断为 `platform_troubleshooting`
 - 低置信截图识别不应进入长流程，应追问一项关键补充
 - `route_trace.reasoning_trace.route_source` 应能看出最终来自 `light_agent`、`write_guard`、`safety_rule` 或 `fallback_rule`
+
+新增结构化字段检查：
+
+- `route_trace.reasoning_trace.understanding_summary.rewritten_user_need`
+- `route_trace.reasoning_trace.understanding_summary.query_type`
+- `route_trace.reasoning_trace.understanding_summary.search_keywords`
+- `route_trace.reasoning_trace.understanding_summary.search_query_candidates`
+- `route_trace.reasoning_trace.understanding_summary.should_prefer_local_kb`
+- `route_trace.reasoning_trace.understanding_summary.should_limit_to_hifleet_sites`
 
 ### 4.4 Harness 路由
 
@@ -88,6 +122,10 @@ PYTHONPATH=src .venv-test/bin/python -m pytest -q \
 
 - `我是免费用户，为什么在网站上看不到最新的船位？`
   - 应解释 HiFleet 免费账号/数据延迟/权限，不应返回随机船舶坐标。
+- `今日长江水位`
+  - 应走公共权威数据检索，不应落回 HiFleet 社区首页。
+- `智能视频监控`
+  - 若 web 已命中具体官方页，应停止，不要再盲目升级 browser。
 - `验证 注意！浏览器开始记忆船队“筛选”了 的详细内容`
   - 应核验具体官方社区文章，不应只返回社区首页或帮助中心首页。
 - `SUNNY STAR历史轨迹是哪些`
@@ -159,6 +197,15 @@ PYTHONPATH=src .venv-test/bin/python -m pytest -q \
 10. `latency_hotspot.total`
    - 是否存在异常慢请求
 
+知识链额外看：
+
+11. `route_trace.reasoning_trace.understanding_summary`
+    - 主查询和站点限制是否合理
+12. `retrieval_trace`
+    - 是否记录了本地 KB、web、browser 各层证据
+13. `t1_payload_meta` / `request_profile`
+    - 是否出现错误 `Sites` 污染或 Ark fallback 覆盖
+
 ## 7. 当前已知限制
 
 - 知识库内容不足时，`smart_search` 命中质量会直接下降
@@ -169,8 +216,8 @@ PYTHONPATH=src .venv-test/bin/python -m pytest -q \
 
 ## 8. 当前优化优先级
 
-1. 补知识库内容
-2. 补官方网页抓取与索引覆盖
-3. 提升轻量 intent agent 与 planner/query rewrite 的稳定性
-4. 扩展异地部署联调脚本和线上观测面板
-5. 不优先恢复旧版重型 Planner/Harness 设计稿
+1. 补 `docs/RAG` 和本地 KB 命中质量
+2. 提升需求理解 agent 的 query_type / search_query_candidates 稳定性
+3. 收紧 `query_type -> Sites` 约束，避免公共数据检索被 HiFleet 站点污染
+4. 补官方网页抓取与索引覆盖
+5. 扩展异地部署联调脚本和线上观测面板
