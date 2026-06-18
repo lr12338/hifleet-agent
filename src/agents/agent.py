@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal, TypedDict
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -243,6 +244,10 @@ def _build_customer_support_json_llm(ctx, cfg: dict[str, Any]) -> ChatOpenAI | N
         return None
     runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
     model = str((cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
+    try:
+        headers = default_headers(ctx) if ctx else {}
+    except Exception:
+        headers = {}
     return ChatOpenAI(
         model=model,
         api_key=api_key,
@@ -251,7 +256,7 @@ def _build_customer_support_json_llm(ctx, cfg: dict[str, Any]) -> ChatOpenAI | N
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
         extra_body={"thinking": {"type": "disabled"}},
-        default_headers=default_headers(ctx) if ctx else {},
+        default_headers=headers,
     )
 
 
@@ -758,6 +763,8 @@ def _guard_customer_support_decision(
     attachments: list[Attachment],
     perception: dict[str, Any],
 ) -> tuple[RouteDecision, str]:
+    if agent_decision.route == "chart_symbol" and not attachments:
+        return fallback_decision, "fallback_rule"
     if fallback_decision.route == "ship_update":
         return fallback_decision, "write_guard"
     if fallback_decision.route == "file_task":
@@ -1559,7 +1566,12 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     graph.add_edge("loop", "act")
     graph.add_edge("finalize", END)
     graph.add_edge("fail", END)
-    return graph.compile(checkpointer=get_memory_saver())
+    try:
+        checkpointer = get_memory_saver()
+    except Exception as exc:
+        logger.warning("customer_support graph falling back to MemorySaver during compile: %s", exc)
+        checkpointer = MemorySaver()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
@@ -1895,7 +1907,12 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
     graph.add_edge("delegate", "check")
     graph.add_edge("check", "finalize")
     graph.add_edge("finalize", END)
-    return graph.compile(checkpointer=get_memory_saver())
+    try:
+        checkpointer = get_memory_saver()
+    except Exception as exc:
+        logger.warning("customer_support graph falling back to MemorySaver during compile: %s", exc)
+        checkpointer = MemorySaver()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def build_agent(ctx=None, intent: str = ""):

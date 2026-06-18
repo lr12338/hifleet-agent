@@ -54,7 +54,7 @@ def sanitize_customer_output(text: str) -> str:
     value = re.sub(r"(?mi)^\[Query\d+:.*$", "", value)
     value = re.sub(r"\[HTMLLINK_\d+\]", "", value)
     value = re.sub(r"(?mi)^#{1,6}\s*", "", value)
-    value = re.sub(r"(?mi)^来源[:：]\s*$", "", value)
+    value = re.sub(r"(?mi)^来源[:：].*$", "", value)
     value = re.sub(r"(?mi)^内容摘要[:：]\s*", "", value)
     value = re.sub(r"(?mi)^详细内容[:：]\s*", "", value)
     value = re.sub(r"(?mis)<a\s+href=\"[^\"]+\">.*?</a>", "", value)

@@ -223,6 +223,26 @@ def _candidate_urls(query: str) -> list[dict[str, str]]:
     return candidates
 
 
+def _explicit_target_url_candidates(target_urls: str) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[\n|]+", target_urls or ""):
+        url = raw.strip()
+        if not url or url in seen or not _is_public_http_url(url):
+            continue
+        seen.add(url)
+        candidates.append(
+            {
+                "url": url,
+                "title": "HiFleet 候选页面",
+                "summary": "",
+                "source": "router_target",
+                "query": "",
+            }
+        )
+    return candidates
+
+
 def _needs_specific_hifleet_page(query: str) -> bool:
     q = (query or "").lower()
     markers = ["验证", "核验", "社区", "发布", "详细内容", "今日", "今天", "最新", "长江水位", "浏览器开始记忆"]
@@ -277,7 +297,7 @@ seen = set()
 for item in PREFERRED:
     url = str(item.get("url", "")).strip()
     if url and allowed(url) and url not in seen:
-        candidates.append({"url": url, "title": item.get("title", ""), "summary": "", "source": "sandbox_preferred"})
+        candidates.append({{"url": url, "title": item.get("title", ""), "summary": "", "source": "sandbox_preferred"}})
         seen.add(url)
 
 bing_query = f'site:hifleet.com "HiFleet" "{{QUERY}}"'
@@ -293,12 +313,12 @@ for match in re.finditer(r'<li class="b_algo".*?<h2><a href="([^"]+)"[^>]*>(.*?)
         continue
     title = clean(match.group(2) or "") or "HiFleet 页面"
     summary = clean(match.group(3) or "")
-    candidates.append({"url": url, "title": title, "summary": summary[:400], "source": "sandbox_bing"})
+    candidates.append({{"url": url, "title": title, "summary": summary[:400], "source": "sandbox_bing"}})
     seen.add(url)
     if len(candidates) >= 5:
         break
 
-print(json.dumps({"candidates": candidates[:5]}, ensure_ascii=False))
+print(json.dumps({{"candidates": candidates[:5]}}, ensure_ascii=False))
 """
 
 
@@ -398,13 +418,20 @@ def verify_public_page(url: str) -> str:
 
 
 @tool
-def agent_browser_deep_search(query: str) -> str:
+def agent_browser_deep_search(query: str, target_urls: str = "", site_hint: str = "") -> str:
     """Fetch public-page evidence with agent-browser when knowledge search has no useful hit."""
     sanitized_query = _sanitize_query(query)
     if not sanitized_query:
         return NO_HIT_TEXT
 
-    candidates = _candidate_urls(sanitized_query) if _needs_specific_hifleet_page(sanitized_query) else (_sandbox_hifleet_candidates(sanitized_query) or _candidate_urls(sanitized_query))
+    explicit_targets = _explicit_target_url_candidates(target_urls)
+    has_hifleet_scope = "hifleet" in sanitized_query.lower() or "hifleet" in (site_hint or "").lower() or _needs_specific_hifleet_page(sanitized_query)
+    if not explicit_targets and not has_hifleet_scope:
+        return NO_HIT_TEXT
+
+    candidates = explicit_targets
+    if not candidates:
+        candidates = _candidate_urls(sanitized_query) if _needs_specific_hifleet_page(sanitized_query) else (_sandbox_hifleet_candidates(sanitized_query) or _candidate_urls(sanitized_query))
     if not candidates:
         candidates = _sandbox_hifleet_candidates(sanitized_query)
     if not candidates:

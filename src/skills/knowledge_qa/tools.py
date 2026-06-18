@@ -30,7 +30,7 @@ import logging
 import os
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 import requests
 import threading
@@ -52,6 +52,8 @@ VOLC_WEB_SEARCH_DEFAULT_COUNT = int(os.getenv("VOLC_WEB_SEARCH_DEFAULT_COUNT", "
 
 _SEARCH_CACHE_LOCK = threading.Lock()
 _SEARCH_CACHE: dict = {}
+_STRUCTURED_TRACE_LOCK = threading.Lock()
+_STRUCTURED_TRACE_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def _emit_search_metric(ctx, result: ToolResult):
@@ -101,6 +103,34 @@ def _cache_set(query: str, depth: str, value: str):
     with _SEARCH_CACHE_LOCK:
         _SEARCH_CACHE[key] = {"value": value, "ts": time.time()}
 
+
+def _structured_trace_key(query: str, depth: str) -> str:
+    return _cache_key(query, depth)
+
+
+def _cache_structured_trace(query: str, depth: str, value: dict[str, Any]):
+    if SMART_SEARCH_CACHE_TTL_SEC <= 0:
+        return
+    key = _structured_trace_key(query, depth)
+    with _STRUCTURED_TRACE_LOCK:
+        _STRUCTURED_TRACE_CACHE[key] = {"value": value, "ts": time.time()}
+
+
+def get_structured_search_trace(query: str, depth: str = "normal") -> dict[str, Any]:
+    if SMART_SEARCH_CACHE_TTL_SEC <= 0:
+        return {}
+    key = _structured_trace_key(query, depth)
+    now = time.time()
+    with _STRUCTURED_TRACE_LOCK:
+        item = _STRUCTURED_TRACE_CACHE.get(key)
+        if not item:
+            return {}
+        if now - item["ts"] > SMART_SEARCH_CACHE_TTL_SEC:
+            _STRUCTURED_TRACE_CACHE.pop(key, None)
+            return {}
+        value = item.get("value")
+    return dict(value) if isinstance(value, dict) else {}
+
 # ══════════════════════════════════════════════════
 # 第1层：平台术语速查表
 # ══════════════════════════════════════════════════
@@ -133,7 +163,7 @@ WIKI_MIN_SCORE = 0.30
 # 第4层：官网站内搜索配置
 # ══════════════════════════════════════════════════
 HIFLEET_COMMUNITY_URL = "https://www.hifleet.com/wp/communities"
-HIFLEET_SITES = "hifleet.com|help.hifleet.com|www.hifleet.com|www.hifleet.com/wp/communities"
+HIFLEET_SITES = "hifleet.com|help.hifleet.com|www.hifleet.com|www.hifleet.com/wp/communities|ttse.hifleet.com"
 
 # ══════════════════════════════════════════════════
 # 第5层：域名权威度加权表
@@ -141,6 +171,7 @@ HIFLEET_SITES = "hifleet.com|help.hifleet.com|www.hifleet.com|www.hifleet.com/wp
 DOMAIN_AUTHORITY = {
     "hifleet.com": 1.0, "help.hifleet.com": 1.0,
     "www.hifleet.com": 1.0,
+    "ttse.hifleet.com": 1.0,
     "msa.gov.cn": 0.95, "mot.gov.cn": 0.90,
     "imo.org": 0.95,
     "xindemarinenews.com": 0.85,
@@ -186,6 +217,53 @@ def _match_glossary(query: str) -> Optional[str]:
 def _should_use_helpcenter_fastpath(query: str) -> bool:
     q = (query or "").strip()
     return any(marker in q for marker in TROUBLESHOOTING_FASTPATH_MARKERS)
+
+
+def _new_structured_search_trace(query: str, depth: str) -> dict[str, Any]:
+    return {
+        "query": query,
+        "depth": depth,
+        "t0_kb_hit": False,
+        "layers": [],
+        "t1_query": "",
+        "t1_payload_meta": {},
+        "t1_source_count": 0,
+        "t1_official_source_count": 0,
+        "t1_used_ark_fallback": False,
+        "source_scope": "",
+        "items": [],
+        "summary": "",
+    }
+
+
+def _update_structured_t1_trace(
+    trace: dict[str, Any],
+    *,
+    result: dict[str, Any] | None,
+    source_scope: str,
+) -> None:
+    if not isinstance(trace, dict) or not isinstance(result, dict):
+        return
+    items = list(result.get("items") or [])
+    payload_meta = dict(result.get("payload_meta") or {})
+    trace["t1_query"] = str(result.get("query") or payload_meta.get("Query") or trace.get("t1_query", ""))
+    trace["t1_payload_meta"] = payload_meta
+    trace["t1_source_count"] = len(items)
+    trace["t1_official_source_count"] = sum(
+        1
+        for item in items
+        if (
+            str(item.get("url", "")).strip()
+            and (
+                "hifleet.com" in str(item.get("url", "")).lower()
+                or int(item.get("authority_level") or 0) == 1
+            )
+        )
+    )
+    trace["t1_used_ark_fallback"] = bool(result.get("used_ark_fallback"))
+    trace["source_scope"] = source_scope
+    trace["items"] = items
+    trace["summary"] = str(result.get("summary") or "")
 
 
 def _search_knowledge_base(query: str, ctx) -> dict:
@@ -251,16 +329,18 @@ def _detect_source_type(content: str) -> str:
     return "unknown"
 
 
-def _search_hifleet_site(query: str, ctx) -> list:
+def _search_hifleet_site(query: str, ctx, *, return_trace: bool = False) -> list | tuple[list, dict[str, Any]]:
     """第4层：Hifleet官网站内搜索（火山联网搜索）"""
+    trace_result: dict[str, Any] = {}
     if _should_use_helpcenter_fastpath(query):
-        return [{
+        results = [{
             "title": "HiFleet 帮助中心",
             "url": DEFAULT_HELP_CENTER_URL,
             "snippet": "官方平台使用与问题排查文档入口",
             "full_content": "",
             "content_quality": "official_fastpath",
         }]
+        return (results, trace_result) if return_trace else results
 
     results = []
     try:
@@ -274,8 +354,9 @@ def _search_hifleet_site(query: str, ctx) -> list:
             need_url=True,
             query_rewrite=True,
             auth_info_level=1,
-            content_format="markdown",
+            content_format="text",
         )
+        trace_result = search
         for item in search.get("items", []):
             url = item.get("url", "")
             if "hifleet" not in url:
@@ -301,12 +382,13 @@ def _search_hifleet_site(query: str, ctx) -> list:
     except Exception as e:
         logger.warning(f"Hifleet site search error: {e}")
 
-    return results
+    return (results, trace_result) if return_trace else results
 
 
-def _search_web_enhanced(query: str, ctx) -> dict:
+def _search_web_enhanced(query: str, ctx, *, return_trace: bool = False) -> dict | tuple[dict, dict[str, Any]]:
     """第5层：增强版网页搜索（火山联网搜索）"""
     result = {"items": [], "summary": ""}
+    trace_result: dict[str, Any] = {}
 
     try:
         search = _web_search(
@@ -318,8 +400,9 @@ def _search_web_enhanced(query: str, ctx) -> dict:
             need_url=True,
             query_rewrite=False,
             auth_info_level=0,
-            content_format="markdown",
+            content_format="text",
         )
+        trace_result = search
         result["summary"] = search.get("summary", "")
 
         for item in search.get("items", []):
@@ -349,7 +432,7 @@ def _search_web_enhanced(query: str, ctx) -> dict:
     except Exception as e:
         logger.warning(f"Web search error: {e}")
 
-    return result
+    return (result, trace_result) if return_trace else result
 
 
 def _expand_query_variants(query: str) -> list:
@@ -375,17 +458,20 @@ def _expand_query_variants(query: str) -> list:
     return dedup[:max(1, DEEP_VARIANTS_MAX)]
 
 
-def _search_web_deep_multi(query: str, ctx) -> dict:
+def _search_web_deep_multi(query: str, ctx, *, return_trace: bool = False) -> dict | tuple[dict, dict[str, Any]]:
     """
     深度检索：多查询词并行思路（串行执行），合并结果并按权威度排序。
     """
     merged = {"items": [], "summary": ""}
+    trace_candidate: dict[str, Any] = {}
     variants = _expand_query_variants(query)
     for i, q in enumerate(variants):
         chunk = _search_web_deep_single(q)
         if chunk.get("summary"):
             merged["summary"] += f"\n查询{i+1}（{q}）：{chunk['summary'][:500]}"
         merged["items"].extend(chunk.get("items", []))
+        if not trace_candidate and chunk.get("payload_meta"):
+            trace_candidate = chunk
 
     # 去重 URL + 权威度排序
     uniq = {}
@@ -398,11 +484,17 @@ def _search_web_deep_multi(query: str, ctx) -> dict:
     items = sorted(list(uniq.values()), key=lambda x: x.get("authority", 0), reverse=True)
     merged["items"] = items[:8]
     merged["summary"] = merged["summary"][:1800]
-    return merged
+    if trace_candidate:
+        trace_candidate = {
+            **trace_candidate,
+            "items": merged["items"],
+            "summary": merged["summary"],
+        }
+    return (merged, trace_candidate) if return_trace else merged
 
 
 def _search_web_deep_single(query: str) -> dict:
-    result = {"items": [], "summary": ""}
+    result = {"items": [], "summary": "", "payload_meta": {}, "query": query, "used_ark_fallback": False}
     try:
         search = _web_search(
             query=query,
@@ -413,9 +505,11 @@ def _search_web_deep_single(query: str) -> dict:
             need_url=True,
             query_rewrite=True,
             auth_info_level=0,
-            content_format="markdown",
+            content_format="text",
         )
         result["summary"] = search.get("summary", "")
+        result["payload_meta"] = dict(search.get("payload_meta") or {})
+        result["used_ark_fallback"] = bool(search.get("used_ark_fallback"))
         for item in search.get("items", []):
             url = item.get("url", "")
             domain = urlparse(url).netloc.lower().lstrip("www.")
@@ -512,7 +606,7 @@ def _build_volc_web_search_payload(
     query_rewrite: bool = False,
     auth_info_level: int = 0,
     time_range: str = "",
-    content_format: str = "markdown",
+    content_format: str = "text",
 ) -> dict:
     payload = {
         "Query": query[:100],
@@ -583,6 +677,46 @@ def _normalize_web_search_result(payload: dict) -> dict:
     }
 
 
+def _build_search_payload_meta(payload: dict) -> dict[str, Any]:
+    filter_payload = dict(payload.get("Filter") or {})
+    return {
+        "Query": str(payload.get("Query", "")),
+        "SearchType": str(payload.get("SearchType", "")),
+        "Count": payload.get("Count"),
+        "NeedSummary": bool(payload.get("NeedSummary")),
+        "ContentFormats": str(payload.get("ContentFormats", "")),
+        "Filter": {
+            "NeedContent": bool(filter_payload.get("NeedContent")),
+            "NeedUrl": bool(filter_payload.get("NeedUrl")),
+            "AuthInfoLevel": filter_payload.get("AuthInfoLevel", 0),
+            "Sites": str(filter_payload.get("Sites", "")),
+            "BlockHosts": str(filter_payload.get("BlockHosts", "")),
+        },
+    }
+
+
+def _build_structured_web_search_response(
+    query: str,
+    payload_meta: dict[str, Any],
+    search_result: dict[str, Any],
+    *,
+    source_scope: str,
+    used_ark_fallback: bool,
+) -> dict[str, Any]:
+    return {
+        "query": query,
+        "search_type": payload_meta.get("SearchType", ""),
+        "summary": search_result.get("summary", ""),
+        "items": list(search_result.get("items", []) or []),
+        "search_context": dict(search_result.get("search_context") or {}),
+        "source_scope": source_scope,
+        "used_ark_fallback": used_ark_fallback,
+        "payload_meta": payload_meta,
+        "log_id": search_result.get("log_id", ""),
+        "time_cost": search_result.get("time_cost"),
+    }
+
+
 def _volc_web_search(
     query: str,
     *,
@@ -620,6 +754,7 @@ def _volc_web_search(
         time_range=time_range,
         content_format=content_format,
     )
+    payload_meta = _build_search_payload_meta(payload)
     response = requests.post(
         VOLC_WEB_SEARCH_URL,
         headers={
@@ -634,7 +769,14 @@ def _volc_web_search(
     error = ((data or {}).get("ResponseMetadata") or {}).get("Error")
     if error:
         raise RuntimeError(f"volc_web_search_error:{error.get('Code')}:{error.get('Message')}")
-    return _normalize_web_search_result(data)
+    normalized = _normalize_web_search_result(data)
+    return _build_structured_web_search_response(
+        query,
+        payload_meta,
+        normalized,
+        source_scope="web",
+        used_ark_fallback=False,
+    )
 
 
 def _web_search(query: str, **kwargs) -> dict:
@@ -642,10 +784,30 @@ def _web_search(query: str, **kwargs) -> dict:
         return _volc_web_search(query, **kwargs)
     except Exception as e:
         logger.warning(f"Structured web search failed, fallback to Ark: {e}")
-        return _ark_web_search(
+        fallback = _ark_web_search(
             query=query,
             site_hint=kwargs.get("sites", ""),
             count=kwargs.get("count", VOLC_WEB_SEARCH_DEFAULT_COUNT),
+        )
+        payload = _build_volc_web_search_payload(
+            query,
+            search_type=str(kwargs.get("search_type") or "web"),
+            count=int(kwargs.get("count", VOLC_WEB_SEARCH_DEFAULT_COUNT)),
+            sites=str(kwargs.get("sites", "")),
+            need_summary=bool(kwargs.get("need_summary", True)),
+            need_content=bool(kwargs.get("need_content", False)),
+            need_url=bool(kwargs.get("need_url", True)),
+            query_rewrite=bool(kwargs.get("query_rewrite", False)),
+            auth_info_level=int(kwargs.get("auth_info_level", 0) or 0),
+            time_range=str(kwargs.get("time_range", "")),
+            content_format=str(kwargs.get("content_format", "text")),
+        )
+        return _build_structured_web_search_response(
+            query,
+            _build_search_payload_meta(payload),
+            fallback,
+            source_scope="web",
+            used_ark_fallback=True,
         )
 
 
@@ -855,6 +1017,7 @@ def smart_search(query: str, depth: str = "normal") -> str:
     logger.info(f"[smart_search] query='{query}', depth='{depth}'")
     t0 = time.time()
     layer_trace = []
+    structured_trace = _new_structured_search_trace(query, depth)
 
     # ── 第1层：术语速查 ──
     glossary_match = _match_glossary(query)
@@ -863,17 +1026,20 @@ def smart_search(query: str, depth: str = "normal") -> str:
         logger.info(f"[smart_search] Layer1 glossary hit: '{term}'")
         output = _format_glossary_result(term, definition)
         layer_trace.append({"layer": "L1", "hit": True, "reason": "glossary"})
+        structured_trace["layers"] = list(layer_trace)
         logger.info(f"[smart_search] layer_trace={layer_trace}")
         _emit_search_metric(
             ctx,
             ToolResult(status="ok", code="SMART_SEARCH_L1_HIT", message=output, latency_ms=int((time.time() - t0) * 1000), source="glossary", data={"layer_trace": layer_trace}),
         )
         _cache_set(query, depth, output)
+        _cache_structured_trace(query, depth, structured_trace)
         return output
 
     # ── 第2-3层：知识库检索 ──
     kb_results = _search_knowledge_base(query, ctx)
     layer_trace.append({"layer": "L2-L3", "hit": bool(kb_results.get("faq") or kb_results.get("wiki"))})
+    structured_trace["t0_kb_hit"] = bool(kb_results.get("faq") or kb_results.get("wiki"))
 
     # 检查FAQ是否有高质量匹配
     faq_items = kb_results.get("faq", [])
@@ -886,36 +1052,42 @@ def smart_search(query: str, depth: str = "normal") -> str:
         kb_output = _format_knowledge_result(kb_results)
         # quick模式：只返回知识库结果
         if depth == "quick":
+            structured_trace["layers"] = list(layer_trace)
             logger.info(f"[smart_search] layer_trace={layer_trace}")
             _emit_search_metric(
                 ctx,
                 ToolResult(status="ok", code="SMART_SEARCH_KB_QUICK", message=kb_output, latency_ms=int((time.time() - t0) * 1000), source="knowledge_base", data={"layer_trace": layer_trace}),
             )
             _cache_set(query, depth, kb_output)
+            _cache_structured_trace(query, depth, structured_trace)
             return kb_output
         # normal/deep：继续搜官网补充
         site_output = ""
         if depth in ("normal", "deep"):
-            site_results = _search_hifleet_site(query, ctx)
+            site_results, site_trace = _search_hifleet_site(query, ctx, return_trace=True)
             if site_results:
                 site_output = "\n\n" + _format_site_result(site_results, query)
                 layer_trace.append({"layer": "L4", "hit": True, "count": len(site_results)})
+                _update_structured_t1_trace(structured_trace, result=site_trace, source_scope="hifleet_site")
 
         # deep模式：再加互联网搜索
         web_output = ""
         if depth == "deep":
-            web_results = _search_web_enhanced(query, ctx)
+            web_results, web_trace = _search_web_enhanced(query, ctx, return_trace=True)
             if web_results.get("items") or web_results.get("summary"):
                 web_output = "\n\n" + _format_web_result(web_results)
                 layer_trace.append({"layer": "L5", "hit": True, "count": len(web_results.get("items", []))})
+                _update_structured_t1_trace(structured_trace, result=web_trace, source_scope="web")
 
         output = kb_output + site_output + web_output
+        structured_trace["layers"] = list(layer_trace)
         logger.info(f"[smart_search] layer_trace={layer_trace}")
         _emit_search_metric(
             ctx,
             ToolResult(status="ok", code="SMART_SEARCH_KB_PRIORITY", message=output, latency_ms=int((time.time() - t0) * 1000), source="knowledge_base", data={"layer_trace": layer_trace}),
         )
         _cache_set(query, depth, output)
+        _cache_structured_trace(query, depth, structured_trace)
         return output
 
     # FAQ无高质量匹配，继续逐层（并在 normal 模式积极触发深搜补强）
@@ -925,23 +1097,28 @@ def smart_search(query: str, depth: str = "normal") -> str:
     # ── 第4层：官网站内搜索 ──
     site_output = ""
     if depth in ("normal", "deep"):
-        site_results = _search_hifleet_site(query, ctx)
+        site_results, site_trace = _search_hifleet_site(query, ctx, return_trace=True)
         has_site_content = any((item.get("full_content") or item.get("snippet")) for item in site_results)
 
         if site_results:
             site_output = _format_site_result(site_results, query)
             layer_trace.append({"layer": "L4", "hit": True, "count": len(site_results)})
+            _update_structured_t1_trace(structured_trace, result=site_trace, source_scope="hifleet_site")
 
         # 有官网内容 + normal模式 → 够用了
         if has_site_content and depth == "normal":
             if kb_output:
+                structured_trace["layers"] = list(layer_trace)
+                _cache_structured_trace(query, depth, structured_trace)
                 return kb_output + "\n\n" + site_output
+            structured_trace["layers"] = list(layer_trace)
             logger.info(f"[smart_search] layer_trace={layer_trace}")
             _emit_search_metric(
                 ctx,
                 ToolResult(status="ok", code="SMART_SEARCH_SITE_SHORTCUT", message=site_output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_site", data={"layer_trace": layer_trace}),
             )
             _cache_set(query, depth, site_output)
+            _cache_structured_trace(query, depth, structured_trace)
             return site_output
 
     # ── 第5层：互联网搜索 ──
@@ -949,10 +1126,11 @@ def smart_search(query: str, depth: str = "normal") -> str:
     # 性能优先：normal 模式仅在“站内和知识库都弱”时触发深搜
     should_force_deep = depth == "deep" or (depth == "normal" and (not site_output and not kb_output and kb_top_score < 0.40))
     if should_force_deep:
-        web_results = _search_web_deep_multi(query, ctx)
+        web_results, web_trace = _search_web_deep_multi(query, ctx, return_trace=True)
         if web_results.get("items") or web_results.get("summary"):
             web_output = _format_web_result(web_results)
             layer_trace.append({"layer": "L5", "hit": True, "count": len(web_results.get("items", []))})
+            _update_structured_t1_trace(structured_trace, result=web_trace, source_scope="web")
 
     # 组装最终输出
     final_parts = []
@@ -965,16 +1143,19 @@ def smart_search(query: str, depth: str = "normal") -> str:
 
     if not final_parts:
         # 最终兜底：再尝试一次深搜，尽量不给“空回复”
-        web_results = _search_web_deep_multi(query, ctx)
+        web_results, web_trace = _search_web_deep_multi(query, ctx, return_trace=True)
         if web_results.get("items") or web_results.get("summary"):
             output = _format_web_result(web_results)
             layer_trace.append({"layer": "L5", "hit": True, "reason": "final_fallback"})
+            _update_structured_t1_trace(structured_trace, result=web_trace, source_scope="web")
+            structured_trace["layers"] = list(layer_trace)
             logger.info(f"[smart_search] layer_trace={layer_trace}")
             _emit_search_metric(
                 ctx,
                 ToolResult(status="ok", code="SMART_SEARCH_WEB_FALLBACK", message=output, latency_ms=int((time.time() - t0) * 1000), source="web_search", data={"layer_trace": layer_trace}),
             )
             _cache_set(query, depth, output)
+            _cache_structured_trace(query, depth, structured_trace)
             return output
 
         output = (
@@ -984,19 +1165,23 @@ def smart_search(query: str, depth: str = "normal") -> str:
             "2. 联系人工客服：400-963-6899（微信：hifleetkhzs）\n"
             f"3. 访问帮助中心：{DEFAULT_HELP_CENTER_URL}"
         )
+        structured_trace["layers"] = list(layer_trace)
         logger.info(f"[smart_search] layer_trace={layer_trace}")
         _emit_search_metric(
             ctx,
             ToolResult(status="error", code="SMART_SEARCH_EMPTY", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="search", data={"layer_trace": layer_trace}),
         )
         _cache_set(query, depth, output)
+        _cache_structured_trace(query, depth, structured_trace)
         return output
 
     output = "\n\n".join(final_parts)
+    structured_trace["layers"] = list(layer_trace)
     logger.info(f"[smart_search] layer_trace={layer_trace}")
     _emit_search_metric(
         ctx,
         ToolResult(status="ok", code="SMART_SEARCH_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="search", data={"layer_trace": layer_trace}),
     )
     _cache_set(query, depth, output)
+    _cache_structured_trace(query, depth, structured_trace)
     return output

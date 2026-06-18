@@ -34,6 +34,8 @@ from agents.customer_support_router import (
     resolve_entities_with_context,
     should_use_ship_context,
     validate_links,
+    _generate_knowledge_expansion_query,
+    _rewrite_hifleet_knowledge_query,
 )
 from agents.customer_support_guard import sanitize_customer_output
 from langchain_core.messages import AIMessage, HumanMessage
@@ -527,6 +529,66 @@ def test_hifleet_business_answers_prefer_direct_domain_answer():
     assert "15 天" in output or "15天" in output
     assert "彩云天气" not in output
     assert trace.check_result["direct_business_answer"] is True
+
+
+def test_authoritative_data_query_does_not_rewrite_into_hifleet_product_query():
+    assert _rewrite_hifleet_knowledge_query("今日长江水位") == "今日长江水位"
+    assert _generate_knowledge_expansion_query("今日长江水位", classify_message("今日长江水位", extract_entities("今日长江水位"))) == "今日长江水位 长江海事局 交通运输部"
+
+
+def test_authoritative_data_short_circuit_skips_browser_and_keeps_public_query(monkeypatch):
+    def smart_search_handler(args):
+        return "长江海事局发布今日长江水位数据。"
+
+    smart_search = FakeTool("smart_search", smart_search_handler)
+    agent_browser = FakeTool("agent_browser_deep_search", lambda args: "Should not be called")
+    text = "今日长江水位"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities, session_id="s1")
+
+    monkeypatch.setattr(
+        "agents.customer_support_router._read_structured_search_trace",
+        lambda query, depth: {
+            "t0_kb_hit": False,
+            "t1_query": query,
+            "t1_payload_meta": {
+                "Query": query,
+                "SearchType": "web",
+                "Count": 5,
+                "NeedSummary": True,
+                "ContentFormats": "text",
+                "Filter": {"NeedContent": False, "NeedUrl": True, "AuthInfoLevel": 0},
+            },
+            "t1_source_count": 1,
+            "t1_official_source_count": 1,
+            "t1_used_ark_fallback": False,
+            "items": [
+                {
+                    "title": "长江水位日报",
+                    "url": "https://cj.msa.gov.cn/water/2026-06-18.html",
+                    "summary": "2026-06-18 长江水位 12.3 米",
+                    "snippet": "2026-06-18 长江水位 12.3 米",
+                    "authority_level": 1,
+                }
+            ],
+            "summary": "2026-06-18 长江水位 12.3 米",
+        },
+    )
+
+    output = execute_knowledge_chain(
+        text,
+        decision,
+        {"smart_search": smart_search, "agent_browser_deep_search": agent_browser},
+        trace,
+    )
+
+    assert smart_search.calls == [{"query": "今日长江水位", "depth": "quick"}]
+    assert agent_browser.calls == []
+    assert trace.reasoning_trace["retrieval_trace"]["t1_eval_decision"] == "short_circuit"
+    assert trace.reasoning_trace["retrieval_trace"]["t2_triggered"] is False
+    assert trace.reasoning_trace["retrieval_trace"]["t1_payload_meta"]["Filter"].get("Sites") in {None, ""}
+    assert "长江水位" in output
 
 
 def test_history_track_permission_answer_is_concise_and_domain_correct():
