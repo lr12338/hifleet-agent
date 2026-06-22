@@ -4,11 +4,12 @@
 
 ## 推荐阅读顺序
 
-先读下面 4 份，足够理解当前客服链路：
+先读下面 5 份，足够理解当前客服链路和下一阶段收敛方向：
 
 | 目标 | 文档 |
 | --- | --- |
 | 理解当前 Agent 架构、`customer_support` 主链、需求理解 agent、knowledge route 与工具边界 | [AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md) |
+| 查看最近几轮开发日志的压缩总结，并为“以 `employee_assistant` 为主线收敛架构”做准备 | [EMPLOYEE_ASSISTANT_MAINLINE_PREP.md](EMPLOYEE_ASSISTANT_MAINLINE_PREP.md) |
 | 理解知识检索链、`knowledge_qa` 单 skill / 三工具 / `smart_search` 兼容层 | [KNOWLEDGE_BASE_GUIDE.md](KNOWLEDGE_BASE_GUIDE.md) |
 | 查看客服主链回归矩阵、测试入口、验收标准、环境阻塞说明 | [CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md) |
 | 接入 `/run`、`/stream_run`，处理多用户会话 | [API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md) |
@@ -37,13 +38,31 @@ flowchart LR
     API --> Profile[profile 解析]
     Profile --> Graph[统一 phase graph]
     Graph --> CS[customer_support<br/>route -> execute -> delegate fallback -> check -> finalize]
-    Graph --> Employee[employee_assistant<br/>route -> plan -> act -> check -> loop/finalize]
+    Graph --> Employee[employee_assistant<br/>route -> knowledge or plan -> act -> check -> loop/finalize]
     API --> Obs[observability]
 ```
+
+## 当前收敛方向
+
+当前代码仍同时保留 `customer_support` 与 `employee_assistant` 两个 profile，但最近几轮修复已经把以下能力逐步统一：
+
+- 三层知识链：`local_kb_search -> web_search -> web_search_agent_browser`
+- 历史压缩上下文
+- 多模态输入标准化与 direct perception
+- `employee_assistant` 的纯文本 knowledge 快捷主链
+
+因此，后续架构演进默认应优先参考：
+
+- 统一执行内核
+- `customer_support` 更偏向外部客户输出策略层
+- `employee_assistant` 更接近未来主执行骨架
+
+详细背景见 [EMPLOYEE_ASSISTANT_MAINLINE_PREP.md](EMPLOYEE_ASSISTANT_MAINLINE_PREP.md)。
 
 ## 文档维护规则
 
 - 架构变化先更新 `AGENT_TECHNICAL_DOCUMENTATION.md`。
+- 若变化会影响“统一到 `employee_assistant` 主线”的判断，同步更新 `EMPLOYEE_ASSISTANT_MAINLINE_PREP.md`。
 - `customer_support` 的主链、需求理解 agent、上下文策略变化，先更新 `AGENT_TECHNICAL_DOCUMENTATION.md`。
 - `knowledge_qa` 的工具顺序、query 生成、站点过滤、browser 升级规则变化，先更新 `KNOWLEDGE_BASE_GUIDE.md` 和 `src/skills/knowledge_qa/SKILL.md`。
 - `browser` 受控兜底策略变化，再同步更新 `agent_browser_fallback_integration.md`。

@@ -63,7 +63,7 @@ flowchart TD
 当前差异：
 
 - `customer_support`：前置安全拦截 -> execute(需求理解 agent / planner / harness) 或 delegate -> 后置 Guard
-- `employee_assistant`：文件/沙盒工作流闭环
+- `employee_assistant`：知识问答可走三层 knowledge 快捷链；文件/沙盒任务进入 `plan -> act -> check -> loop`
 
 ## 3. customer_support 与 employee_assistant 对比
 
@@ -71,8 +71,8 @@ flowchart TD
 | --- | --- | --- |
 | 面向对象 | 外部客户、微信客服、CRM 渠道 | 内部员工、后台运营 |
 | 主目标 | 给出稳定、简洁、可直接发送的客服回复 | 帮员工完成任务并产出可复核结果 |
-| 主执行方式 | 受控路由 + planner/harness + 标准 Agent 兜底 | workspace task 进入 `plan -> act -> check -> loop` |
-| 前置控制 | `route` 做敏感内部探查拦截、分类、上下文提取 | `route` 判断是否进入 workspace task |
+| 主执行方式 | 受控路由 + planner/harness + 标准 Agent 兜底 | knowledge 可直接走三层检索；workspace task 进入 `plan -> act -> check -> loop` |
+| 前置控制 | `route` 做敏感内部探查拦截、分类、上下文提取 | `route` 判断是否进入 knowledge 快捷链、workspace task 或标准 delegate |
 | 后置控制 | `sanitize_customer_output` + 链接校验 + 统一兜底 | `exit_code` / artifact / sandbox 自愈 |
 | 核心瓶颈 | 知识库完整度、官网检索命中率、上下文误继承 | 文件结构识别、代码生成、沙盒执行 |
 
@@ -276,13 +276,18 @@ flowchart TD
 
 ## 8. employee_assistant 当前链路
 
-`employee_assistant` 保持“工作流型助手”定位，重点是文件/Python/产物。
+`employee_assistant` 当前已经不只是“工作流型助手”，而是同时承担两类职责：
+
+1. `intent_hint=knowledge` 且不是 workspace 文件任务时，直接复用三层知识链
+2. 文件/表格/分析任务进入 `plan -> act -> check -> loop`
 
 ```mermaid
 flowchart TD
     Msg[员工请求] --> Route[route]
+    Route -->|knowledge| Knowledge[三层 knowledge 链]
     Route -->|普通问答| Delegate[standard agent]
     Route -->|文件/表格/分析任务| Plan[plan]
+    Knowledge --> Done1[直接返回]
     Plan --> Inspect[inspect_tabular_file / download]
     Inspect --> Code[生成 Python]
     Code --> Run[run_sandboxed_python]
@@ -292,12 +297,19 @@ flowchart TD
     Loop --> Code
 ```
 
-与 `customer_support` 最大差异：
+最近一轮修复后需要特别注意：
+
+- `employee_assistant` 的纯文本知识问答不再直接依赖标准 delegate，而是优先走三层知识链
+- 这样可以绕开标准 agent 在某些纯文本 knowledge 场景下的 `last_ai_index` 内部异常
+
+与 `customer_support` 当前最大差异：
 
 - `employee_assistant` 允许更长执行链和沙盒循环
 - 输出对象是员工，不是客户
 - 重点是产物和分析结果，不是客服化话术
 - `customer_support` 可以用文件/浏览器/多模态，但必须受控且对外极度收口
+
+这也意味着，下一阶段如果要继续简化架构，`employee_assistant` 已具备成为统一执行骨架的条件；`customer_support` 更可能收敛为客户输出策略层。相关背景见 [EMPLOYEE_ASSISTANT_MAINLINE_PREP.md](EMPLOYEE_ASSISTANT_MAINLINE_PREP.md)。
 
 ## 9. 开发建议
 

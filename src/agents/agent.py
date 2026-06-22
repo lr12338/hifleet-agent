@@ -172,6 +172,15 @@ JSON 格式:
 {"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true}
 """
 
+
+def _safe_default_headers(ctx) -> dict[str, str]:
+    if not ctx:
+        return {}
+    try:
+        return default_headers(ctx)
+    except Exception:
+        return {}
+
 CUSTOMER_SUPPORT_PERCEPTION_PROMPT = """你是 HiFleet 客服附件识别助手。
 只根据用户文字和附件内容做轻量识别，不回答用户问题，只返回 JSON。
 
@@ -307,7 +316,7 @@ def _build_customer_support_json_llm(ctx, cfg: dict[str, Any], model_override: s
     runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
     model = str(model_override or (cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
     try:
-        headers = default_headers(ctx) if ctx else {}
+        headers = _safe_default_headers(ctx)
     except Exception:
         headers = {}
     return ChatOpenAI(
@@ -504,15 +513,19 @@ def _run_customer_support_perception_agent(
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
         extra_body={"thinking": {"type": "disabled"}},
-        default_headers=default_headers(ctx) if ctx else {},
+        default_headers=_safe_default_headers(ctx),
     )
     content: list[dict[str, Any]] = [{"type": "text", "text": f"用户问题：{text}\n请识别附件并只返回 JSON。"}]
     if attachment.type == "image":
         content.append({"type": "image_url", "image_url": {"url": attachment.url}})
     elif attachment.type == "video":
-        content.append({"type": "text", "text": f"视频附件 URL：{attachment.url}"})
+        content.append({"type": "video_url", "video_url": {"url": attachment.url}})
     elif attachment.type == "audio":
-        content.append({"type": "text", "text": f"音频附件 URL：{attachment.url}"})
+        audio_obj: dict[str, Any] = {"url": attachment.url}
+        suffix = attachment.filename.rsplit(".", 1)[-1].lower() if "." in attachment.filename else ""
+        if suffix:
+            audio_obj["format"] = suffix
+        content.append({"type": "input_audio", "input_audio": audio_obj})
     try:
         result = llm.invoke([SystemMessage(content=CUSTOMER_SUPPORT_PERCEPTION_PROMPT), HumanMessage(content=content)])
     except Exception as exc:
@@ -1180,6 +1193,25 @@ def _message_text_for_context_summary(msg: AnyMessage) -> str:
     return str(content or "")
 
 
+def _sanitize_historical_multimodal_content(content: Any) -> Any:
+    """Drop stale media URLs from historical turns while preserving text context."""
+    if not isinstance(content, list):
+        return content
+    kept = []
+    for seg in content:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = str(seg.get("type", "")).strip().lower()
+        if seg_type in {"input_audio", "image_url", "video_url"}:
+            continue
+        kept.append(seg)
+    if not kept:
+        return "（历史多媒体内容已省略，仅保留上下文结论）"
+    if len(kept) == 1 and kept[0].get("type") == "text":
+        return str(kept[0].get("text", "")).strip()
+    return kept
+
+
 def _clean_context_summary_text(text: str, *, max_chars: int = 120) -> str:
     value = sanitize_customer_output(text or "")
     value = re.sub(r"(?mi)^综合摘要[:：]?\s*", "", value)
@@ -1238,6 +1270,17 @@ def _build_compressed_history_message(messages: list[AnyMessage], latest_user_id
     return SystemMessage(content=content)
 
 
+def _copy_message_with_content(msg: AnyMessage, content: Any) -> AnyMessage:
+    try:
+        return msg.model_copy(update={"content": content})
+    except Exception:
+        try:
+            msg.content = content
+        except Exception:
+            pass
+        return msg
+
+
 def _windowed_messages(old, new):
     merged = add_messages(old, new)
     cleaned = []
@@ -1264,9 +1307,14 @@ def _windowed_messages(old, new):
         if latest_user_idx >= 0 and latest_system_idx >= 0:
             break
 
+    for idx, msg in enumerate(list(cleaned)):
+        if isinstance(msg, HumanMessage) and idx != latest_user_idx:
+            new_content = _sanitize_historical_multimodal_content(msg.content)
+            if new_content != msg.content:
+                cleaned[idx] = _copy_message_with_content(msg, new_content)
+
     latest_user = cleaned[latest_user_idx] if latest_user_idx >= 0 else None
     latest_system = cleaned[latest_system_idx] if latest_system_idx >= 0 else None
-    latest_user_text = _message_text_for_context_summary(latest_user) if latest_user else ""
     use_compressed_context = len(cleaned) > CONTEXT_COMPRESS_TRIGGER_MESSAGES
 
     if not use_compressed_context:
@@ -1287,6 +1335,188 @@ def _windowed_messages(old, new):
     return result[-MAX_MESSAGES:] if result else cleaned[-MAX_MESSAGES:]
 
 
+def _iter_message_content_parts(messages: list[AnyMessage] | list[Any] | None):
+    for msg in messages or []:
+        content = None
+        if isinstance(msg, (HumanMessage, AIMessage, SystemMessage)):
+            content = msg.content
+        elif isinstance(msg, dict):
+            content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    yield part
+
+
+def _iter_latest_human_content_parts(messages: list[AnyMessage] | list[Any] | None):
+    content = _latest_human_content(messages)
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                yield part
+
+
+def _message_text_segments(messages: list[AnyMessage] | list[Any] | None) -> list[str]:
+    texts: list[str] = []
+    for part in _iter_latest_human_content_parts(messages):
+        if str(part.get("type", "")).strip().lower() == "text":
+            text = str(part.get("text", "") or "").strip()
+            if text:
+                texts.append(text)
+    return texts
+
+
+def _has_current_multimodal_media(messages: list[AnyMessage] | list[Any] | None) -> bool:
+    return any(str(part.get("type", "")).strip().lower() in {"input_audio", "image_url", "video_url"} for part in _iter_latest_human_content_parts(messages))
+
+
+def _latest_human_content(messages: list[AnyMessage] | list[Any] | None) -> Any:
+    for msg in reversed(messages or []):
+        if isinstance(msg, HumanMessage):
+            return msg.content
+        if isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user":
+            return msg.get("content", "")
+    return ""
+
+
+def _primary_multimodal_type(messages: list[AnyMessage] | list[Any] | None) -> str:
+    for part in _iter_latest_human_content_parts(messages):
+        part_type = str(part.get("type", "")).strip().lower()
+        if part_type == "input_audio":
+            return "audio"
+        if part_type == "image_url":
+            return "image"
+        if part_type == "video_url":
+            return "video"
+    return "unknown"
+
+
+def _fallback_multimodal_perception(messages: list[AnyMessage] | list[Any] | None, *, attachment_type: str = "") -> dict[str, Any]:
+    user_text = "\n".join(_message_text_segments(messages)).strip()
+    return {
+        "attachment_type": attachment_type or _primary_multimodal_type(messages),
+        "recognized_text": "",
+        "summary": "",
+        "visible_text": "",
+        "suspected_symbol": "",
+        "suspected_issue": "",
+        "confidence": "low",
+        "source": "fallback",
+        "user_text": user_text,
+    }
+
+
+def _normalize_multimodal_perception(raw: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    value = dict(fallback)
+    if isinstance(raw, dict):
+        value.update({k: v for k, v in raw.items() if v is not None})
+    confidence = str(value.get("confidence") or "low").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    value["confidence"] = confidence
+    for key in ("recognized_text", "summary", "visible_text", "suspected_symbol", "suspected_issue", "attachment_type"):
+        value[key] = str(value.get(key) or "").strip()
+    value["source"] = str(value.get("source") or "direct_multimodal_model")
+    return value
+
+
+def _run_direct_multimodal_perception(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    messages: list[AnyMessage] | list[Any],
+    fallback_type: str = "",
+) -> dict[str, Any]:
+    fallback = _fallback_multimodal_perception(messages, attachment_type=fallback_type)
+    if not _has_current_multimodal_media(messages):
+        return fallback
+    api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
+    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
+    if not api_key or not base_url:
+        return fallback
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
+    model = str((cfg.get("config") or {}).get("multimodal_model") or runtime_settings["model"] or DEFAULT_MULTIMODAL_MODEL).strip()
+    llm = ChatOpenAI(
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0.0,
+        streaming=False,
+        timeout=(cfg.get("config") or {}).get("timeout", 600),
+        extra_body={"thinking": {"type": "disabled"}},
+        default_headers=_safe_default_headers(ctx),
+    )
+    prompt = (
+        "你是 HiFleet 多模态感知层。只输出 JSON，不要解释。\n"
+        "字段：attachment_type(audio|image|video|unknown), recognized_text, summary, visible_text, "
+        "suspected_symbol, suspected_issue, confidence(high|medium|low)。\n"
+        "音频：尽量转写语音内容到 recognized_text。\n"
+        "图片：识别可见文字、界面元素、海图符号、报错信息。\n"
+        "视频：基于可访问内容或首帧能力总结到 summary；不确定时 confidence=low。"
+    )
+    try:
+        result = llm.invoke([SystemMessage(content=prompt), HumanMessage(content=_latest_human_content(messages))])
+    except Exception as exc:
+        logger.warning("[DirectMultimodalPerception] invoke failed: %s", exc)
+        return fallback
+    parsed = _json_object_from_text(getattr(result, "content", ""))
+    normalized = _normalize_multimodal_perception(parsed, fallback)
+    normalized["source"] = "direct_multimodal_model"
+    return normalized
+
+
+def _multimodal_perception_has_signal(perception: dict[str, Any]) -> bool:
+    if str(perception.get("confidence") or "").lower() in {"high", "medium"}:
+        return True
+    return any(str(perception.get(key) or "").strip() for key in ("recognized_text", "summary", "visible_text", "suspected_symbol", "suspected_issue"))
+
+
+def _multimodal_failure_response() -> str:
+    return "暂时无法稳定识别该多模态文件。请补充文字说明，或稍后重新上传后我再继续处理。"
+
+
+def _text_from_multimodal_perception(perception: dict[str, Any], user_text: str = "") -> str:
+    parts: list[str] = []
+    attachment_type = str(perception.get("attachment_type") or "").strip().lower()
+    recognized = str(perception.get("recognized_text") or "").strip()
+    summary = str(perception.get("summary") or "").strip()
+    visible = str(perception.get("visible_text") or "").strip()
+    suspected_symbol = str(perception.get("suspected_symbol") or "").strip()
+    suspected_issue = str(perception.get("suspected_issue") or "").strip()
+    if recognized:
+        prefix = "语音识别内容" if attachment_type == "audio" else "附件识别内容"
+        parts.append(f"{prefix}：{recognized}")
+    if summary:
+        parts.append(f"附件摘要：{summary}")
+    if visible:
+        parts.append(f"可见文字：{visible}")
+    if suspected_symbol:
+        parts.append(f"疑似对象：{suspected_symbol}")
+    if suspected_issue:
+        parts.append(f"疑似问题：{suspected_issue}")
+    if user_text:
+        parts.append(f"用户补充：{user_text}")
+    return "\n".join(parts).strip() or user_text
+
+
+def _messages_with_text_replacement(messages: list[AnyMessage] | list[Any], replacement_text: str) -> list[Any]:
+    replaced: list[Any] = []
+    latest_user_replaced = False
+    for msg in reversed(messages or []):
+        is_user = isinstance(msg, HumanMessage) or (isinstance(msg, dict) and str(msg.get("role", "")).lower() == "user")
+        if is_user and not latest_user_replaced:
+            if isinstance(msg, HumanMessage):
+                replaced.append(HumanMessage(content=replacement_text))
+            else:
+                new_msg = dict(msg)
+                new_msg["content"] = replacement_text
+                replaced.append(new_msg)
+            latest_user_replaced = True
+        else:
+            replaced.append(msg)
+    return list(reversed(replaced))
+
+
 class AgentState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], _windowed_messages]
 
@@ -1300,7 +1530,7 @@ class EmployeeAgentState(TypedDict, total=False):
     intent_hint: str
     status: str
     loop_count: int
-    phase: Literal["route", "download", "plan", "act", "check", "loop", "done", "failed", "delegated"]
+    phase: Literal["route", "knowledge", "download", "plan", "act", "check", "loop", "done", "failed", "delegated"]
     phase_history: list[str]
     workspace_task: bool
     task_goal: str
@@ -1311,6 +1541,9 @@ class EmployeeAgentState(TypedDict, total=False):
     generated_code: str
     sandbox_result: dict[str, Any]
     last_error: dict[str, Any]
+    generated_answer: str
+    generated_tool_calls: list[str]
+    route_trace: dict[str, Any]
 
 
 class CustomerSupportState(TypedDict, total=False):
@@ -1502,7 +1735,7 @@ def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
         streaming=streaming,
         timeout=cfg["config"].get("timeout", 600),
         extra_body={"thinking": {"type": runtime_settings["thinking_type"]}},
-        default_headers=default_headers(ctx) if ctx else {},
+        default_headers=_safe_default_headers(ctx),
     )
 
 
@@ -1641,7 +1874,31 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     )
 
     def route_node(state: EmployeeAgentState) -> dict[str, Any]:
-        user_text = _latest_user_text(state.get("messages", []))
+        messages = list(state.get("messages", []) or [])
+        user_text = _latest_user_text(messages)
+        if is_sensitive_internal_request(user_text):
+            return {
+                "phase": "done",
+                "status": "success",
+                "phase_history": ["route", "done"],
+                "workspace_task": False,
+                "task_goal": user_text,
+                "messages": [AIMessage(content=SENSITIVE_DISCLOSURE_REFUSAL)],
+            }
+        if _has_current_multimodal_media(messages):
+            perception = _run_direct_multimodal_perception(ctx=ctx, cfg=cfg, messages=messages)
+            if _multimodal_perception_has_signal(perception):
+                user_text = _text_from_multimodal_perception(perception, user_text)
+                messages = _messages_with_text_replacement(messages, user_text)
+            else:
+                return {
+                    "phase": "done",
+                    "status": "success",
+                    "phase_history": ["route", "done"],
+                    "workspace_task": False,
+                    "task_goal": user_text,
+                    "messages": [AIMessage(content=_multimodal_failure_response())],
+                }
         if is_sensitive_internal_request(user_text):
             return {
                 "phase": "done",
@@ -1655,15 +1912,53 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         source_file_url = _extract_public_file_url(user_text)
         expected_artifact = _extract_expected_artifact(user_text, target_file_path or source_file_url)
         workspace_task = bool((target_file_path or source_file_url) and any(keyword in user_text for keyword in ["分析", "表格", "csv", "excel", "xlsx", "报价", "统计", "数据", "生成", "python", "下载", "链接"]))
+        resolved_intent = str(state.get("intent_hint") or intent_hint or "").strip().lower()
+        phase = "knowledge" if resolved_intent == "knowledge" and not workspace_task else "route"
         return {
-            "phase": "route",
+            "phase": phase,
             "phase_history": ["route"],
+            "messages": messages,
             "workspace_task": workspace_task,
             "task_goal": user_text,
             "target_file_path": target_file_path,
             "source_file_url": source_file_url,
             "expected_artifact": expected_artifact,
             "loop_count": int(state.get("loop_count") or 0),
+        }
+
+    def knowledge_node(state: EmployeeAgentState) -> dict[str, Any]:
+        messages = list(state.get("messages", []) or [])
+        question = str(state.get("task_goal") or _latest_user_text(messages) or "").strip()
+        context = build_conversation_context(messages)
+        entities = extract_entities(question)
+        understanding_result = _normalize_customer_support_understanding_result(
+            {},
+            text=question,
+            intent="knowledge",
+            route="knowledge",
+        )
+        answer, trace, _evidence_items, _evidence_summary = _execute_customer_support_planner(
+            question=question,
+            route="knowledge",
+            task_type="platform_knowledge",
+            tool_bundle=KNOWLEDGE_BUNDLE,
+            entities=entities,
+            context=context,
+            understanding_result=understanding_result,
+            session_id=str(state.get("session_id", "")),
+            run_id=str(getattr(ctx, "run_id", "") or ""),
+        )
+        final_answer = sanitize_customer_output(answer)
+        return {
+            "phase": "done",
+            "status": "success",
+            "phase_history": list(state.get("phase_history", [])) + ["knowledge"],
+            "workspace_task": False,
+            "task_goal": question,
+            "messages": [AIMessage(content=final_answer)],
+            "generated_answer": final_answer,
+            "generated_tool_calls": list(trace.get("tool_call_sequence", []) or []),
+            "route_trace": trace,
         }
 
     def delegate_node(state: EmployeeAgentState) -> dict[str, Any]:
@@ -1790,6 +2085,8 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     def route_after_entry(state: EmployeeAgentState) -> str:
         if state.get("phase") == "done":
             return "delegate"
+        if state.get("phase") == "knowledge":
+            return "knowledge"
         if state.get("workspace_task"):
             return "plan"
         return "delegate"
@@ -1803,6 +2100,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
 
     graph = StateGraph(EmployeeAgentState)
     graph.add_node("route", route_node)
+    graph.add_node("knowledge", knowledge_node)
     graph.add_node("delegate", delegate_node)
     graph.add_node("plan", plan_node)
     graph.add_node("act", act_node)
@@ -1811,7 +2109,8 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     graph.add_node("finalize", finalize_node)
     graph.add_node("fail", fail_node)
     graph.add_edge(START, "route")
-    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "plan": "plan"})
+    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "knowledge": "knowledge", "plan": "plan"})
+    graph.add_edge("knowledge", END)
     graph.add_edge("delegate", END)
     graph.add_edge("plan", "act")
     graph.add_edge("act", "check")
@@ -1940,7 +2239,42 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                     "reasoning_trace": {"route_source": "safety_rule"},
                 },
             }
+        if _has_current_multimodal_media(list(messages or [])):
+            direct_perception = _run_direct_multimodal_perception(ctx=ctx, cfg=cfg, messages=list(messages or []))
+            if not _multimodal_perception_has_signal(direct_perception):
+                return {
+                    "phase": "done",
+                    "status": "success",
+                    "phase_history": ["route", "done"],
+                    "support_task": True,
+                    "task_goal": text,
+                    "messages": [AIMessage(content=_multimodal_failure_response())],
+                    "generated_answer": _multimodal_failure_response(),
+                    "generated_tool_calls": [],
+                    "route": "multimodal_understanding",
+                    "task_type": "multimodal_understanding",
+                    "tool_bundle": [],
+                    "entities": {},
+                    "attachments": [],
+                    "route_trace": {
+                        "route": "multimodal_understanding",
+                        "task_type": "multimodal_understanding",
+                        "tool_bundle": [],
+                        "tool_call_sequence": [],
+                        "check_result": {"blocked": True, "multimodal_perception_failed": True},
+                        "answer_confidence": "medium",
+                        "reasoning_trace": {"route_source": "direct_multimodal_model"},
+                    },
+                }
+            attachment_type = str(direct_perception.get("attachment_type") or _primary_multimodal_type(list(messages or [])))
+            if attachment_type == "audio":
+                text = _text_from_multimodal_perception(direct_perception, text)
+                messages = _messages_with_text_replacement(list(messages or []), text)
+            else:
+                messages = list(messages or [])
         decision, entities, attachments, perception, intent_agent_result, route_source = _classify_customer_support(messages)
+        if _has_current_multimodal_media(list(messages or [])) and "direct_perception" in locals() and _multimodal_perception_has_signal(direct_perception):
+            perception = {**dict(perception or {}), **dict(direct_perception or {})}
         trace = make_trace(
             decision,
             MessageEntities(**entities),
@@ -1964,7 +2298,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
                 "should_prefer_local_kb": bool((intent_agent_result or {}).get("should_prefer_local_kb")),
                 "should_limit_to_hifleet_sites": bool((intent_agent_result or {}).get("should_limit_to_hifleet_sites")),
             },
-            "route_source": route_source,
+            "route_source": "direct_multimodal_model" if "direct_perception" in locals() else route_source,
         }
         return {
             "phase": "route",
@@ -1981,6 +2315,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "intent_agent_result": intent_agent_result,
             "started_at_ms": int(time.time() * 1000),
             "route_trace": asdict(trace),
+            "messages": messages,
         }
 
     def execute_node(state: CustomerSupportState) -> dict[str, Any]:

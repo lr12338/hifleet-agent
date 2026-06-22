@@ -130,12 +130,16 @@ def _build_multimodal_content_from_input(input_payload: Dict[str, Any]) -> List[
     text = str(input_payload.get("text", "")).strip()
     image_url = str(input_payload.get("image_url", "")).strip()
     audio_url = str(input_payload.get("audio_url", "")).strip()
+    audio_format = str(input_payload.get("audio_format", "") or input_payload.get("format", "")).strip()
     video_url = str(input_payload.get("video_url", "")).strip()
 
     if image_url:
         content.append({"type": "image_url", "image_url": {"url": image_url}})
     if audio_url:
-        content.append({"type": "input_audio", "input_audio": {"url": audio_url}})
+        audio_obj: Dict[str, Any] = {"url": audio_url}
+        if audio_format:
+            audio_obj["format"] = audio_format
+        content.append({"type": "input_audio", "input_audio": audio_obj})
     if video_url:
         content.append({"type": "video_url", "video_url": {"url": video_url}})
     if text:
@@ -279,28 +283,41 @@ def _build_stream_prompt_from_messages(messages: List[Dict[str, Any]]) -> List[D
                 continue
 
             file_url = ""
+            file_format = ""
+            prompt_type = "upload_file"
             if part_type == "image_url":
                 file_url = str((part.get("image_url") or {}).get("url", "")).strip()
+                prompt_type = "image"
             elif part_type == "video_url":
                 file_url = str((part.get("video_url") or {}).get("url", "")).strip()
+                prompt_type = "video"
             elif part_type == "input_audio":
-                file_url = str((part.get("input_audio") or {}).get("url", "")).strip()
+                audio_obj = part.get("input_audio") or {}
+                file_url = str(audio_obj.get("url", "")).strip()
+                file_format = str(audio_obj.get("format", "")).strip()
+                prompt_type = "voice"
             elif part_type == "file_url":
                 file_url = str((part.get("file_url") or {}).get("url", "")).strip()
 
             if file_url:
-                prompt.append(
-                    {
-                        "type": "upload_file",
-                        "content": {
-                            "upload_file": {
-                                "file_name": _filename_from_url(file_url),
-                                "file_path": "",
-                                "url": file_url,
-                            }
-                        },
-                    }
-                )
+                if prompt_type in {"image", "video", "voice"}:
+                    content_payload: Dict[str, Any] = {"url": file_url}
+                    if file_format:
+                        content_payload["format"] = file_format
+                    prompt.append({"type": prompt_type, "content": content_payload})
+                else:
+                    prompt.append(
+                        {
+                            "type": "upload_file",
+                            "content": {
+                                "upload_file": {
+                                    "file_name": _filename_from_url(file_url),
+                                    "file_path": "",
+                                    "url": file_url,
+                                }
+                            },
+                        }
+                    )
         return prompt
     return []
 

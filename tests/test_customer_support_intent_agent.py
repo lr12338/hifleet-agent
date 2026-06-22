@@ -8,6 +8,7 @@ from agents.agent import (
     SENSITIVE_REFUSAL as AGENT_SENSITIVE_REFUSAL,
     _build_customer_support_followup_question,
     _build_customer_support_agent,
+    _build_employee_agent,
     _customer_support_route_for_intent,
     _execute_customer_support_harness,
     _execute_customer_support_planner,
@@ -40,6 +41,7 @@ from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_o
 from skills.skill_loader import SkillLoader
 from skills.knowledge_qa.tools import HIFLEET_COMMUNITY_URL, HIFLEET_SITES
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from coze_coding_utils.runtime_ctx.context import new_context
 
 
 class FakeTool:
@@ -118,6 +120,233 @@ def test_windowed_messages_preserves_ship_entity_in_compressed_summary():
     assert messages[-1].content == latest.content
 
 
+def test_windowed_messages_strips_historical_media_but_keeps_latest_media():
+    old = [
+        HumanMessage(
+            content=[
+                {"type": "input_audio", "input_audio": {"url": "https://example.com/old.amr", "format": "amr"}},
+                {"type": "text", "text": "旧语音"},
+            ]
+        )
+    ]
+    latest = HumanMessage(
+        content=[
+            {"type": "input_audio", "input_audio": {"url": "https://example.com/new.amr", "format": "amr"}},
+            {"type": "text", "text": "请先识别语音内容，再结合识别结果简要回复。"},
+        ]
+    )
+
+    messages = _windowed_messages(old, [latest])
+
+    assert messages[0].content == "旧语音"
+    assert messages[-1].content[0]["type"] == "input_audio"
+    assert messages[-1].content[0]["input_audio"]["format"] == "amr"
+
+
+def test_windowed_messages_compressed_context_keeps_latest_multimodal_content():
+    history = []
+    for idx in range(10):
+        history.append(HumanMessage(content=f"历史问题 {idx}"))
+        history.append(AIMessage(content=f"历史回答 {idx}"))
+    latest = HumanMessage(
+        content=[
+            {"type": "image_url", "image_url": {"url": "https://example.com/latest.png"}},
+            {"type": "text", "text": "识别这张图"},
+        ]
+    )
+
+    messages = _windowed_messages(history, [latest])
+
+    assert isinstance(messages[-1], HumanMessage)
+    assert messages[-1].content[0]["type"] == "image_url"
+    assert any(isinstance(msg, SystemMessage) and "历史上下文摘要" in str(msg.content) for msg in messages)
+
+
+def test_employee_assistant_audio_direct_perception_rewrites_to_text(monkeypatch):
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            content = payload["messages"][-1].content
+            assert isinstance(content, str)
+            assert "语音识别内容：查一下今天长江水位" in content
+            return {"messages": [AIMessage(content="已根据语音内容继续处理。")]}
+
+    monkeypatch.setattr("agents.agent._build_llm", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {
+            "attachment_type": "audio",
+            "recognized_text": "查一下今天长江水位",
+            "summary": "",
+            "visible_text": "",
+            "suspected_issue": "",
+            "confidence": "high",
+        },
+    )
+    graph = _build_employee_agent(
+        ctx=new_context("test"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="employee_assistant", skills=["knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=[
+                        {"type": "input_audio", "input_audio": {"url": "https://example.com/a.amr", "format": "amr"}},
+                        {"type": "text", "text": "请先识别语音内容，再结合识别结果简要回复。"},
+                    ]
+                )
+            ],
+            "session_id": "s-audio-employee",
+            "agent_profile": "employee_assistant",
+        },
+        config={"configurable": {"thread_id": "s-audio-employee"}},
+    )
+
+    assert result["status"] == "delegated"
+    assert "已根据语音内容继续处理" in result["messages"][-1].content
+
+
+def test_customer_support_audio_direct_perception_rewrites_current_question(monkeypatch):
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            raise AssertionError("audio knowledge should stay in customer support graph")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {
+            "attachment_type": "audio",
+            "recognized_text": "Hifleet筛选船队有记忆功能吗",
+            "summary": "",
+            "visible_text": "",
+            "suspected_issue": "",
+            "confidence": "high",
+        },
+    )
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: '{"tool":"local_kb_search","can_answer":true,"should_continue":false,"items":[{"title":"筛选记忆","content":"HiFleet支持浏览器记忆船队筛选条件。","score":0.95}]}',
+    )
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [local_kb])
+    graph = _build_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-audio"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["multimodal_support", "knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=[
+                        {"type": "input_audio", "input_audio": {"url": "https://example.com/a.amr", "format": "amr"}},
+                        {"type": "text", "text": "请先识别语音内容，再结合识别结果简要回复。"},
+                    ]
+                )
+            ],
+            "session_id": "s-audio-customer",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-audio-customer"}},
+    )
+
+    assert result["status"] == "success"
+    assert "筛选" in result["task_goal"]
+    assert "HiFleet" in result["messages"][-1].content
+
+
+def test_employee_assistant_multimodal_direct_perception_failure_is_stable(monkeypatch):
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            raise AssertionError("failed perception should not reach standard agent")
+
+    monkeypatch.setattr("agents.agent._build_llm", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {"attachment_type": "audio", "confidence": "low", "recognized_text": "", "summary": "", "visible_text": "", "suspected_issue": ""},
+    )
+    graph = _build_employee_agent(
+        ctx=new_context("test"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="employee_assistant", skills=["knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content=[{"type": "input_audio", "input_audio": {"url": "https://example.com/a.amr", "format": "amr"}}])],
+            "session_id": "s-audio-fail",
+            "agent_profile": "employee_assistant",
+        },
+        config={"configurable": {"thread_id": "s-audio-fail"}},
+    )
+
+    assert result["status"] == "success"
+    assert "暂时无法稳定识别" in result["messages"][-1].content
+
+
+def test_customer_support_image_direct_perception_feeds_multimodal_route(monkeypatch):
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            raise AssertionError("image task should stay in customer support graph")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {
+            "attachment_type": "image",
+            "recognized_text": "",
+            "summary": "图片中是红色圆形标志，中心有黑点。",
+            "visible_text": "",
+            "suspected_symbol": "安全水域浮标",
+            "suspected_issue": "全球海图符号含义咨询",
+            "confidence": "high",
+        },
+    )
+    monkeypatch.setattr(
+        "agents.agent._run_customer_support_intent_agent",
+        lambda **kwargs: {
+            "intent": "chart_symbol",
+            "confidence": "high",
+            "needs_multimodal_grounding": True,
+            "query_type": "multimodal_symbol",
+        },
+    )
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [])
+    graph = _build_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-image"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["multimodal_support", "knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=[
+                        {"type": "image_url", "image_url": {"url": "https://example.com/chart.png"}},
+                        {"type": "text", "text": "这个图标是什么意思"},
+                    ]
+                )
+            ],
+            "session_id": "s-image",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-image"}},
+    )
+
+    assert result["route"] == "chart_symbol"
+    assert result["perception_result"]["suspected_symbol"] == "安全水域浮标"
+    assert "安全水域浮标" in result["messages"][-1].content
+
+
 def test_customer_support_agent_imports_guard_refusal_constant():
     assert AGENT_SENSITIVE_REFUSAL == SENSITIVE_REFUSAL
 
@@ -172,6 +401,16 @@ def test_customer_support_graph_uses_light_agent_after_perception(monkeypatch):
         },
     )
     monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {
+            "attachment_type": "image",
+            "summary": "HiFleet 海图上有红色圆形标志",
+            "suspected_symbol": "安全水域浮标",
+            "confidence": "high",
+            "source": "test",
+        },
+    )
+    monkeypatch.setattr(
         "agents.agent._run_customer_support_intent_agent",
         lambda **kwargs: {
             "intent": "chart_symbol",
@@ -214,7 +453,7 @@ def test_customer_support_graph_uses_light_agent_after_perception(monkeypatch):
     )
 
     assert result["route"] == "chart_symbol"
-    assert result["route_trace"]["reasoning_trace"]["route_source"] == "light_agent"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "direct_multimodal_model"
     assert result["route_trace"]["reasoning_trace"]["perception_summary"]["suspected_symbol"] == "安全水域浮标"
     assert "安全水域浮标" in result["messages"][-1].content
 
@@ -325,6 +564,45 @@ def test_employee_assistant_profile_loads_three_layer_knowledge_and_browser_brid
     assert {"local_kb_search", "web_search", "web_search_agent_browser"} <= names
     assert {"verify_public_page", "agent_browser_deep_search"} <= names
     assert "smart_search" not in names
+
+
+def test_employee_assistant_knowledge_hint_uses_three_layer_chain(monkeypatch):
+    local = FakeTool("local_kb_search", lambda args: '{"tool":"local_kb_search","can_answer":false,"items":[]}')
+    web = FakeTool(
+        "web_search",
+        lambda args: '{"tool":"web_search","can_answer":true,"summary":"DTU 安装一般需要确认设备型号、供电、天线/SIM 卡、接线和平台绑定步骤。","items":[{"title":"DTU 安装说明","snippet":"确认设备型号、供电、天线/SIM 卡、接线和平台绑定。","url":"https://www.hifleet.com/helpcenter/?i18n=zh","source":"official"}]}',
+    )
+    browser = FakeTool("web_search_agent_browser", lambda args: '{"tool":"web_search_agent_browser","can_answer":true,"items":[]}')
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [local, web, browser])
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None):
+            raise AssertionError("employee_assistant knowledge hint should not delegate to standard_agent")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_employee_agent(
+        ctx=SimpleNamespace(run_id="r-employee-knowledge"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="employee_assistant", skills=["knowledge_qa", "browser_verify"]),
+        intent_hint="knowledge",
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="我们想安装DTU，需要怎么操作？")],
+            "session_id": "s-employee-knowledge",
+            "agent_profile": "employee_assistant",
+            "intent_hint": "knowledge",
+            "source_channel": "wechat_kf",
+        },
+        config={"configurable": {"thread_id": "s-employee-knowledge"}},
+    )
+
+    assert result["phase"] == "done"
+    assert result["status"] == "success"
+    assert "DTU" in result["messages"][-1].content
+    assert result["generated_tool_calls"] == ["local_kb_search", "web_search"]
 
 
 def test_hifleet_community_is_registered_as_official_search_source():
