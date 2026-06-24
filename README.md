@@ -9,6 +9,7 @@
 - `customer_ceshi`：测试/内部 Agent，保留知识问答、业务工具、文件检查和受控 Python 分析能力。
 
 详细架构请优先阅读：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
+客服知识检索、平台操作类收口和授权写库请看：`docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md`。
 如果是在其他服务器上部署联调，先看：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`。
 如果需要让远端代码 Agent 快速接手检查和烟测，可直接使用：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`。
 
@@ -24,7 +25,7 @@ coze_ai/
 ├── src/
 │   ├── main.py                     # FastAPI 入口，/run、/stream_run、/admin-ui
 │   ├── agents/                     # Agent 构建和 Profile 解析
-│   ├── skills/                     # knowledge_qa / hifleet_ship_service / employee_workspace
+│   ├── skills/                     # knowledge_qa / knowledge_admin / hifleet_ship_service / employee_workspace
 │   ├── admin_api/                  # 后台管理 API
 │   └── observability/              # 日志、工具调用、会话观测
 ├── frontend/                       # React 后台管理台
@@ -39,7 +40,7 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 | Profile | 典型 source_channel | 能力 |
 | --- | --- | --- |
 | `customer_support` | `websdk`, `wechat_mp`, `wechat_kf`, `customer_api`, `crm` | 正式客服 profile；`employee_assistant` 作为兼容别名也会落到这里 |
-| `customer_ceshi` | `admin_panel`, `internal_web`, `employee_api`, `employee_assistant` | 测试/内部 profile；包含 employee workspace、表格检查和受控 Python 沙盒 |
+| `customer_ceshi` | `admin_panel`, `internal_web`, `employee_api` | 测试/内部 profile；包含 employee workspace、表格检查和受控 Python 沙盒 |
 
 ## 3. 快速启动
 
@@ -89,6 +90,12 @@ ADMIN_API_KEY=your_admin_secret
 SHIP_SERVICE_API_URL=...
 SHIP_SERVICE_API_TOKEN=...
 ark_websearch_api_key=...
+```
+
+授权写入本地知识库时需要额外配置：
+
+```bash
+HIFLEET_KB_UPDATE_KEY=<HIFLEET_KB_UPDATE_KEY>
 ```
 
 数字员工 Python/文件能力可选变量：
@@ -161,6 +168,7 @@ npm run build
 ## 8. 文档入口
 
 - 主架构：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`
+- 客服知识检索与授权写库：`docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md`
 - 异地部署联调：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`
 - 远端 Agent 检查提示词：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`
 - `agent-browser` 兜底链：`docs/agent_browser_fallback_integration.md`

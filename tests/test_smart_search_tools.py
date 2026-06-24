@@ -216,6 +216,72 @@ def test_web_search_returns_structured_analysis(monkeypatch):
     assert payload["items"][0]["has_specific_fact"] is True
 
 
+def test_web_search_how_to_rejects_directory_or_video_only(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_web_search",
+        lambda query, **kwargs: {
+            "query": query,
+            "summary": "命中帮助中心和演示视频标题",
+            "items": [
+                {
+                    "title": "HiFleet 帮助中心",
+                    "url": "https://www.hifleet.com/helpcenter/?i18n=zh",
+                    "site_name": "HiFleet",
+                    "summary": "官方平台使用与问题排查文档入口。",
+                    "snippet": "官方平台使用与问题排查文档入口。",
+                    "authority_level": 1,
+                },
+                {
+                    "title": "在HiFleet平台上添加区域(电子围栏)报警 - HIFLEET演示视频",
+                    "url": "https://www.hifleet.com/wp/communities/fleet/video-area",
+                    "site_name": "HiFleet",
+                    "summary": "演示视频标题页，介绍可添加区域报警。",
+                    "snippet": "演示视频标题页，介绍可添加区域报警。",
+                    "authority_level": 1,
+                },
+            ],
+            "payload_meta": {"Filter": {"Sites": tools.HIFLEET_SITES}},
+            "used_ark_fallback": False,
+        },
+    )
+
+    payload = json.loads(tools.web_search.invoke({"query": "怎么绘制区域标注"}))
+
+    assert payload["can_answer"] is False
+    assert payload["trace"]["question_class"] == "how_to_operate"
+    assert "tutorial_generic_pages_only" in payload["trace"]["risk_flags"]
+
+
+def test_web_search_how_to_accepts_official_step_evidence(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_web_search",
+        lambda query, **kwargs: {
+            "query": query,
+            "summary": "命中官方正文步骤",
+            "items": [
+                {
+                    "title": "HiFleet 区域标注操作说明",
+                    "url": "https://www.hifleet.com/wp/communities/fleet/area-marker-steps",
+                    "site_name": "HiFleet",
+                    "summary": "在主海图页面右上角点击标注，选择区域标注，绘制多边形后点击保存完成。",
+                    "snippet": "在主海图页面右上角点击标注，选择区域标注，绘制多边形后点击保存完成。",
+                    "authority_level": 1,
+                }
+            ],
+            "payload_meta": {"Filter": {"Sites": tools.HIFLEET_SITES}},
+            "used_ark_fallback": False,
+        },
+    )
+
+    payload = json.loads(tools.web_search.invoke({"query": "怎么绘制区域标注"}))
+
+    assert payload["can_answer"] is True
+    assert payload["trace"]["question_class"] == "how_to_operate"
+    assert payload["items"][0]["has_operation_step_signal"] is True
+
+
 def test_web_search_authoritative_public_query_does_not_add_sites(monkeypatch):
     monkeypatch.setattr(
         tools,
@@ -328,3 +394,4 @@ def test_agent_browser_keyword_fallback_prompt_rules_are_documented():
     assert "web_search" in skill_text and "Bing" in skill_text and "官方候选" in skill_text
     assert "无有效命中" in profile_text
     assert "短关键词" in profile_text
+    assert "3–5 组短关键词" in profile_text

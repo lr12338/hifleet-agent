@@ -1,7 +1,7 @@
 # Hifleet FAQ知识库导入报告（归档）
 
-> 归档说明：这是 2026-04-03 的一次性导入报告。当前知识库使用与检索链路见
-> `docs/KNOWLEDGE_BASE_GUIDE.md`。
+> 归档说明：这是 2026-04-03 的一次性导入报告，保留当时导入背景，不作为当前维护流程。
+> 当前知识库使用与检索链路见 [../KNOWLEDGE_BASE_GUIDE.md](../KNOWLEDGE_BASE_GUIDE.md)，客服知识检索与授权写库见 [../CUSTOMER_SUPPORT_KB_OPERATIONS.md](../CUSTOMER_SUPPORT_KB_OPERATIONS.md)。
 
 ## 📊 导入概览
 
@@ -204,13 +204,11 @@ FAQ问答  ████████████ 17 (24.6%)
 
 ### 定期更新机制
 
-```bash
-# 每月更新FAQ
-python scripts/import_faq_knowledge.py
+当前不再使用本报告里的旧导入脚本命令。维护 FAQ 时，优先更新：
 
-# 测试检索效果
-python scripts/knowledge_base_cli.py test-search
-```
+- `docs/RAG/hifleet_cs_outputs/客服知识库结构化.jsonl`
+- `docs/RAG/hifleet_cs_wiki/`
+- 或通过授权的 `knowledge_admin.upsert_local_kb_entry` 写入结构化 FAQ
 
 ### 效果监控指标
 
@@ -283,9 +281,8 @@ result = agent.invoke({
 
 ### 相关文档
 
-- [知识库管理指南](KNOWLEDGE_BASE_GUIDE.md)
-- [FAQ导入脚本](../scripts/import_faq_knowledge.py)
-- [知识库CLI工具](../scripts/knowledge_base_cli.py)
+- [当前知识检索链指南](../KNOWLEDGE_BASE_GUIDE.md)
+- [客服知识检索与授权写库总览](../CUSTOMER_SUPPORT_KB_OPERATIONS.md)
 
 ### 问题反馈
 

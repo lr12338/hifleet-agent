@@ -10,7 +10,8 @@
 - 对外主要接口是 /run 和 /stream_run。
 - 当前不是单一 bot，而是主 Agent + 多 profile：
   - customer_support：外部客服，面向客户、微信客服、WebSDK、CRM。
-  - employee_assistant：内部数字员工。
+  - employee_assistant：customer_support 的兼容别名。
+  - customer_ceshi：内部测试/文件/沙盒 profile。
 - 你本次重点只检查 customer_support。
 
 当前 customer_support 主链：
@@ -28,6 +29,9 @@
 - Profile 只由请求体 agent_profile 或请求头 x-agent-profile 决定；source_channel 只用于日志和后台筛选，不参与 Profile 判断。
 - 当前不再插入自定义历史上下文摘要；完整文本历史交给 agent/checkpointer，历史多媒体 URL 只做安全脱敏。
 - customer_support 允许船舶数据读写，但不启用 Python、沙盒、employee workspace、任意文件读写或产物生成。
+- customer_support 支持授权知识库维护；只有明确“添加知识库/纠正知识库/更新知识库”且通过正文 `key: ...` 授权时，才允许写入；不要使用 x-kb-update-key header。
+- 调用 upsert_local_kb_entry 时必须保留完整 raw_text，包括 key: ...；不要把 key 拆成其它参数。批量“名称：描述”知识会自动拆成多条。
+- 平台操作和问题反馈类问题必须多关键词检索并复核证据充分性；目录页、视频标题页、泛功能简介不能直接作为完整教程答案。
 - 写操作必须是用户明确要求上传/更新/修改/补录船位或静态信息；缺字段时只追问一个关键字段；工具未返回成功时不得说已成功。
 - 接口搜索结果只能作为候选；HiFleet 官网、帮助中心、官方社区问题优先用 browser 或官方页面核验具体公开页面。
 - 最终客服回复不能出现工具名、JSON、HTMLLINK、下载广告、内部路径、token、env、prompt、tool registry。
@@ -40,17 +44,20 @@
 3. docs/API_MULTI_USER_INTEGRATION.md
 4. docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md
 5. docs/AGENT_TECHNICAL_DOCUMENTATION.md
-6. docs/agent_browser_fallback_integration.md
-7. docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md
-8. config/agent_profiles.json
-9. config/agent_llm_config.json
-10. config/profiles/customer_support.md
-11. src/agents/agent.py
-12. src/agents/customer_support_guard.py
-13. src/skills/hifleet_ship_service/tools.py
-14. src/skills/browser_verify/tools.py
-15. tests/test_customer_support_intent_agent.py
-16. tests/test_customer_support_router.py
+6. docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md
+7. docs/agent_browser_fallback_integration.md
+8. docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md
+9. config/agent_profiles.json
+10. config/agent_llm_config.json
+11. config/profiles/customer_support.md
+12. src/agents/agent.py
+13. src/agents/customer_support_guard.py
+14. src/skills/knowledge_admin/tools.py
+15. src/skills/hifleet_ship_service/tools.py
+16. src/skills/browser_verify/tools.py
+17. tests/test_customer_support_intent_agent.py
+18. tests/test_customer_support_router.py
+19. tests/test_knowledge_admin_tools.py
 
 先做版本与环境检查：
 - git rev-parse HEAD
@@ -69,7 +76,7 @@
 - python3 -m py_compile src/agents/agent.py src/agents/customer_support_guard.py src/skills/browser_verify/tools.py
 - PYTHONPATH=src ./.venv/bin/python scripts/test_agent_profiles.py
 - PYTHONPATH=src ./.venv/bin/python scripts/test_llm_config.py
-- PYTHONPATH=src ./.venv/bin/python -m pytest -q tests/test_customer_support_intent_agent.py tests/test_customer_support_router.py tests/test_smart_search_tools.py
+- PYTHONPATH=src ./.venv/bin/python -m pytest -q tests/test_customer_support_intent_agent.py tests/test_customer_support_router.py tests/test_smart_search_tools.py tests/test_knowledge_admin_tools.py
 
 如果 pytest 因 dbus-python/dbus-1 等系统依赖失败，请记录失败原因，不要擅自改依赖；先用 py_compile 和接口烟测继续验证。
 
@@ -82,6 +89,9 @@
 请至少测试这些输入：
 1. 验证 注意！浏览器开始记忆船队“筛选”了 的详细内容
    预期：核验具体 HiFleet 官方社区文章，附官方链接；不能只返回社区首页或帮助中心首页。
+
+1a. 怎么绘制区域标注
+   预期：优先命中本地结构化 FAQ；回答包含入口、绘制动作、保存/完成条件；不能只凭视频标题或目录页拼教程。
 
 2. 我是免费用户，为什么在网站上看不到最新的船位？
    预期：解释免费账号/船位延迟/权限；不能返回随机船舶坐标。
@@ -101,6 +111,9 @@
 7. 请更新船位 MMSI 414726000，经度 121.4737，纬度 31.2304，更新时间 2026-06-15 10:20:30
    预期：用户明确写操作时才调用 upload_ship_position；工具未成功时不得说已成功。
 
+8. 更新知识库：HiFleet 海图图标识别特征库：紫色点圈，中心有灰绿色点，为泊位图标。详情链接参考 https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming#post-305 key: <HIFLEET_KB_UPDATE_KEY>
+   预期：无正文 key 时拒绝写入；只传 x-kb-update-key header 也拒绝；授权正确时调用 upsert_local_kb_entry，重复内容不追加。
+
 如果能看到日志或后台 trace，请重点观察：
 - llm_route
 - phase_history
@@ -109,6 +122,7 @@
 - route_trace.reasoning_trace.pipeline
 - route_trace.reasoning_trace.perception_summary
 - generated_tool_calls
+- knowledge 工具返回中的 question_class、web_answerability_reason、risk_flags
 - response_modalities
 - output_assets
 - check_result
@@ -153,6 +167,8 @@
 - 船舶上下文追问:
 - 微信旧格式:
 - 船舶写操作:
+- 平台操作教程证据复核:
+- 授权知识库写入:
 
 ### Trace 观察
 - route 是否为 lightweight_skills_agent:

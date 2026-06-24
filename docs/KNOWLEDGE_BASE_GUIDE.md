@@ -23,13 +23,15 @@
 flowchart TD
     Q[知识问题] --> W[customer_support lightweight wrapper]
     W --> M[standard tool-calling skills agent]
-    M --> A[local_kb_search]
-    A -->|FAQ 强命中| Done[直接回答]
+    M --> Plan[生成 3-5 组关键词]
+    Plan --> A[local_kb_search]
+    A -->|FAQ 强命中| Review[证据充分性复核]
     A -->|不足| B[web_search]
     B -->|命中具体事实页| Done
     B -->|只有候选页线索| C[web_search_agent_browser]
     C --> D[bridge 到 browser_verify]
-    D --> Done
+    D --> Review
+    Review --> Done[回答或保守收口]
 ```
 
 固定升级顺序：
@@ -43,6 +45,7 @@ flowchart TD
 - tool 只做本层事情，不在内部偷偷串下一层
 - skills agent 或 `smart_search` facade 才负责编排
 - browser 不是第一轮搜索工具；但在 `web_search` 弱命中后，可用短关键词通过 Bing 优先召回 HiFleet 官方候选页
+- 平台操作和问题反馈类问题要覆盖多个证据面，不应只用单个 query 或单条摘要收口
 
 ## 2. 模型主导检索如何影响查询
 
@@ -64,6 +67,16 @@ flowchart TD
 - 不再默认套旧的 `_rewrite_hifleet_knowledge_query()` 模板
 - browser 的 `site_hint` 优先使用 `should_limit_to_hifleet_sites`
 - 当前 trace 优先观察 `generated_tool_calls`、`route_trace.reasoning_trace.pipeline`、`perception_summary` 和 `retrieval_trace`
+
+平台操作类或问题反馈类 query 要求模型主动生成多组关键词，例如“怎么绘制区域标注”应覆盖：
+
+- `HiFleet 区域标注 绘制 步骤`
+- `HiFleet 电子围栏 标注及电子围栏报警`
+- `HiFleet 我的标注 区域标注 编辑 报警`
+- `HiFleet 区域回放 绘制 区域`
+- `HiFleet 多边形 圆形 矩形 区域标注`
+
+最终回答前必须判断证据是否覆盖入口、动作、保存/完成条件；如果只确认“支持该功能”，不能拼成完整教程。
 
 示例：
 
@@ -146,10 +159,14 @@ query 规则：
 - `is_directory_page`
 - `is_aggregated_page`
 - `has_specific_fact`
+- `question_class`
+- `web_answerability_reason`
+- `risk_flags`
 
 结果评估规则：
 
 - 具体官方页且摘要含明确事实：`can_answer=true`
+- 平台教程/问题反馈类需要更严格：必须是具体官方页或正文型页面，且包含点击、选择、填写、保存、进入、关闭、设置等动作证据
 - 权威公共页且摘要含日期/数值/机构信息：`can_answer=true`
 - 只有目录页或聚合页：`should_continue=true`
 - 有具体候选页但摘要不足：`continue_with=agent_browser`
@@ -279,14 +296,31 @@ ark_websearch_api_key=
 - `web_search_runtime.looks_like_authoritative_data_query(...)`
 - fallback trace 是否覆盖了真实请求画像
 
-### 8.2 平台问题误入船舶链路
+### 8.2 平台操作类问题过早收口
+
+示例：`怎么绘制区域标注`
+
+期望：
+
+- 优先命中结构化 FAQ，例如 `客服知识库结构化.jsonl` 中的区域标注步骤。
+- 至少生成 3 组相关关键词，覆盖区域标注、电子围栏、我的标注、区域回放等角度。
+- 仅命中帮助中心首页、社区目录、视频标题页时，`web_search.can_answer=false`。
+- 最终教程答案必须包含入口、操作动作、保存/完成条件。
+
+若仍输出未经核验的完整步骤，优先检查：
+
+- `config/profiles/customer_support.md` 的多关键词和证据充分性规则是否被删改。
+- `web_search_runtime.analyze_web_search_result(...)` 是否把目录页或视频标题页判成可答。
+- 本地 FAQ 是否缺少结构化步骤答案。
+
+### 8.3 平台问题误入船舶链路
 
 示例：`HiFleet 轨迹加载失败怎么办`
 
 期望：
 
 - `customer_support` 下 `route_trace.route=lightweight_skills_agent`
-- `employee_assistant` 下可进入 knowledge 快捷链
+- `customer_ceshi` 下可进入 knowledge 或内部测试链路
 - knowledge 检索应优先围绕平台问题本身，不误调船舶读写工具
 
 若误入船舶链路，检查：
@@ -294,7 +328,7 @@ ark_websearch_api_key=
 - `config/profiles/customer_support.md` 中船舶写操作和平台知识边界是否被近期修改
 - 会话上下文是否错误继承了上一个船舶实体
 
-### 8.3 搜索太慢
+### 8.4 搜索太慢
 
 检查：
 
@@ -313,7 +347,7 @@ VOLC_WEB_SEARCH_TIMEOUT_SEC=15
 VOLC_WEB_SEARCH_DEFAULT_COUNT=5
 ```
 
-### 8.4 结构化联网搜索未生效
+### 8.5 结构化联网搜索未生效
 
 现象：
 
@@ -331,7 +365,7 @@ VOLC_WEB_SEARCH_DEFAULT_COUNT=5
    - `10406` 免费额度用尽
    - `700429` QPS 限流
 
-### 8.5 `.venv-test` 下历史 router 测试导入失败
+### 8.6 `.venv-test` 下历史 router 测试导入失败
 
 当前已知环境阻塞：
 
@@ -345,7 +379,7 @@ VOLC_WEB_SEARCH_DEFAULT_COUNT=5
 - `tests/test_customer_support_intent_agent.py`
 - `tests/test_smart_search_tools.py`
 
-### 8.6 官网链接不可访问
+### 8.7 官网链接不可访问
 
 处理：
 
@@ -378,3 +412,5 @@ VOLC_WEB_SEARCH_DEFAULT_COUNT=5
 2. 用典型用户问法验证 `local_kb_search`
 3. 再验证 `web_search` 的 query 和 `Sites` 是否符合预期
 4. 跑客服回归，确认没有触发不必要 browser 升级
+
+授权在线写库由 `knowledge_admin.upsert_local_kb_entry` 处理。使用前必须设置 `HIFLEET_KB_UPDATE_KEY`，调用时只能通过正文 `key: ...` 传入；`x-kb-update-key` header 不再支持。工具会写入结构化 JSONL、去重并刷新本地 KB 缓存；普通纠错或闲聊不应触发写库。

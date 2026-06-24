@@ -47,6 +47,7 @@ from agents.customer_support_stream_debug import (
     build_customer_support_debug_events_from_update,
 )
 from llm_config import load_llm_config, messages_have_multimodal_content, resolve_model_selection
+from utils.context_headers import ensure_context_headers
 from utils.llm_route_state import clear_current_llm_route, set_current_llm_route
 
 setup_logging(
@@ -97,15 +98,7 @@ def _ensure_context_headers(ctx: Optional[Context]) -> Dict[str, Any]:
     """
     if ctx is None:
         return {}
-    headers = getattr(ctx, "headers", None)
-    if isinstance(headers, dict):
-        return headers
-    try:
-        headers = {}
-        setattr(ctx, "headers", headers)
-        return headers
-    except Exception:
-        return {}
+    return ensure_context_headers(ctx)
 
 
 def is_feature_enabled(name: str, default: bool = False) -> bool:

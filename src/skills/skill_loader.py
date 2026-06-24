@@ -53,6 +53,7 @@ class SkillLoader:
         "multimodal": "multimodal_support",
         "customer_file": "customer_workspace",
         "browser": "browser_verify",
+        "knowledge_admin": "knowledge_admin",
     }
 
     # 缓存
@@ -123,6 +124,7 @@ class SkillLoader:
                 "update_ship_static_info",
             ],
             "knowledge_qa": ["local_kb_search", "web_search", "web_search_agent_browser"],
+            "knowledge_admin": ["upsert_local_kb_entry"],
             "employee_workspace": ["download_public_file_to_artifact", "inspect_tabular_file", "run_sandboxed_python"],
             "multimodal_support": ["inspect_media_attachment"],
             "customer_workspace": ["inspect_customer_file", "upload_customer_artifact"],

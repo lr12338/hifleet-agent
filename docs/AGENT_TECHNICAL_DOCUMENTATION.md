@@ -35,6 +35,7 @@ flowchart TD
 | `config/agent_llm_config.json` | 默认模型、thinking、工具配置 |
 | `src/agents/customer_support_guard.py` | 客服最终输出脱敏、拒答、链接清洗 |
 | `src/skills/knowledge_qa/tools.py` | `local_kb_search / web_search / web_search_agent_browser` |
+| `src/skills/knowledge_admin/tools.py` | 授权写入本地结构化客服知识库 |
 | `src/skills/hifleet_ship_service/tools.py` | 船舶查询、统计、轨迹、挂靠、船位上传、静态信息更新 |
 | `src/skills/multimodal_support/tools.py` | 附件 metadata 辅助 |
 | `src/skills/browser_verify/tools.py` | 公开网页核验、`agent_browser_deep_search` |
@@ -64,6 +65,7 @@ Profile 解析规则：
 `customer_support` 当前 skills：
 
 - `knowledge_qa`
+- `knowledge_admin`
 - `hifleet_ship_service`
 - `multimodal_support`
 - `browser_verify`
@@ -120,6 +122,7 @@ flowchart TD
 模型在此层自主选择工具，例如：
 
 - 平台知识：`local_kb_search -> web_search -> web_search_agent_browser`
+- 授权知识库维护：`upsert_local_kb_entry`
 - 公开网页核验：`verify_public_page` / `agent_browser_deep_search`
 - 船舶读写：`ship_search`、`get_ship_position`、`get_ship_archive`、`get_ship_trajectory`、`upload_ship_position`、`update_ship_static_info` 等
 - 多模态辅助：`inspect_media_attachment`
@@ -209,7 +212,22 @@ flowchart TD
 - 缺字段时只追问一个最关键字段。
 - 工具没有明确成功时，不能对外宣称已更新成功。
 
-## 7. 记忆和会话
+## 7. 知识检索与授权写库
+
+平台操作和问题反馈类问题的准确性优先于流畅完整。`customer_support` prompt 要求模型围绕入口、步骤、保存/完成、管理/报警、异常原因等证据面生成 3 到 5 组关键词，并在 `local_kb_search -> web_search -> web_search_agent_browser` 之间多轮检索。
+
+收口规则：
+
+- 本地 FAQ 强命中时可直接回答。
+- 只有 wiki 概览、帮助中心首页、社区目录、视频标题页或泛功能介绍时，不能输出完整教程。
+- 教程类答案至少需要入口位置、关键操作动作、完成/保存条件。
+- 问题反馈类答案要区分已确认事实、可能原因、建议检查项和需补充信息。
+
+授权写库由 `knowledge_admin.upsert_local_kb_entry` 处理，不新增外部 API。必须显式输入 `添加知识库：`、`纠正知识库：` 或 `更新知识库：`，并在正文中通过 `key: ...` 提供与 `HIFLEET_KB_UPDATE_KEY` 匹配的授权 key；`x-kb-update-key` header 不再支持。Agent 调用工具时必须保留完整 `raw_text`，不要把 key 单独拆成参数。工具负责 profile 校验、key 校验、批量映射拆条、去重、JSONL 写入和本地 KB 缓存刷新。
+
+更多运维规则见 [CUSTOMER_SUPPORT_KB_OPERATIONS.md](CUSTOMER_SUPPORT_KB_OPERATIONS.md)。
+
+## 8. 记忆和会话
 
 多轮记忆依赖：
 
@@ -225,7 +243,7 @@ flowchart TD
 - 当前不再插入自定义“历史上下文摘要”系统消息；完整文本历史交给 LangGraph/checkpointer 和底层 agent 处理。
 - 历史多模态 `HumanMessage` 只做安全脱敏，避免旧音频、图片、视频 URL 在后续轮次重复发送；最新一轮多模态内容保持原样进入 perception。
 
-## 8. 观测字段
+## 9. 观测字段
 
 排障时优先看：
 
@@ -236,6 +254,7 @@ flowchart TD
 - `route_trace.reasoning_trace.pipeline`
 - `route_trace.reasoning_trace.perception_summary`
 - `generated_tool_calls`
+- `question_class`、`web_answerability_reason`、`risk_flags`、`recommended_next_action`，通常出现在知识工具结果或检索 trace 中
 - `response_modalities`
 - `output_assets`
 - `check_result`
@@ -250,7 +269,7 @@ flowchart TD
 - `.env`
 - key / token
 
-## 9. customer_ceshi 当前链路
+## 10. customer_ceshi 当前链路
 
 `customer_ceshi` 仍保留测试/内部执行能力：
 
@@ -272,7 +291,7 @@ flowchart TD
 
 不要把 `customer_ceshi` 暴露给未鉴权外部用户。
 
-## 10. 开发建议
+## 11. 开发建议
 
 - 改 `customer_support` 主入口：优先看 `src/agents/agent.py` 的 `_build_lightweight_customer_support_agent()` 和 `build_agent()`。
 - 改外部客服权限：改 `config/agent_profiles.json`。
@@ -280,5 +299,6 @@ flowchart TD
 - 改输出脱敏：改 `src/agents/customer_support_guard.py`。
 - 改 `/run` 和微信旧格式兼容：改 `src/main.py`。
 - 改知识检索工具：改 `src/skills/knowledge_qa/tools.py` 及 runtime 文件。
+- 改授权写库：改 `src/skills/knowledge_admin/tools.py`。
 - 改船舶读写：改 `src/skills/hifleet_ship_service/tools.py`。
 - 旧 `customer_support_router.py` 暂时只作为回滚和旧测试参考，不再是当前 customer 主链入口。

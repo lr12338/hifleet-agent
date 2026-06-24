@@ -212,5 +212,5 @@ print(SkillLoader.validate_registry_consistency())
 PY
 ```
 
-4. 在 Chat Debug 中分别测试 `customer_support` 和 `employee_assistant`。
+4. 在 Chat Debug 中分别测试 `customer_support` 和 `customer_ceshi`；旧 `employee_assistant` 只用于验证是否兼容落到 `customer_support`。
 5. 到 Logs 检查 profile、route、tool 调用是否正确落库。

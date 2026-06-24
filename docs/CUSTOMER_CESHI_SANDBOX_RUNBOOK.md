@@ -1,13 +1,15 @@
-# Employee Assistant 沙盒与闭环 Runbook
+# customer_ceshi 沙盒与闭环 Runbook
 
-本文只覆盖当前 `employee_assistant` 的真实落地能力：表格探测、Docker sibling container 执行、自愈 loop、observability 对齐和发布前测试。
+本文只覆盖当前 `customer_ceshi` 的真实落地能力：表格探测、Docker sibling container 执行、自愈 loop、observability 对齐和发布前测试。
+
+注意：`employee_assistant` 现在是 `customer_support` 的兼容别名，不再代表内部沙盒 profile。需要文件、表格或受控 Python 能力时，应显式使用 `agent_profile=customer_ceshi`。
 
 ## 1. 适用场景
 
 - 读取 CSV/XLS/XLSX，分析字段、缺失值、样例数据。
 - 处理公开 OSS/HTTP 文件链接，先下载再进入分析闭环。
 - 生成报价汇总、内部统计表、临时分析产物。
-- 在管理台 `Chat Debug` 中以 `agent_profile=employee_assistant` 调试多轮复杂任务。
+- 在管理台 `Chat Debug` 中以 `agent_profile=customer_ceshi` 调试多轮复杂任务。
 
 不适用：
 
@@ -17,16 +19,16 @@
 
 ## 2. 运行时流程
 
-在进入 employee loop 之前，请求会先经过统一模型路由层：
+在进入内部 workspace loop 之前，请求会先经过统一模型路由层：
 
 - 纯文本消息默认走文本模型 `doubao-seed-2-0-lite-260428`
 - 图片/音频/视频消息默认走多模态模型 `doubao-seed-2-0-lite-260428`
 - 运行态路由结果会回写到 `llm_route`，用于调试页和 `/run` 返回体对齐
 
-随后才进入以下 employee 执行流程：
+随后才进入以下内部测试执行流程：
 
 1. `/run` 或 `/stream_run` 进入 `src/main.py`，按 `agent_profile` 或 `x-agent-profile` 选择 Profile，并记录 `source_channel` 作为观测字段。
-2. `src/agents/agent.py` 在 `employee_assistant` 下识别是否为“表格分析/产物任务”。
+2. `src/agents/agent.py` 在 `customer_ceshi` 下识别是否为“表格分析/产物任务”。
 3. 命中后进入 `route -> plan -> act -> check -> loop/finalize/fail`。
 4. 如果输入是公开 URL，`plan` 先调用 `download_public_file_to_artifact`。
 5. `plan` 调用 `inspect_tabular_file` 返回 schema。
@@ -39,7 +41,7 @@
 
 ### 2.1 先理解入口，再理解沙盒
 
-如果你要读懂 `employee_assistant`，不要从 Docker 配置开始。
+如果你要读懂 `customer_ceshi`，不要从 Docker 配置开始。
 
 推荐先回答这两个问题：
 
@@ -61,7 +63,7 @@
 
 ### 2.2 真实执行骨架
 
-`employee_assistant` 的核心不是“LLM 一次性把答案写对”，而是下面这条闭环：
+`customer_ceshi` 的核心不是“LLM 一次性把答案写对”，而是下面这条闭环：
 
 ```mermaid
 flowchart TD
@@ -103,14 +105,14 @@ flowchart TD
 
 这意味着：
 
-- 不是所有 `employee_assistant` 请求都能跑 Python
+- 不是所有 `customer_ceshi` 请求都能跑 Python
 - 它本质上是“文件任务代理”，不是“万能执行代理”
 - 纯问答会直接 `delegate` 给标准 Agent
 
-如果你当前要看的不是 sandbox 闭环，而是“employee 普通问答链”，直接跳到：
+如果你当前要看的不是 sandbox 闭环，而是 `customer_ceshi` 普通问答链，直接跳到：
 
 - [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
-  - `9. employee_assistant 当前链路`
+  - `9. customer_ceshi 当前链路`
 
 ### 2.4 plan 节点为什么必须先 inspect
 
@@ -197,7 +199,7 @@ flowchart TD
    - 防止产物路径逃逸
    - 校验文件存在且非空
 
-理解 `employee_assistant` 时，prompt 不是第一安全边界，工具实现才是。
+理解 `customer_ceshi` 时，prompt 不是第一安全边界，工具实现才是。
 
 ### 2.8 推荐阅读顺序
 
@@ -222,7 +224,7 @@ flowchart TD
 - evidence 审查
 - 最终话术安全收口
 
-`employee_assistant` 更重：
+`customer_ceshi` 更重：
 
 - 输入文件真实性
 - 执行环境可控
@@ -231,7 +233,7 @@ flowchart TD
 所以：
 
 - `customer_support` 的核心问题是“能不能安全、准确地说”
-- `employee_assistant` 的核心问题是“能不能基于真实输入把任务做完”
+- `customer_ceshi` 的核心问题是“能不能基于真实输入把任务做完”
 
 ## 3. 关键环境变量
 

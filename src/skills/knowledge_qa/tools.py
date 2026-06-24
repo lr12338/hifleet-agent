@@ -734,9 +734,11 @@ def web_search(
         "recommended_next_action": "直接基于当前检索结果回答用户" if analysis["analysis"]["can_answer"] else "继续抓取具体页面" if analysis["analysis"]["continue_with"] == "agent_browser" else "调整 query 或过滤条件后重试",
         "trace": {
             "query_type": query_type,
+            "question_class": str(analysis["analysis"].get("question_class") or analysis["result_profile"].get("question_class") or ""),
             "request_profile": analysis["request_profile"],
             "result_profile": analysis["result_profile"],
             "risk_flags": list(analysis["analysis"]["risk_flags"]),
+            "web_answerability_reason": str(analysis["analysis"].get("reason") or ""),
             "used_ark_fallback": bool(raw_result.get("used_ark_fallback")),
         },
     }
@@ -808,10 +810,13 @@ def smart_search(query: str, depth: str = "normal") -> str:
         structured_trace["items"] = result_items
         structured_trace["summary"] = str(web_payload.get("summary") or "")
         structured_trace["source_scope"] = "web"
+        structured_trace["question_class"] = str(((web_payload.get("trace") or {}).get("question_class") or ""))
+        structured_trace["risk_flags"] = list(((web_payload.get("trace") or {}).get("risk_flags") or []))
+        structured_trace["web_answerability_reason"] = str(((web_payload.get("trace") or {}).get("web_answerability_reason") or web_payload.get("summary") or ""))
         layer_trace.append({"layer": "L4-L5", "hit": bool(result_items), "continue_with": web_payload.get("continue_with", "")})
         if web_payload.get("can_answer"):
             web_output = format_web_result({"summary": web_payload.get("summary", ""), "items": result_items})
-        elif result_items and kb_output:
+        elif result_items and kb_output and structured_trace["question_class"] not in {"how_to_operate", "issue_feedback"}:
             web_output = format_web_result({"summary": web_payload.get("summary", ""), "items": result_items})
 
     final_parts = [part for part in [kb_output, web_output] if part]

@@ -101,6 +101,12 @@ def load_local_kb_index() -> dict[str, list[dict[str, Any]]]:
         return _LOCAL_KB_INDEX
 
 
+def reset_local_kb_index() -> None:
+    global _LOCAL_KB_INDEX
+    with _LOCAL_KB_LOCK:
+        _LOCAL_KB_INDEX = None
+
+
 def score_local_kb_item(query: str, item: dict[str, Any]) -> float:
     tokens = keyword_tokens(query)
     if not tokens:

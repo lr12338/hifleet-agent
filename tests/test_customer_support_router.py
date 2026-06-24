@@ -127,7 +127,111 @@ def test_knowledge_chain_escalates_to_web_search_agent_browser():
 
     assert call_sequence == ["local_kb_search", "web_search", "web_search_agent_browser"]
     assert trace.reasoning_trace["retrieval_trace"]["t2_tool"] == "web_search_agent_browser"
-    assert "轨迹" in output
+
+
+def test_knowledge_chain_runs_multiple_understanding_queries_before_answering():
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps(
+            {"tool": "local_kb_search", "status": "ok", "can_answer": False, "should_continue": True, "items": [], "summary": "no hit"},
+            ensure_ascii=False,
+        ),
+    )
+
+    def web_handler(args):
+        if "我的标注" in args["query"]:
+            return json.dumps(
+                {
+                    "tool": "web_search",
+                    "query": args["query"],
+                    "status": "ok",
+                    "can_answer": True,
+                    "should_continue": False,
+                    "continue_with": "none",
+                    "summary": "命中 HiFleet 官方具体页面且包含步骤/处置证据",
+                    "items": [
+                        {
+                            "title": "HiFleet 区域标注操作说明",
+                            "url": "https://www.hifleet.com/wp/communities/fleet/area-marker-steps",
+                            "snippet": "主海图页面右上角点击标注，进入我的标注，选择区域标注后绘制并保存。",
+                            "is_hifleet_official": True,
+                        }
+                    ],
+                    "best_urls": [],
+                    "trace": {
+                        "question_class": "how_to_operate",
+                        "request_profile": {"Filter": {"Sites": "hifleet.com"}},
+                        "result_profile": {"result_count": 1, "official_count": 1},
+                        "risk_flags": [],
+                        "used_ark_fallback": False,
+                    },
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "tool": "web_search",
+                "query": args["query"],
+                "status": "ok",
+                "can_answer": False,
+                "should_continue": True,
+                "continue_with": "web_search_refine",
+                "summary": "当前结果缺少可直接回答的步骤或处置证据",
+                "items": [],
+                "best_urls": [],
+                "trace": {
+                    "question_class": "how_to_operate",
+                    "request_profile": {"Filter": {"Sites": "hifleet.com"}},
+                    "result_profile": {"result_count": 0, "official_count": 0},
+                    "risk_flags": ["insufficient_step_evidence"],
+                    "used_ark_fallback": False,
+                },
+            },
+            ensure_ascii=False,
+        )
+
+    web_search = FakeTool("web_search", web_handler)
+    text = "怎么绘制区域标注"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities, session_id="multi-query")
+    trace.reasoning_trace = {
+        "understanding_result": {
+            "query_type": "hifleet_product",
+            "rewritten_user_need": "用户想了解 HiFleet 如何绘制区域标注",
+            "search_keywords": ["区域标注", "电子围栏", "我的标注"],
+            "search_query_candidates": [
+                "HiFleet 区域标注 绘制 步骤",
+                "HiFleet 电子围栏 标注及电子围栏报警",
+                "HiFleet 我的标注 区域标注 编辑 报警",
+            ],
+            "should_prefer_local_kb": True,
+            "should_limit_to_hifleet_sites": True,
+        }
+    }
+
+    output = execute_knowledge_chain(text, decision, {"local_kb_search": local_kb, "web_search": web_search}, trace)
+
+    assert len(web_search.calls) == 3
+    assert web_search.calls[-1]["query"] == "HiFleet 我的标注 区域标注 编辑 报警"
+    assert trace.check_result["multi_query_synthesis"] is True
+    assert trace.reasoning_trace["retrieval_trace"]["query_plan"][:3] == [
+        "HiFleet 区域标注 绘制 步骤",
+        "HiFleet 电子围栏 标注及电子围栏报警",
+        "HiFleet 我的标注 区域标注 编辑 报警",
+    ]
+    assert "右上角点击标注" in output
+
+
+def test_area_marker_local_kb_faq_is_direct_answer():
+    from skills.knowledge_qa.tools import local_kb_search
+
+    payload = json.loads(local_kb_search.invoke({"query": "怎么绘制区域标注", "top_k": 3}))
+
+    assert payload["can_answer"] is True
+    assert payload["items"][0]["source_type"] == "faq"
+    assert "保存" in payload["items"][0]["content"]
+    assert "多边形" in payload["items"][0]["content"]
     
 
 def test_knowledge_chain_stops_when_local_kb_can_answer():

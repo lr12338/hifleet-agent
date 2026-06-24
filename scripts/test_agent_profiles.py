@@ -40,6 +40,7 @@ def main() -> int:
     assert "local_kb_search" in customer_tools
     assert "web_search" in customer_tools
     assert "web_search_agent_browser" in customer_tools
+    assert "upsert_local_kb_entry" in customer_tools
     assert "run_sandboxed_python" not in customer_tools
     assert "download_public_file_to_artifact" not in customer_tools
     assert "inspect_tabular_file" not in customer_tools
@@ -49,6 +50,7 @@ def main() -> int:
     assert "update_ship_static_info" in customer_tools
     assert "run_sandboxed_python" in employee_tools
     assert "upload_ship_position" in employee_tools
+    assert "upsert_local_kb_entry" in employee_tools
 
     request_context.set(new_context(method="test_agent_profiles"))
     set_current_agent_profile("customer_support")

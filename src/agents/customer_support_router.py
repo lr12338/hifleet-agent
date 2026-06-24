@@ -765,13 +765,15 @@ def _planner_search_plan(
     if decision.route == "browser_verify":
         return [{"hypothesis_id": "H1", "query": text, "depth": decision.search_depth or "normal", "source_priority": source_priority, "purpose": "核验官方网页与公开信息"}]
     if decision.route == "knowledge":
-        # 多角度检索：主查询 + 补充角度，确保覆盖平台功能、使用场景、常见问题
-        primary_query = _understanding_primary_query(understanding_result, text)
         primary_depth = decision.search_depth or "quick"
-        plan = [{"hypothesis_id": "H1", "query": primary_query, "depth": primary_depth, "source_priority": source_priority, "purpose": "从知识库和官方资料回答核心问题"}]
-        # 生成补充检索词
+        plan: list[dict[str, Any]] = []
+        for query in _knowledge_query_candidates_from_understanding(understanding_result, text, limit=5):
+            plan.append({"hypothesis_id": "H1", "query": query, "depth": primary_depth, "source_priority": source_priority, "purpose": "从知识库和官方资料回答核心问题"})
+            if len(plan) >= 5:
+                break
         expansion_query = _generate_knowledge_expansion_query(text, decision, understanding_result)
-        if expansion_query and expansion_query != primary_query:
+        existing_queries = {normalize_message_text(str(item.get("query") or "")) for item in plan}
+        if len(plan) < 5 and expansion_query and normalize_message_text(expansion_query) not in existing_queries:
             plan.append({"hypothesis_id": "H2", "query": expansion_query, "depth": "normal", "source_priority": source_priority, "purpose": "补充产品能力和使用场景信息"})
         return plan
     return []
@@ -948,7 +950,19 @@ def is_kb_effective_hit(search_output: str) -> bool:
 
 def is_no_hit_text(output: str) -> bool:
     text = output or ""
-    return any(marker in text for marker in ("未检索到足够可信", "未找到精确的FAQ匹配", "未找到", "暂无", "信息不足"))
+    return any(
+        marker in text
+        for marker in (
+            "未检索到足够可信",
+            "未找到精确的FAQ匹配",
+            "未找到",
+            "暂无",
+            "信息不足",
+            "缺少可直接回答",
+            "证据不足",
+            "摘要不足",
+        )
+    )
 
 
 def _strip_markdown(text: str) -> str:
@@ -1125,6 +1139,76 @@ def _generate_knowledge_expansion_query(text: str, decision: RouteDecision, unde
         return f"HiFleet {text} 解决方案 处理方法"
     # 通用产品问题：补充产品功能介绍
     return f"HiFleet {text} 产品功能 使用说明"
+
+
+def _knowledge_query_candidates_from_understanding(understanding_result: dict[str, Any] | None, fallback_text: str, limit: int = 5) -> list[str]:
+    result = dict(understanding_result or {})
+    candidates: list[str] = []
+    raw_candidates = result.get("search_query_candidates")
+    if isinstance(raw_candidates, list):
+        for item in raw_candidates:
+            query = normalize_message_text(str(item or ""))
+            if query and query not in candidates:
+                candidates.append(query)
+    fallback_query = _understanding_primary_query(result, fallback_text)
+    if fallback_query and fallback_query not in candidates:
+        candidates.append(fallback_query)
+    return candidates[: max(1, limit)]
+
+
+def _merge_knowledge_search_plan(
+    question: str,
+    decision: RouteDecision,
+    search_plan: list[dict[str, Any]],
+    understanding_result: dict[str, Any],
+    default_depth: str,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+
+    def add(query: str, *, depth: str = "", hypothesis_id: str = "H1", purpose: str = "回答当前问题", source_priority: list[str] | None = None) -> None:
+        normalized_query = normalize_message_text(query)
+        if not normalized_query:
+            return
+        if any(normalize_message_text(str(item.get("query") or "")) == normalized_query for item in merged):
+            return
+        resolved_depth = (depth or default_depth or "normal").strip().lower()
+        if resolved_depth not in {"quick", "normal", "deep"}:
+            resolved_depth = default_depth or "normal"
+        merged.append(
+            {
+                "hypothesis_id": hypothesis_id or "H1",
+                "query": normalized_query,
+                "depth": resolved_depth,
+                "source_priority": list(source_priority or ["local_kb", "official_site", "official_community", "public_web"]),
+                "purpose": purpose or "回答当前问题",
+            }
+        )
+
+    for item in search_plan or []:
+        if not isinstance(item, dict):
+            continue
+        add(
+            str(item.get("query") or ""),
+            depth=str(item.get("depth") or ""),
+            hypothesis_id=str(item.get("hypothesis_id") or "H1"),
+            purpose=str(item.get("purpose") or "回答当前问题"),
+            source_priority=list(item.get("source_priority") or []),
+        )
+        if len(merged) >= 5:
+            break
+
+    for query in _knowledge_query_candidates_from_understanding(understanding_result, question, limit=5):
+        add(query, depth=default_depth, hypothesis_id="H1", purpose="多关键词补充检索")
+        if len(merged) >= 5:
+            break
+
+    expansion_query = _generate_knowledge_expansion_query(question, decision, understanding_result)
+    if len(merged) < 5:
+        add(expansion_query, depth="normal", hypothesis_id="H2", purpose="补充产品能力、步骤或常见问题")
+
+    if not merged:
+        add(_rewrite_hifleet_knowledge_query(question), depth=default_depth)
+    return merged[:5]
 
 
 def _try_direct_hifleet_knowledge_answer(question: str) -> str:
@@ -1687,6 +1771,9 @@ def _new_knowledge_retrieval_trace(understanding_summary: dict[str, Any], query:
 
 
 def _append_layer(retrieval_trace: dict[str, Any], layer: str, payload: dict[str, Any]) -> None:
+    payload_trace = dict(payload.get("trace") or {})
+    source_breakdown = dict(payload_trace.get("source_breakdown") or {})
+    risk_flags = list(payload_trace.get("risk_flags") or [])
     retrieval_trace.setdefault("layers", []).append(
         {
             "layer": layer,
@@ -1696,8 +1783,69 @@ def _append_layer(retrieval_trace: dict[str, Any], layer: str, payload: dict[str
             "continue_with": str(payload.get("continue_with") or ""),
             "status": str(payload.get("status") or ""),
             "result_count": len(list(payload.get("items") or payload.get("pages") or [])),
+            "faq_count": int(source_breakdown.get("faq") or 0),
+            "wiki_count": int(source_breakdown.get("wiki") or 0),
+            "risk_flags": risk_flags,
+            "answerability_reason": str(payload_trace.get("web_answerability_reason") or payload.get("summary") or ""),
         }
     )
+
+
+def _trace_snapshot(trace_data: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in dict(trace_data or {}).items() if key not in {"query_traces"}}
+
+
+def _question_needs_step_complete_answer(question: str) -> bool:
+    q = normalize_message_text(question).lower()
+    action_markers = ["绘制", "创建", "设置", "添加", "编辑", "保存", "配置", "上传", "导出"]
+    howto_markers = ["怎么", "如何", "怎样", "步骤", "教程", "入口", "在哪", "操作"]
+    return any(marker in q for marker in action_markers) or (
+        any(marker in q for marker in howto_markers)
+        and any(marker in q for marker in ["标注", "电子围栏", "报警", "航线", "船队", "账号"])
+    )
+
+
+def _answer_has_step_completeness(text: str) -> bool:
+    value = normalize_message_text(text)
+    has_entry = any(marker in value for marker in ["入口", "右上角", "进入", "打开", "页面", "标注", "我的标注", "更多"])
+    has_action = any(marker in value for marker in ["点击", "选择", "拖动", "绘制", "填写", "添加", "编辑", "设置"])
+    has_finish = any(marker in value for marker in ["保存", "确定", "完成", "结束", "闭合", "生效"])
+    return has_entry and has_action and has_finish
+
+
+def _build_conservative_step_answer(question: str, evidence_items: list[dict[str, Any]]) -> str:
+    links = []
+    for item in evidence_items:
+        url = str(item.get("url") or "").strip()
+        if url and url not in links:
+            links.append(url)
+    suffix = f"\n\n可先参考官方帮助中心：{HELP_CENTER_URL}"
+    if links:
+        suffix = f"\n\n我能先给您一个可核验的官方链接：{links[0]}"
+    return (
+        "目前检索到的信息还不足以确认完整操作步骤，因此我不能直接把它整理成标准教程。\n\n"
+        "我只能先确认这是 HiFleet 平台功能相关问题；如果您方便，请补充当前所在页面或截图，我再按页面入口和按钮继续核验。"
+        + suffix
+    )
+
+
+def _has_high_confidence_step_evidence(evidence_items: list[dict[str, Any]]) -> bool:
+    for item in evidence_items:
+        if str(item.get("source_name") or "") in {"local_kb_search", "web_search", "web_search_agent_browser"} and float(item.get("relevance") or 0.0) >= 0.85:
+            snippet = normalize_message_text(str(item.get("snippet") or ""))
+            if _answer_has_step_completeness(snippet) or any(marker in snippet for marker in ["点击", "选择", "保存", "导出", "设置", "添加"]):
+                return True
+    return False
+
+
+def _ensure_step_answer_completeness(question: str, answer: str, evidence_items: list[dict[str, Any]]) -> str:
+    if not _question_needs_step_complete_answer(question):
+        return answer
+    if _answer_has_step_completeness(answer):
+        return answer
+    if _has_high_confidence_step_evidence(evidence_items):
+        return answer
+    return _build_conservative_step_answer(question, evidence_items)
 
 
 def _invoke_three_layer_knowledge_chain(
@@ -2011,16 +2159,34 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
     understanding_summary = _understanding_summary_for_trace(understanding_result)
     depth = decision.search_depth or ("normal" if understanding_summary.get("query_type") in {"authoritative_public_data", "shipping_general_knowledge", "hifleet_troubleshooting"} else "quick")
     query = _understanding_primary_query(understanding_result, text)
-    outputs, evidence_items, retrieval_trace = _invoke_three_layer_knowledge_chain(
-        text,
-        query=query,
-        depth=depth,
-        decision=decision,
-        tool_map=tool_map,
-        trace=trace,
-        understanding_summary=understanding_summary,
-        purpose="回答当前客服问题",
-    )
+    queries = _merge_knowledge_search_plan(text, decision, [], understanding_result, depth)
+    if "local_kb_search" not in tool_map and "web_search" not in tool_map and "smart_search" in tool_map:
+        queries = queries[:1]
+    outputs: list[str] = []
+    evidence_items: list[dict[str, Any]] = []
+    retrieval_trace = _new_knowledge_retrieval_trace(understanding_summary, query)
+    retrieval_trace["query_plan"] = [item.get("query", "") for item in queries]
+    retrieval_trace["query_traces"] = []
+    for item in queries:
+        chain_outputs, chain_evidence, chain_trace = _invoke_three_layer_knowledge_chain(
+            text,
+            query=str(item.get("query") or query),
+            depth=str(item.get("depth") or depth),
+            decision=decision,
+            tool_map=tool_map,
+            trace=trace,
+            understanding_summary=understanding_summary,
+            hypothesis_id=str(item.get("hypothesis_id") or "H1"),
+            purpose=str(item.get("purpose") or "回答当前客服问题"),
+        )
+        outputs.extend(chain_outputs)
+        evidence_items.extend(chain_evidence)
+        retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
+        if chain_trace.get("t2_triggered") or chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"):
+            retrieval_trace.update(chain_trace)
+            break
+        if len(chain_evidence) > len(retrieval_trace.get("layers", [])):
+            retrieval_trace.update(chain_trace)
     output = _select_best_evidence_output(outputs, evidence_items)
     if retrieval_trace.get("t2_triggered"):
         trace.fallback_reason = trace.fallback_reason or "official_browser_verification"
@@ -2032,14 +2198,16 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
     trace.check_result = {
         "links_ok": ok,
         "invalid_links": invalid,
+        "planned_queries": [item.get("query", "") for item in queries],
         "evidence_count": len(evidence_items),
         "official_support_count": evidence_summary["official_support_count"],
+        "multi_query_synthesis": len(queries) > 1,
         "evidence_summary": evidence_summary,
     }
     trace.answer_confidence = evidence_summary["confidence"] if ok and not is_no_hit_text(output) else "medium"
     trace.reasoning_trace = _build_reasoning_trace(
         text,
-        [{"query": query, "depth": depth}],
+        queries,
         evidence_items,
         "先直接回答用户核心问题，再补必要操作步骤或核验来源。",
     )
@@ -2055,7 +2223,8 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         return _format_route_upload_troubleshooting(output)
     if decision.task_type == "platform_troubleshooting":
         return _format_platform_troubleshooting_answer(text, output)
-    return _format_general_knowledge_answer(text, output, evidence_items=evidence_items)
+    answer = _format_general_knowledge_answer(text, output, evidence_items=evidence_items)
+    return _ensure_step_answer_completeness(text, answer, evidence_items)
 
 
 def execute_planned_knowledge_chain(
@@ -2069,10 +2238,14 @@ def execute_planned_knowledge_chain(
     understanding_summary = _understanding_summary_for_trace(understanding_result)
     primary_query = _understanding_primary_query(understanding_result, question)
     default_depth = decision.search_depth or ("normal" if understanding_summary.get("query_type") in {"authoritative_public_data", "shipping_general_knowledge", "hifleet_troubleshooting"} else "quick")
-    queries = search_plan or [{"query": primary_query, "depth": default_depth, "hypothesis_id": "H1", "purpose": "回答当前问题"}]
+    queries = _merge_knowledge_search_plan(question, decision, search_plan, understanding_result, default_depth)
+    if "local_kb_search" not in tool_map and "web_search" not in tool_map and "smart_search" in tool_map:
+        queries = queries[:1]
     outputs: list[str] = []
     evidence_items: list[dict[str, Any]] = []
     retrieval_trace = _new_knowledge_retrieval_trace(understanding_summary, primary_query)
+    retrieval_trace["query_plan"] = [item.get("query", "") for item in queries]
+    retrieval_trace["query_traces"] = []
 
     for item in queries:
         query = str(item.get("query", "")).strip() or primary_query
@@ -2090,7 +2263,10 @@ def execute_planned_knowledge_chain(
         )
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
+        retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
         if chain_trace.get("t2_triggered") or chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"):
+            chain_trace["query_plan"] = [item.get("query", "") for item in queries]
+            chain_trace["query_traces"] = list(retrieval_trace.get("query_traces") or [])
             retrieval_trace = chain_trace
             break
         if len(chain_evidence) > len(retrieval_trace.get("layers", [])):
@@ -2132,7 +2308,8 @@ def execute_planned_knowledge_chain(
         return _format_route_upload_troubleshooting(output), evidence_items, evidence_summary
     if decision.task_type == "platform_troubleshooting":
         return _format_platform_troubleshooting_answer(question, output), evidence_items, evidence_summary
-    return _format_general_knowledge_answer(question, output, evidence_items=evidence_items), evidence_items, evidence_summary
+    answer = _format_general_knowledge_answer(question, output, evidence_items=evidence_items)
+    return _ensure_step_answer_completeness(question, answer, evidence_items), evidence_items, evidence_summary
 
 def _format_platform_troubleshooting_answer(question: str, search_output: str) -> str:
     q = normalize_message_text(question).lower()
@@ -2375,6 +2552,9 @@ def _select_best_evidence_output(outputs: list[str], evidence_items: list[dict[s
         return ""
     if len(outputs) == 1:
         return outputs[0]
+    for output in outputs:
+        if _answer_has_step_completeness(output) and not is_no_hit_text(output):
+            return output
     # Browser-verified official pages are preferred for community/article/latest verification tasks.
     for i, item in enumerate(evidence_items):
         if (

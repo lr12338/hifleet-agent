@@ -17,12 +17,14 @@ preprocess -> delegate standard skills agent -> finalize
 3. `doubao-seed-2-0-lite-260428` 默认模型与 `thinking_type=enabled`、`reasoning_effort=medium`。
 4. 模型自主调用 `knowledge_qa`、`browser_verify`、`hifleet_ship_service`、`multimodal_support`。
 5. `knowledge_qa` 按 `local_kb_search -> web_search -> web_search_agent_browser` 顺序受控升级。
-6. HiFleet 官方社区、帮助中心、官网公开页面核验。
-7. 船舶查询、档案、PSC、轨迹、挂靠、统计、船位上传、静态信息更新。
-8. 船舶写操作的显式意图和必填字段保护。
-9. 多轮上下文与最近船舶实体记忆。
-10. 最终输出脱敏、链接抽取和 `output_assets`。
-11. `/run`、`/stream_run` 和微信旧 `content.query.prompt` 兼容。
+6. 平台操作/问题反馈类问题的多关键词检索和证据充分性复核。
+7. 授权知识库维护 `knowledge_admin.upsert_local_kb_entry`。
+8. HiFleet 官方社区、帮助中心、官网公开页面核验。
+9. 船舶查询、档案、PSC、轨迹、挂靠、统计、船位上传、静态信息更新。
+10. 船舶写操作的显式意图和必填字段保护。
+11. 多轮上下文与最近船舶实体记忆。
+12. 最终输出脱敏、链接抽取和 `output_assets`。
+13. `/run`、`/stream_run` 和微信旧 `content.query.prompt` 兼容。
 
 旧 `customer_support_router.py`、旧 planner/review/harness 和旧 `_build_customer_support_agent()` 仍保留为回滚与历史测试参考，但不再是当前 customer 入口。
 
@@ -38,7 +40,8 @@ PYTHONPATH=src .venv/bin/python scripts/test_llm_config.py
 PYTHONPATH=src .venv/bin/python -m pytest -q \
   tests/test_customer_support_intent_agent.py \
   tests/test_customer_support_router.py \
-  tests/test_smart_search_tools.py
+  tests/test_smart_search_tools.py \
+  tests/test_knowledge_admin_tools.py
 ```
 
 语法级检查：
@@ -82,6 +85,22 @@ npm run build
 - 用户要求验证官方/社区/今日/最新内容时，应触发 browser 或公开页面核验。
 - `agent_browser_deep_search` 返回结构化 evidence 后，最终回复不能暴露内部 CLI、日志、路径、JSON。
 - 产品问题才允许 HiFleet 站点过滤；公共权威数据问题不能被错误改写成 HiFleet 产品搜索。
+- 平台操作类问题应生成 3 到 5 组关键词，并覆盖入口、动作、保存/完成条件。
+- 仅命中帮助中心首页、社区目录、视频标题页、泛功能简介时，不能输出完整教程。
+- `怎么绘制区域标注` 应优先命中本地结构化 FAQ，回复包含主海图入口、绘制动作和保存动作。
+- `怎么添加电子围栏报警` 应能覆盖我的标注、报警入口、规则、对象和通知方式。
+- `标注不保存怎么办` 应区分已确认保存动作、可能原因、检查项和需补充信息，不直接断言根因。
+
+### 4.1.1 授权知识库维护
+
+- 明确 `添加知识库：`、`纠正知识库：` 或 `更新知识库：`，且授权 key 正确时，才允许调用 `upsert_local_kb_entry`。
+- `customer_support` 与 `customer_ceshi` 均可写库，但必须通过工具层 profile 和 key 校验。
+- 缺正文 `key: ...` 时，应拒绝写入；只传 `x-kb-update-key` header 也应拒绝。
+- 工具调用必须保留完整 `raw_text`；模型把 key 拆到其它参数但 `raw_text` 缺 key 时，应拒绝。
+- 多行 `名称：描述` 映射表应自动拆成多条独立知识，重复条目跳过，新条目继续写入。
+- 普通“你答错了/应该是...”但没有明确写库指令时，不应写入。
+- 重复 question 或高度相似内容不应重复追加。
+- 写入后 JSONL 每行应可 `json.loads`，并且 `local_kb_search` 可命中新条目。
 
 ### 4.2 多轮上下文
 
@@ -199,10 +218,14 @@ npm run build
     - 是否记录了本地 KB、web、browser 各层证据。
 13. `t1_payload_meta` / `request_profile`
     - 是否出现错误 `Sites` 污染或 Ark fallback 覆盖。
+14. `question_class`、`web_answerability_reason`、`risk_flags`
+    - 教程类问题是否被识别为需要更严格证据。
+15. `knowledge_admin` 工具结果
+    - 写库是否因缺 key、重复、缺标准答案被正确拒绝。
 
 ## 7. 当前已知限制
 
-- 知识库内容不足时，`smart_search` 命中质量会直接下降。
+- 知识库内容不足时，平台操作类问题会更依赖 web/browser 核验；不要用半相关摘要拼完整教程。
 - `agent-browser` 是受控官方核验证据层，不是自由浏览器 Agent。
 - `agent-browser` 当前只抓取公开网页正文，不处理登录态、Cookie、站内复杂交互。
 - 当前已取消自定义上下文压缩摘要；完整文本历史交给 agent/checkpointer 处理，历史多模态内容只做安全脱敏。

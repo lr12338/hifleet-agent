@@ -34,6 +34,7 @@
 - `user_id`：用户唯一标识。
 - `source_channel`：来源渠道，用于日志、观测和后台筛选，不参与 Profile 选择。
 - `agent_profile`：可选但推荐显式传入，正式值为 `customer_support` 或 `customer_ceshi`；旧值 `employee_assistant` 会被兼容解析为 `customer_support`。
+- 知识库写入 key：仅在授权客服/内部人员通过明确“添加知识库/纠正知识库/更新知识库”指令写入本地知识库时使用，且只能放在用户正文 `key: ...` 中。普通问答不要传。
 
 兼容说明：`input`、`text`、`content.query.prompt` 仍可被服务端自动归一化为 `messages`，因此微信客服等旧调用方可以平滑迁移，不需要一次性改完；但新接入和后续维护都应统一使用 `messages`。
 
@@ -64,6 +65,8 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 `customer_support` 能力边界：
 
 - 平台问题：模型按提示优先使用 `local_kb_search -> web_search -> web_search_agent_browser`。
+- 平台操作/问题反馈：模型会生成 3 到 5 组关键词做多轮检索，并在证据不足时保守回答。
+- 授权知识库维护：仅在明确写库指令且正文 `key: ...` 授权通过时，才会追加结构化 FAQ。
 - 多模态问题：当前轮包含 `image_url`、`input_audio`、`video_url` 时，会先做轻量感知/转写/摘要，再交给模型和工具链处理。
 - 船舶问题：允许读写 HiFleet ship service 工具，包括船位查询、档案、PSC、轨迹、挂靠、航次、区域/海峡统计、船位上传和静态信息更新。
 - 写操作：只有用户明确要求上传/更新/修改/补录船舶数据，并且工具真实返回成功时，才能对外宣称成功。
@@ -193,6 +196,32 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 ```
 
 写操作注意：如果缺少 MMSI、经纬度或实际要更新的字段，Agent 应只追问一个关键字段；如果工具未返回成功，回复不能声称已更新成功。
+
+### 5.2 授权知识库更新示例
+
+该能力用于客服运营或内部人员纠正已确认的标准答案，不用于普通用户自由投稿。
+
+```bash
+curl -X POST http://127.0.0.1:10123/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "更新知识库：HiFleet 海图图标识别特征库：紫色点圈，中心有灰绿色点，为泊位图标。详情链接参考 https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming#post-305\nkey: <HIFLEET_KB_UPDATE_KEY>"}
+    ],
+    "session_id": "kb-admin:ops:u1:c1",
+    "user_id": "ops-u1",
+    "source_channel": "admin_panel",
+    "agent_profile": "customer_support"
+  }'
+```
+
+约束：
+
+- 必须显式包含 `添加知识库：`、`纠正知识库：` 或 `更新知识库：`。
+- 授权 key 由环境变量 `HIFLEET_KB_UPDATE_KEY` 配置，只能通过正文 `key: ...` 传入；`x-kb-update-key` header 不再支持。
+- Agent 调用写库工具时必须保留完整 `raw_text`，不能把 key 单独拆成参数。
+- 多行 `名称：描述` 映射表会自动拆成多条独立知识；重复条目会跳过。
+- 缺授权、缺标准答案或命中重复时，Agent 应说明未写入原因。
 
 ## 6. 数字员工调用示例
 

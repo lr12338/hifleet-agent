@@ -408,7 +408,7 @@ curl -X POST http://127.0.0.1:10123/run \
 
 优先排查：
 
-1. 请求体 `agent_profile` 或请求头 `x-agent-profile` 是否误传了 `employee_assistant`。
+1. 请求体 `agent_profile` 或请求头 `x-agent-profile` 是否为空或被网关改写；`employee_assistant` 现在会被兼容解析为 `customer_support`。
 2. 如果没有传 Profile，服务端是否仍按默认值回退到 `customer_support`。
 3. 旧 `content.query.prompt` 是否按数组传入。
 4. `session_id` 是否稳定，是否被网关改写。
@@ -418,10 +418,11 @@ curl -X POST http://127.0.0.1:10123/run \
 
 1. [docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md](CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md)
 2. [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
-3. [docs/API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md)
-4. [docs/agent_browser_fallback_integration.md](agent_browser_fallback_integration.md)
-5. [docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md)
-6. [config/profiles/customer_support.md](../config/profiles/customer_support.md)
-7. [src/agents/agent.py](../src/agents/agent.py)
-8. [src/agents/customer_support_guard.py](../src/agents/customer_support_guard.py)
-9. [src/skills/browser_verify/tools.py](../src/skills/browser_verify/tools.py)
+3. [docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md](CUSTOMER_SUPPORT_KB_OPERATIONS.md)
+4. [docs/API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md)
+5. [docs/agent_browser_fallback_integration.md](agent_browser_fallback_integration.md)
+6. [docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md)
+7. [config/profiles/customer_support.md](../config/profiles/customer_support.md)
+8. [src/agents/agent.py](../src/agents/agent.py)
+9. [src/agents/customer_support_guard.py](../src/agents/customer_support_guard.py)
+10. [src/skills/browser_verify/tools.py](../src/skills/browser_verify/tools.py)
