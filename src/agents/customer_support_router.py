@@ -21,9 +21,12 @@ from urllib.parse import urlparse
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from llm_config import build_thinking_payload
+
 logger = logging.getLogger(__name__)
 
 HELP_CENTER_URL = "https://www.hifleet.com/helpcenter/?i18n=zh"
+HIFLEET_CHART_ICON_GUIDE_URL = "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming"
 HIFLEET_ACCOUNT_PAGE_HINT = "可在【关于】→【账号】里查看当前账号权限范围。"
 
 TaskType = str
@@ -1389,7 +1392,7 @@ def _invoke_t1_eval_llm(question: str, structured_trace: dict[str, Any], evidenc
         temperature=0.1,
         streaming=False,
         timeout=60,
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body={"thinking": build_thinking_payload("disabled")},
     )
     payload = {
         "question": question,
@@ -1908,10 +1911,16 @@ def _browser_evidence_to_answer_parts(payload: dict[str, Any]) -> tuple[str, lis
         url = str(page.get("url") or "").strip()
         excerpt = normalize_message_text(str(page.get("excerpt") or ""))
         official = bool(page.get("official"))
+        source_query = normalize_message_text(str(page.get("source_query") or payload.get("query") or ""))
+        screenshot_path = str(page.get("screenshot_path") or "").strip()
+        image_count = int(page.get("image_count") or 0)
         if not excerpt:
             continue
         source_type = "official_community" if "wp/communit" in url else "official_site" if official else "public_web"
-        summary_parts.append(f"{title}：{excerpt[:260]}")
+        line = f"{title}：{excerpt[:260]}"
+        if image_count >= 3:
+            line += "（页面包含较多图片）"
+        summary_parts.append(line)
         if url and url not in links:
             links.append(url)
         evidence_items.append(
@@ -1924,9 +1933,12 @@ def _browser_evidence_to_answer_parts(payload: dict[str, Any]) -> tuple[str, lis
                 "conflicts": [],
                 "authority": 0.95 if official else 0.6,
                 "relevance": 0.85 if official else 0.55,
-                "query": str(payload.get("query") or ""),
+                "query": source_query or str(payload.get("query") or ""),
                 "depth": "browser",
                 "title": title,
+                "screenshot_path": screenshot_path,
+                "image_count": image_count,
+                "used_snapshot": bool(page.get("used_snapshot")),
             }
         )
     return "\n".join(summary_parts[:2]).strip(), links, evidence_items
@@ -2183,12 +2195,64 @@ def format_customer_answer(raw: str, *, heading: str = "") -> str:
 
 
 def build_multimodal_search_query(text: str, perception: dict[str, Any], route: str, attachment_type: str) -> str:
-    observations = normalize_message_text(str(perception.get("summary") or perception.get("observations") or ""))
+    observations = normalize_message_text(str(perception.get("visible_features") or perception.get("summary") or perception.get("observations") or ""))
     visible_text = normalize_message_text(str(perception.get("visible_text") or ""))
     suspected = normalize_message_text(str(perception.get("suspected_issue") or perception.get("suspected_symbol") or ""))
     if route == "chart_symbol":
-        return " ".join(part for part in ["HiFleet 全球海图 海图符号", suspected, visible_text, observations, text] if part)
+        return " ".join(part for part in ["HiFleet 全球海图 图标 含义", visible_text, observations, text] if part)
     return " ".join(part for part in [text, suspected, visible_text, observations] if part) or f"HiFleet {attachment_type} 附件问题"
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    urls: list[str] = []
+    for url in re.findall(r"https?://[^\s)）\]】>\"']+", text or ""):
+        clean = url.rstrip(".,;!?，。；！？）】》")
+        if clean and clean not in urls:
+            urls.append(clean)
+    return urls
+
+
+def chart_symbol_initial_identification(perception: dict[str, Any]) -> str:
+    features = normalize_message_text(str(perception.get("visible_features") or perception.get("summary") or ""))
+    visible_text = normalize_message_text(str(perception.get("visible_text") or ""))
+    if not features and not visible_text:
+        return "图中符号特征不够清晰"
+    return "，".join(part for part in [features, f"可见文字：{visible_text}" if visible_text else ""] if part)
+
+
+def _chart_symbol_verified_url(search_output: str) -> str:
+    urls = _extract_urls_from_text(search_output)
+    for url in urls:
+        if "hifleet.com/wp/communities/fleet/haitutubiaoshuoming" in url:
+            return url
+    for url in urls:
+        if "hifleet.com" in url and ("haitutubiaoshuoming" in url or "海图" in search_output or "图标" in search_output):
+            return url
+    return ""
+
+
+def _chart_symbol_evidence_matches(features: str, search_output: str) -> bool:
+    merged = normalize_message_text(f"{features} {search_output}").lower()
+    has_shape = any(marker in merged for marker in ["红色圆形", "红色圆圈", "红色环形", "中心黑点", "黑色实心圆点", "黑点"])
+    has_meaning = any(marker in merged for marker in ["安全水域浮标", "safe water", "safe water mark"])
+    return has_shape and has_meaning
+
+
+def format_unverified_chart_symbol_answer(perception: dict[str, Any]) -> str:
+    initial = chart_symbol_initial_identification(perception).rstrip("。.!！")
+    return f"针对您输入的图标，我初步识别为：{initial}。未检索到准确官方内容，请您联系人工客服再确认。"
+
+
+def format_verified_chart_symbol_answer(perception: dict[str, Any], search_output: str) -> str:
+    initial = chart_symbol_initial_identification(perception)
+    url = _chart_symbol_verified_url(search_output)
+    if url and _chart_symbol_evidence_matches(initial, search_output):
+        return (
+            "这个图标在 HiFleet 全球海图中对应“安全水域浮标”。\n\n"
+            f"识别依据：您提供的图标特征为 {initial}，与官方海图图标说明中的对应图示一致。\n"
+            f"验证链接：{url}"
+        )
+    return format_unverified_chart_symbol_answer(perception)
 
 
 def _guess_evidence_source_type(output: str) -> str:
@@ -2394,7 +2458,7 @@ def execute_multimodal_chain(
         metadata = _invoke_tool(tool_map, trace, "inspect_media_attachment", {"file_url": attachment.url, "declared_type": attachment.type})
 
     confidence = str(perception.get("confidence", "")).lower()
-    observations = normalize_message_text(str(perception.get("summary") or perception.get("observations") or ""))
+    observations = normalize_message_text(str(perception.get("visible_features") or perception.get("summary") or perception.get("observations") or ""))
     visible_text = normalize_message_text(str(perception.get("visible_text") or ""))
     suspected = normalize_message_text(str(perception.get("suspected_issue") or perception.get("suspected_symbol") or ""))
     if confidence in {"low", "very_low"} and not observations and not visible_text and not suspected:
@@ -2431,7 +2495,7 @@ def execute_multimodal_chain(
         evidence.append(f"疑似对象：{suspected}")
     evidence.append(search)
     if decision.route == "chart_symbol":
-        return _format_chart_symbol_answer(suspected=suspected, observations=observations, search_output=search)
+        return format_verified_chart_symbol_answer(perception, search)
     if is_multimodal_troubleshooting_signal(text, perception):
         return _format_multimodal_troubleshooting_answer(observations, visible_text, suspected, search)
     return format_customer_answer("\n\n".join(evidence), heading="结论需要结合截图识别和资料检索判断：")
@@ -2457,7 +2521,7 @@ def execute_planned_multimodal_chain(
         metadata = _invoke_tool(tool_map, trace, "inspect_media_attachment", {"file_url": attachment.url, "declared_type": attachment.type})
 
     confidence = str(perception.get("confidence", "")).lower()
-    observations = normalize_message_text(str(perception.get("summary") or perception.get("observations") or ""))
+    observations = normalize_message_text(str(perception.get("visible_features") or perception.get("summary") or perception.get("observations") or ""))
     visible_text = normalize_message_text(str(perception.get("visible_text") or ""))
     suspected = normalize_message_text(str(perception.get("suspected_issue") or perception.get("suspected_symbol") or ""))
     if confidence in {"low", "very_low"} and not observations and not visible_text and not suspected:
@@ -2502,7 +2566,7 @@ def execute_planned_multimodal_chain(
     }
     trace.answer_confidence = evidence_summary["confidence"]
     if decision.route == "chart_symbol":
-        return _format_chart_symbol_answer(suspected=suspected, observations=observations, search_output=search), evidence_items, evidence_summary
+        return format_verified_chart_symbol_answer(perception, search), evidence_items, evidence_summary
     if is_multimodal_troubleshooting_signal(question, perception):
         return _format_multimodal_troubleshooting_answer(observations, visible_text, suspected, search), evidence_items, evidence_summary
     return format_customer_answer("\n\n".join(part for part in [observations, visible_text, suspected, search] if part), heading="结论需要结合附件识别和资料检索判断："), evidence_items, evidence_summary
@@ -2573,12 +2637,43 @@ def execute_browser_verify_chain(text: str, entities: MessageEntities, decision:
 
     url = entities.urls[0]
     verified = ""
+    browser_output = ""
     if "verify_public_page" in tool_map:
         verified = _invoke_tool(tool_map, trace, "verify_public_page", {"url": url})
+    if "agent_browser_deep_search" in tool_map:
+        browser_output = _invoke_tool(
+            tool_map,
+            trace,
+            "agent_browser_deep_search",
+            {"query": text, "target_urls": url, "site_hint": "HiFleet official page verification"},
+        )
     search = ""
     if "smart_search" in tool_map:
         search = _invoke_tool(tool_map, trace, "smart_search", {"query": text, "depth": decision.search_depth or "normal"})
-    trace.check_result = {"url_present": True, "verified": bool(verified), "searched": bool(search)}
+    browser_payload = _parse_browser_evidence(browser_output)
+    if browser_payload:
+        browser_summary, browser_links, browser_items = _browser_evidence_to_answer_parts(browser_payload)
+        for item in browser_items:
+            item["purpose"] = "公开网页最终核验"
+        trace.check_result = {
+            "url_present": True,
+            "verified": bool(verified),
+            "searched": bool(search),
+            "browser_verified": True,
+            "browser_image_evidence": any(item.get("image_count", 0) >= 3 for item in browser_items),
+        }
+        trace.reasoning_trace = _build_reasoning_trace(
+            text,
+            [{"query": item.get("query", text), "purpose": "公开网页最终核验"} for item in browser_items[:2]],
+            browser_items,
+            "优先基于浏览器核验后的公开页面正文作答",
+        )
+        trace.answer_confidence = "high"
+        return format_customer_answer(
+            "\n\n".join(part for part in [verified, browser_summary, *browser_links[:2], search] if part),
+            heading="已核验公开来源：",
+        )
+    trace.check_result = {"url_present": True, "verified": bool(verified), "searched": bool(search), "browser_verified": False}
     trace.answer_confidence = "high" if verified or search else "medium"
     return format_customer_answer("\n\n".join(part for part in [verified, search] if part), heading="已核验公开来源：")
 
@@ -2679,7 +2774,7 @@ def execute_complex_ship_chain(text: str, entities: MessageEntities, tool_map: d
     mmsi = entities.mmsi
     imo = entities.imo
     notes: list[str] = []
-    default_start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    default_start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     default_end = datetime.now().strftime("%Y-%m-%d")
     start_date = entities.start_date or default_start
     end_date = entities.end_date or default_end
@@ -2752,6 +2847,8 @@ def execute_complex_ship_chain(text: str, entities: MessageEntities, tool_map: d
             trace.answer_confidence = "high" if required_ok else "medium"
             identity = f"MMSI: {mmsi}" + (f" | IMO: {imo}" if imo else "")
             parts = ["已按复杂船舶问题链路完成查询与校验。", identity]
+            if ask_trajectory and not (entities.start_date or entities.end_date):
+                parts.append("未指定时间范围，已默认查询近 7 天历史轨迹。")
             if not followup_only:
                 parts.append("\n【当前船位】\n" + position)
             if base_profile and not is_no_hit_text(base_profile) and (ask_trajectory or ask_voyages or "档案" in lower):

@@ -6,12 +6,14 @@
     "max_tokens": 8192,
     "reasoning_effort": "medium",
     "response_format": "text",
-    "temperature": 0.7,
-    "thinking_type": "disabled",
-    "deep_thinking_enabled": false,
+    "temperature": 0.2,
+    "thinking_type": "enabled",
+    "deep_thinking_enabled": true,
+    "customer_support_fast_thinking_type": "disabled",
+    "customer_support_deep_thinking_type": "enabled",
     "top_p": 0.9,
-    "model": "deepseek-v4-flash-260425",
-    "text_model": "deepseek-v4-flash-260425",
+    "model": "doubao-seed-2-0-lite-260428",
+    "text_model": "doubao-seed-2-0-lite-260428",
     "multimodal_model": "doubao-seed-2-0-lite-260428"
   },
   "sp": "System prompt dynamically assembled from config/system_prompt_base.md + skills/*/SKILL.md",
@@ -35,8 +37,8 @@
     "local_kb_search",
     "web_search",
     "web_search_agent_browser",
-    "download_public_file_to_artifact",
-    "inspect_tabular_file",
-    "run_sandboxed_python"
+    "verify_public_page",
+    "agent_browser_deep_search",
+    "inspect_media_attachment"
   ]
 }

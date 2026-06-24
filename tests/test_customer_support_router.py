@@ -26,6 +26,8 @@ from agents.customer_support_router import (
     execute_multimodal_chain,
     execute_simple_ship_chain,
     execute_update_chain,
+    format_unverified_chart_symbol_answer,
+    format_verified_chart_symbol_answer,
     extract_attachments,
     extract_entities,
     make_trace,
@@ -41,8 +43,17 @@ from agents.customer_support_guard import sanitize_customer_output
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from skills.browser_verify.tools import (
     PREFERRED_HIFLEET_PAGES,
+    AGENT_BROWSER_SESSION_PREFIX,
+    AGENT_BROWSER_OPEN_TIMEOUT_SEC,
     _candidate_urls,
+    _candidate_priority,
+    _merge_agent_browser_args,
+    _new_agent_browser_session,
+    _run_agent_browser,
+    _query_variants,
+    _bing_search_candidates,
     _preferred_hifleet_candidates,
+    _browser_capture_page_text,
     agent_browser_deep_search,
 )
 
@@ -243,16 +254,18 @@ def test_agent_browser_deep_search_formats_public_page_results(monkeypatch):
     )
     monkeypatch.setattr(
         "skills.browser_verify.tools._browser_capture_page_text",
-        lambda url: ("HiFleet 帮助中心", "这里是帮助中心正文摘要，包含轨迹导出功能说明。"),
+        lambda url, query="", session="": ("HiFleet 帮助中心", "这里是帮助中心正文摘要，包含轨迹导出功能说明。", {"image_count": 0, "screenshot_path": "", "used_snapshot": False}),
     )
 
     output = agent_browser_deep_search.invoke({"query": "HiFleet 船舶轨迹怎么导出"})
     payload = json.loads(output)
 
     assert payload["type"] == "hifleet_browser_evidence"
+    assert payload["search_strategy"]["official_first"] is True
     assert payload["pages"][0]["title"] == "HiFleet 帮助中心"
     assert "轨迹导出功能说明" in payload["pages"][0]["excerpt"]
     assert payload["pages"][0]["url"] == "https://www.hifleet.com/helpcenter/?i18n=zh"
+    assert payload["pages"][0]["used_snapshot"] is False
 
 
 def test_agent_browser_deep_search_rejects_invalid_query_characters():
@@ -269,7 +282,7 @@ def test_agent_browser_deep_search_prefers_sandbox_candidates(monkeypatch):
     monkeypatch.setattr("skills.browser_verify.tools._candidate_urls", lambda query: [])
     monkeypatch.setattr(
         "skills.browser_verify.tools._browser_capture_page_text",
-        lambda url: ("HiFleet 数据服务", "这里是通过 agent-browser 抓取的 HiFleet 数据服务正文。"),
+        lambda url, query="", session="": ("HiFleet 数据服务", "这里是通过 agent-browser 抓取的 HiFleet 数据服务正文。", {"image_count": 0, "screenshot_path": "", "used_snapshot": False}),
     )
 
     output = agent_browser_deep_search.invoke({"query": "HiFleet 数据服务介绍"})
@@ -278,6 +291,173 @@ def test_agent_browser_deep_search_prefers_sandbox_candidates(monkeypatch):
     assert payload["type"] == "hifleet_browser_evidence"
     assert payload["pages"][0]["title"] == "HiFleet 数据服务"
     assert "通过 agent-browser 抓取" in payload["pages"][0]["excerpt"]
+
+
+def test_agent_browser_deep_search_keeps_image_evidence(monkeypatch):
+    monkeypatch.setattr("skills.browser_verify.tools._sandbox_hifleet_candidates", lambda query: [])
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._candidate_urls",
+        lambda query: [{"url": "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming#post-305", "title": "海图图标说明", "summary": "图标说明页", "source": "bing", "query": query}],
+    )
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._browser_capture_page_text",
+        lambda url, query="", session="": ("海图图标说明", "这里是海图图标说明正文。", {"image_count": 12, "screenshot_path": "/tmp/agent-browser-hifleet/map-icons.png", "used_snapshot": False}),
+    )
+
+    output = agent_browser_deep_search.invoke({"query": "HiFleet 海图图标说明 图片"})
+    payload = json.loads(output)
+
+    assert payload["pages"][0]["image_count"] == 12
+    assert payload["pages"][0]["screenshot_path"] == "/tmp/agent-browser-hifleet/map-icons.png"
+
+
+def test_agent_browser_deep_search_uses_bing_without_target_urls(monkeypatch):
+    monkeypatch.setattr("skills.browser_verify.tools._sandbox_hifleet_candidates", lambda query: [])
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._bing_search_candidates",
+        lambda query: [
+            {
+                "url": "https://www.hifleet.com/wp/communities/fleet/zhuyiliulanqikaishijiyichuanduishaixuanle",
+                "title": "注意！浏览器开始记忆船队“筛选”了",
+                "summary": "船队筛选记忆功能",
+                "source": "bing",
+                "query": f"HiFleet {query}",
+            }
+        ],
+    )
+    monkeypatch.setattr("skills.browser_verify.tools._preferred_hifleet_candidates", lambda query: [])
+    monkeypatch.setattr(
+        "skills.browser_verify.tools._browser_capture_page_text",
+        lambda url, query="", session="": ("注意！浏览器开始记忆船队“筛选”了", "在显示-船队-筛选上增加了浏览器记忆功能。", {"image_count": 0, "screenshot_path": "", "used_snapshot": False}),
+    )
+
+    output = agent_browser_deep_search.invoke({"query": "船队筛选记忆功能"})
+    payload = json.loads(output)
+
+    assert payload["type"] == "hifleet_browser_evidence"
+    assert payload["pages"][0]["url"].startswith("https://www.hifleet.com/wp/communities/")
+    assert payload["pages"][0]["source_query"] == "HiFleet 船队筛选记忆功能"
+
+
+def test_agent_browser_deep_search_no_target_urls_no_candidates_returns_no_hit(monkeypatch):
+    monkeypatch.setattr("skills.browser_verify.tools._candidate_urls", lambda query: [])
+    monkeypatch.setattr("skills.browser_verify.tools._sandbox_hifleet_candidates", lambda query: [])
+
+    output = agent_browser_deep_search.invoke({"query": "船队筛选记忆功能"})
+
+    assert "未检索到足够可信的信息" in output
+
+
+def test_agent_browser_deep_search_filters_local_target_urls(monkeypatch):
+    monkeypatch.setattr("skills.browser_verify.tools._candidate_urls", lambda query: [])
+    monkeypatch.setattr("skills.browser_verify.tools._sandbox_hifleet_candidates", lambda query: [])
+
+    output = agent_browser_deep_search.invoke({"query": "普通问题", "target_urls": "http://localhost:8000/page"})
+
+    assert "未检索到足够可信的信息" in output
+
+
+def test_query_variants_add_hifleet_prefix():
+    variants = _query_variants("租船AI 使用指南")
+
+    assert variants[0] == "租船AI 使用指南"
+    assert any(item.startswith("HiFleet ") for item in variants)
+
+
+def test_merge_agent_browser_args_adds_no_sandbox():
+    merged = _merge_agent_browser_args("--disable-gpu")
+
+    assert "--disable-gpu" in merged
+    assert "--no-sandbox" in merged
+
+
+def test_new_agent_browser_session_is_unique():
+    first = _new_agent_browser_session()
+    second = _new_agent_browser_session()
+
+    assert first.startswith(f"{AGENT_BROWSER_SESSION_PREFIX}-")
+    assert second.startswith(f"{AGENT_BROWSER_SESSION_PREFIX}-")
+    assert first != second
+
+
+def test_run_agent_browser_uses_supplied_session(monkeypatch):
+    captured = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def fake_run(cmd, capture_output, text, timeout, shell, env):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return FakeResult()
+
+    monkeypatch.setattr("skills.browser_verify.tools.subprocess.run", fake_run)
+
+    output = _run_agent_browser("get", "title", session="hifleet-cs-test-session")
+
+    assert output == "ok"
+    assert captured["cmd"][:3] == ["agent-browser", "--session", "hifleet-cs-test-session"]
+    assert captured["env"]["AGENT_BROWSER_SESSION"] == "hifleet-cs-test-session"
+
+
+def test_browser_capture_page_text_reuses_one_session(monkeypatch):
+    calls = []
+
+    def fake_run_agent_browser(*args, timeout=25, session=""):
+        calls.append({"args": args, "timeout": timeout, "session": session})
+        if args == ("get", "title"):
+            return "标题"
+        if args == ("get", "text", "body"):
+            return "正文"
+        if args == ("get", "count", "img"):
+            return "0"
+        return ""
+
+    monkeypatch.setattr("skills.browser_verify.tools._run_agent_browser", fake_run_agent_browser)
+
+    title, body, meta = _browser_capture_page_text("https://www.hifleet.com/", "HiFleet", session="hifleet-cs-capture")
+
+    assert title == "标题"
+    assert body == "正文"
+    assert meta["used_snapshot"] is False
+    assert {call["session"] for call in calls} == {"hifleet-cs-capture"}
+    assert calls[0]["args"] == ("open", "https://www.hifleet.com/")
+    assert calls[0].get("timeout") == AGENT_BROWSER_OPEN_TIMEOUT_SEC
+
+
+def test_browser_capture_page_text_retries_open_once(monkeypatch):
+    calls = []
+
+    def fake_run_agent_browser(*args, timeout=25, session=""):
+        calls.append({"args": args, "timeout": timeout, "session": session})
+        if args == ("open", "https://www.hifleet.com/") and len([call for call in calls if call["args"] == args]) == 1:
+            raise RuntimeError("cold start timeout")
+        if args == ("get", "title"):
+            return "标题"
+        if args == ("get", "text", "body"):
+            return "正文"
+        if args == ("get", "count", "img"):
+            return "0"
+        return ""
+
+    monkeypatch.setattr("skills.browser_verify.tools._run_agent_browser", fake_run_agent_browser)
+
+    title, body, meta = _browser_capture_page_text("https://www.hifleet.com/", "HiFleet", session="hifleet-cs-retry")
+
+    open_calls = [call for call in calls if call["args"] == ("open", "https://www.hifleet.com/")]
+    assert len(open_calls) == 2
+    assert title == "标题"
+    assert body == "正文"
+    assert meta["used_snapshot"] is False
+
+
+def test_start_system_service_defaults_to_single_worker():
+    script = Path(__file__).resolve().parents[1] / "scripts/start_system_service.sh"
+    text = script.read_text(encoding="utf-8")
+
+    assert 'export COZE_HTTP_WORKERS="${COZE_HTTP_WORKERS:-1}"' in text
 
 
 def test_preferred_hifleet_candidates_prioritize_helpcenter_for_howto(monkeypatch):
@@ -291,7 +471,7 @@ def test_preferred_hifleet_candidates_prioritize_helpcenter_for_howto(monkeypatc
     assert any(item["url"] == "https://www.hifleet.com/account/index.html?type=account" for item in candidates)
 
 
-def test_candidate_urls_merge_preferred_hifleet_pages_before_bing(monkeypatch):
+def test_candidate_urls_merge_preferred_hifleet_pages_before_bing_for_hifleet_scope(monkeypatch):
     preferred = [
         {"url": "https://www.hifleet.com/helpcenter/?i18n=en", "title": "HiFleet Help Center EN", "summary": "", "source": "preferred_hifleet", "query": "q"}
     ]
@@ -301,11 +481,62 @@ def test_candidate_urls_merge_preferred_hifleet_pages_before_bing(monkeypatch):
     monkeypatch.setattr("skills.browser_verify.tools._preferred_hifleet_candidates", lambda query: preferred)
     monkeypatch.setattr("skills.browser_verify.tools._bing_search_candidates", lambda query: bing)
 
-    candidates = _candidate_urls("q")
+    candidates = _candidate_urls("HiFleet 帮助中心")
 
     assert candidates[0]["source"] == "preferred_hifleet"
     assert candidates[0]["url"] == "https://www.hifleet.com/helpcenter/?i18n=en"
     assert candidates[1]["source"] == "bing"
+
+
+def test_candidate_urls_prioritize_official_bing_candidates(monkeypatch):
+    bing = [
+        {"url": "https://example.com/hifleet-guide", "title": "第三方 HiFleet 指南", "summary": "船队筛选记忆", "source": "bing", "query": "q"},
+        {"url": "https://www.hifleet.com/wp/communities/fleet/zhuyiliulanqikaishijiyichuanduishaixuanle", "title": "HiFleet 官方社区", "summary": "船队筛选记忆", "source": "bing", "query": "q"},
+    ]
+    monkeypatch.setattr("skills.browser_verify.tools._bing_search_candidates", lambda query: bing)
+    monkeypatch.setattr("skills.browser_verify.tools._preferred_hifleet_candidates", lambda query: [])
+
+    candidates = _candidate_urls("船队筛选记忆功能")
+
+    assert candidates[0]["url"].startswith("https://www.hifleet.com/")
+    assert _candidate_priority(candidates[0], "船队筛选记忆功能") > _candidate_priority(candidates[1], "船队筛选记忆功能")
+
+
+def test_candidate_urls_prioritize_specific_official_pages_over_homepage(monkeypatch):
+    preferred = [
+        {"url": "https://www.hifleet.com/", "title": "HiFleet 官网首页", "summary": "", "source": "preferred_hifleet", "query": "q"}
+    ]
+    bing = [
+        {"url": "https://www.hifleet.com/wp/communities/fleet/zhuyiliulanqikaishijiyichuanduishaixuanle", "title": "船队筛选记忆功能", "summary": "船队筛选记忆", "source": "bing", "query": "q"}
+    ]
+    monkeypatch.setattr("skills.browser_verify.tools._preferred_hifleet_candidates", lambda query: preferred)
+    monkeypatch.setattr("skills.browser_verify.tools._bing_search_candidates", lambda query: bing)
+
+    candidates = _candidate_urls("HiFleet 船队筛选记忆功能")
+
+    assert candidates[0]["url"].startswith("https://www.hifleet.com/wp/communities/")
+
+
+def test_bing_search_candidates_records_actual_source_query(monkeypatch):
+    html = """
+    <li class="b_algo"><h2><a href="https://www.hifleet.com/wp/communities/fleet/example">HiFleet 官方社区</a></h2><p>船队筛选记忆</p></li>
+    """
+
+    class FakeResponse:
+        text = html
+
+        def raise_for_status(self):
+            return None
+
+    requested_urls = []
+    monkeypatch.setattr("skills.browser_verify.tools.requests.get", lambda url, timeout, headers: requested_urls.append(url) or FakeResponse())
+    monkeypatch.setattr("skills.knowledge_qa.tools._is_url_accessible", lambda url: True)
+
+    candidates = _bing_search_candidates("船队筛选记忆功能")
+
+    assert candidates[0]["url"] == "https://www.hifleet.com/wp/communities/fleet/example"
+    assert candidates[0]["query"].startswith('site:hifleet.com "HiFleet"')
+    assert requested_urls
 
 
 def test_preferred_hifleet_pages_cover_requested_urls():
@@ -964,7 +1195,13 @@ def test_extract_attachments_from_human_multimodal_content():
 
 
 def test_multimodal_chain_combines_perception_and_deep_search():
-    smart_search = FakeTool("smart_search", lambda args: f"query={args['query']} depth={args['depth']}")
+    smart_search = FakeTool(
+        "smart_search",
+        lambda args: (
+            "海图图标说明：红色圆形中心黑点为安全水域浮标\n"
+            "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming"
+        ),
+    )
     inspect = FakeTool("inspect_media_attachment", lambda args: '{"category":"image"}')
     decision = classify_multimodal_message(
         "这个符号是什么意思",
@@ -976,16 +1213,40 @@ def test_multimodal_chain_combines_perception_and_deep_search():
     output = execute_multimodal_chain(
         "这个符号是什么意思",
         [Attachment(type="image", url="https://example.com/chart.png")],
-        {"confidence": "high", "summary": "红色圆圈中心黑点", "suspected_symbol": "安全水域浮标"},
+        {"confidence": "high", "visible_features": "红色圆形、中心黑点", "summary": "红色圆形、中心黑点"},
         decision,
         {"smart_search": smart_search, "inspect_media_attachment": inspect},
         trace,
     )
 
     assert "安全水域浮标" in output
-    assert "红色圆圈中心黑点" in smart_search.calls[0]["query"]
+    assert "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming" in output
+    assert "红色圆形、中心黑点" in smart_search.calls[0]["query"]
     assert smart_search.calls[0]["depth"] == "deep"
     assert trace.tool_call_sequence == ["inspect_media_attachment", "smart_search"]
+
+
+def test_chart_symbol_answer_without_verified_link_uses_unverified_template():
+    perception = {"visible_features": "红色圆形、中心黑点", "confidence": "high"}
+
+    output = format_verified_chart_symbol_answer(perception, "未检索到足够可信的信息")
+
+    assert "初步识别为：红色圆形、中心黑点" in output
+    assert "未检索到准确官方内容" in output
+    assert "安全水域浮标" not in output
+
+
+def test_chart_symbol_answer_requires_verified_link():
+    perception = {"visible_features": "红色圆形、中心黑点", "confidence": "high"}
+
+    output = format_verified_chart_symbol_answer(
+        perception,
+        "海图图标说明：红色圆形中心黑点对应安全水域浮标。"
+        "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming",
+    )
+
+    assert "安全水域浮标" in output
+    assert "验证链接：https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming" in output
 
 
 def test_multimodal_error_screenshot_reroutes_to_platform_troubleshooting():
@@ -1076,6 +1337,53 @@ def test_browser_verify_chain_checks_public_url_and_searches():
     assert "官方社区" in output
     assert verify.calls == [{"url": "https://www.hifleet.com/wp/communities"}]
     assert trace.check_result["verified"] is True
+
+
+def test_browser_verify_chain_prefers_browser_verified_evidence():
+    verify = FakeTool("verify_public_page", lambda args: '{"ok":true,"title":"HiFleet 官方社区"}')
+    search = FakeTool("smart_search", lambda args: "【Hifleet官方站内搜索】\n来源：官方社区")
+    browser = FakeTool(
+        "agent_browser_deep_search",
+        lambda args: json.dumps(
+            {
+                "type": "hifleet_browser_evidence",
+                "query": args["query"],
+                "pages": [
+                    {
+                        "title": "HiFleet 官方社区",
+                        "url": "https://www.hifleet.com/wp/communities",
+                        "excerpt": "这里是社区正文摘要。",
+                        "official": True,
+                        "source_query": "HiFleet 官方社区 核验",
+                        "image_count": 5,
+                        "screenshot_path": "/tmp/agent-browser-hifleet/community.png",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    text = "核验 https://www.hifleet.com/wp/communities 的官方信息"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    decision.route = "browser_verify"
+    decision.task_type = "browser_verify"
+    decision.tool_bundle = ["verify_public_page", "smart_search", "agent_browser_deep_search"]
+    trace = make_trace(decision, entities)
+
+    output = execute_browser_verify_chain(
+        text,
+        entities,
+        decision,
+        {"verify_public_page": verify, "smart_search": search, "agent_browser_deep_search": browser},
+        trace,
+    )
+
+    assert "HiFleet 官方社区" in output
+    assert "页面包含较多图片" in output
+    assert trace.check_result["browser_verified"] is True
+    assert trace.check_result["browser_image_evidence"] is True
+    assert trace.reasoning_trace["tool_summary"]["official_source_count"] >= 1
 
 
 def test_reference_02_route_upload_failure_returns_layered_troubleshooting():

@@ -6,6 +6,10 @@ import logging
 import os
 import re
 import subprocess
+import threading
+import uuid
+from hashlib import md5
+from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
 import requests
@@ -15,13 +19,16 @@ from skills.employee_workspace.tools import ARTIFACT_ROOT, _prepare_job_dir, _ru
 
 logger = logging.getLogger(__name__)
 
-AGENT_BROWSER_SESSION = "hifleet-cs-fallback"
+AGENT_BROWSER_SESSION_PREFIX = "hifleet-cs"
 AGENT_BROWSER_TIMEOUT_SEC = 25
+AGENT_BROWSER_OPEN_TIMEOUT_SEC = 60
 AGENT_BROWSER_MAX_BODY_CHARS = 4000
+AGENT_BROWSER_SCREENSHOT_DIR = Path("/tmp/agent-browser-hifleet")
 PY_SANDBOX_SEARCH_NETWORK_MODE = os.getenv("HIFLEET_PY_SANDBOX_BROWSER_NETWORK_MODE", "bridge").strip() or "bridge"
 NO_HIT_TEXT = "未检索到足够可信的信息"
 BING_SEARCH_URL = "https://www.bing.com/search"
 REQUESTS_HEADERS = {"User-Agent": "HiFleetCustomerSupport/1.0"}
+IMAGE_HEAVY_QUERY_MARKERS = ("图片", "图标", "截图", "界面", "海图", "标识", "图示", "符号", "image", "screenshot", "icon")
 PREFERRED_HIFLEET_PAGES = [
     {
         "url": "https://www.hifleet.com/",
@@ -78,34 +85,137 @@ def _normalize_page_text(text: str) -> str:
     return value[:AGENT_BROWSER_MAX_BODY_CHARS]
 
 
+def _normalize_keyword_token(value: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (value or "").lower()).strip()
+
+
 def _strip_html_tags(text: str) -> str:
     value = re.sub(r"<[^>]+>", " ", text or "")
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _run_agent_browser(*args: str, timeout: int = AGENT_BROWSER_TIMEOUT_SEC) -> str:
-    cmd = ["agent-browser", "--session", AGENT_BROWSER_SESSION, "--max-output", str(AGENT_BROWSER_MAX_BODY_CHARS), *args]
+def _merge_agent_browser_args(existing: str) -> str:
+    merged = [part.strip() for part in re.split(r"[,\n]+", existing or "") if part.strip()]
+    if os.name == "posix" and "--no-sandbox" not in merged:
+        merged.append("--no-sandbox")
+    return ",".join(merged)
+
+
+def _new_agent_browser_session() -> str:
+    return f"{AGENT_BROWSER_SESSION_PREFIX}-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}"
+
+
+def _build_agent_browser_env(session: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["AGENT_BROWSER_SESSION"] = session
+    env["AGENT_BROWSER_ARGS"] = _merge_agent_browser_args(env.get("AGENT_BROWSER_ARGS", ""))
+    return env
+
+
+def _run_agent_browser(*args: str, timeout: int = AGENT_BROWSER_TIMEOUT_SEC, session: str = "") -> str:
+    browser_session = session or _new_agent_browser_session()
+    cmd = ["agent-browser", "--session", browser_session, "--max-output", str(AGENT_BROWSER_MAX_BODY_CHARS), *args]
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=timeout,
         shell=False,
+        env=_build_agent_browser_env(browser_session),
     )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "agent-browser failed").strip()[:400])
     return (result.stdout or "").strip()
 
 
-def _browser_capture_page_text(url: str) -> tuple[str, str]:
-    _run_agent_browser("open", url)
-    title = _run_agent_browser("get", "title")
-    body = _run_agent_browser("get", "text", "body")
-    body = _normalize_page_text(body)
+def _query_contains_visual_markers(query: str) -> bool:
+    lowered = (query or "").lower()
+    return any(marker in lowered for marker in IMAGE_HEAVY_QUERY_MARKERS)
+
+
+def _screenshot_output_path(url: str) -> str:
+    AGENT_BROWSER_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    parsed = urlparse(url or "")
+    slug = re.sub(r"[^0-9a-zA-Z_-]+", "-", f"{parsed.netloc}{parsed.path}".strip("-"))[:80].strip("-") or "page"
+    digest = md5((url or "").encode("utf-8")).hexdigest()[:8]
+    return str(AGENT_BROWSER_SCREENSHOT_DIR / f"{slug}-{digest}.png")
+
+
+def _parse_int_output(value: str) -> int:
+    match = re.search(r"-?\d+", value or "")
+    return int(match.group(0)) if match else 0
+
+
+def _strip_for_excerpt(text: str) -> str:
+    value = _normalize_page_text(text)
+    noisy_markers = [
+        "论坛搜索",
+        "最近主题",
+        "最近留言",
+        "论坛统计",
+        "All forum topics",
+        "Previous Topic",
+        "Next Topic",
+        "请 登录 或 注册 to reply to this topic.",
+    ]
+    cut_positions = [value.find(marker) for marker in noisy_markers if marker in value]
+    if cut_positions:
+        value = value[: min(cut_positions)].strip()
+    return value
+
+
+def _browser_capture_page_text(url: str, query: str = "", session: str = "") -> tuple[str, str, dict[str, str | int | bool]]:
+    browser_session = session or _new_agent_browser_session()
+    try:
+        _run_agent_browser("open", url, timeout=AGENT_BROWSER_OPEN_TIMEOUT_SEC, session=browser_session)
+    except RuntimeError:
+        logger.debug("agent-browser open retry for %s", url)
+        _run_agent_browser("open", url, timeout=AGENT_BROWSER_OPEN_TIMEOUT_SEC, session=browser_session)
+    try:
+        _run_agent_browser("wait", "--load", "networkidle", timeout=min(AGENT_BROWSER_TIMEOUT_SEC, 12), session=browser_session)
+    except Exception:
+        logger.debug("agent-browser wait networkidle failed for %s", url)
+        try:
+            _run_agent_browser("wait", "2000", timeout=5, session=browser_session)
+        except Exception:
+            logger.debug("agent-browser fixed wait failed for %s", url)
+    try:
+        title = _run_agent_browser("get", "title", session=browser_session)
+    except Exception:
+        logger.debug("agent-browser title failed for %s", url)
+        title = ""
+    try:
+        body = _run_agent_browser("get", "text", "body", session=browser_session)
+    except Exception:
+        logger.debug("agent-browser body text failed for %s", url)
+        try:
+            _run_agent_browser("wait", "2000", timeout=5, session=browser_session)
+            body = _run_agent_browser("get", "text", "body", session=browser_session)
+        except Exception:
+            body = ""
+    body = _strip_for_excerpt(body)
+    image_count = 0
+    try:
+        image_count = _parse_int_output(_run_agent_browser("get", "count", "img", timeout=10, session=browser_session))
+    except Exception:
+        logger.debug("agent-browser image count failed for %s", url)
+    screenshot_path = ""
+    needs_screenshot = image_count >= 3 or _query_contains_visual_markers(query)
+    if needs_screenshot:
+        screenshot_path = _screenshot_output_path(url)
+        try:
+            _run_agent_browser("screenshot", screenshot_path, timeout=min(AGENT_BROWSER_TIMEOUT_SEC, 20), session=browser_session)
+        except Exception as exc:
+            logger.debug("agent-browser screenshot failed for %s: %s", url, exc)
+            screenshot_path = ""
     if body:
-        return title.strip(), body
-    snapshot = _normalize_page_text(_run_agent_browser("snapshot", "-c", "-d", "4"))
-    return title.strip(), snapshot
+        return title.strip(), body, {"image_count": image_count, "screenshot_path": screenshot_path, "used_snapshot": False}
+    try:
+        snapshot = _strip_for_excerpt(_run_agent_browser("snapshot", "-c", "-d", "4", session=browser_session))
+    except Exception:
+        logger.debug("agent-browser snapshot failed for %s", url)
+        snapshot = ""
+    return title.strip(), snapshot, {"image_count": image_count, "screenshot_path": screenshot_path, "used_snapshot": True}
 
 
 def _query_keywords(query: str) -> list[str]:
@@ -114,9 +224,65 @@ def _query_keywords(query: str) -> list[str]:
     return [token for token in tokens if token]
 
 
+def _query_variants(query: str, site_hint: str = "") -> list[str]:
+    base = _sanitize_query(query)
+    if not base:
+        return []
+    variants = [base]
+    lowered = base.lower()
+    if "hifleet" not in lowered and "船队在线" not in base:
+        variants.append(f"HiFleet {base}")
+    hint = _sanitize_query(site_hint)
+    if hint and hint.lower() not in lowered:
+        variants.append(f"{base} {hint}")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        key = item.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            normalized.append(item)
+    return normalized[:3]
+
+
 def _is_hifleet_official_url(url: str) -> bool:
     host = (urlparse(url or "").hostname or "").lower()
     return host == "hifleet.com" or host.endswith(".hifleet.com")
+
+
+def _candidate_keyword_score(query: str, title: str, summary: str, url: str = "") -> int:
+    haystack = " ".join([title or "", summary or "", url or ""]).lower()
+    tokens = [_normalize_keyword_token(token) for token in _query_keywords(query)]
+    tokens = [token for token in tokens if len(token) >= 2]
+    score = 0
+    for token in tokens:
+        if token and token in _normalize_keyword_token(haystack):
+            score += 3 if len(token) >= 4 else 2
+    return score
+
+
+def _official_page_rank(url: str) -> int:
+    if not _is_hifleet_official_url(url):
+        return 0
+    parsed = urlparse(url or "")
+    path = (parsed.path or "/").lower()
+    if "/wp/communities" in path or "/wp/community" in path or "helpcenter" in path:
+        return 3
+    if path and path != "/":
+        return 2
+    return 1
+
+
+def _candidate_priority(candidate: dict[str, str], query: str) -> tuple[int, int, int, int]:
+    url = str(candidate.get("url", "")).strip()
+    title = str(candidate.get("title", "")).strip()
+    summary = str(candidate.get("summary", "")).strip()
+    source = str(candidate.get("source", "")).strip()
+    official_rank = 2 if _is_hifleet_official_url(url) else 0
+    page_rank = _official_page_rank(url)
+    source_rank = 2 if source.startswith("preferred") or source.startswith("router_target") else 1 if source.startswith("sandbox") or source == "bing" else 0
+    keyword_rank = _candidate_keyword_score(query, title, summary, url)
+    return (official_rank, page_rank, keyword_rank, source_rank)
 
 
 def _page_match_reason(query: str, title: str, body: str, summary: str = "") -> str:
@@ -168,50 +334,69 @@ def _preferred_hifleet_candidates(query: str) -> list[dict[str, str]]:
 def _bing_search_candidates(query: str) -> list[dict[str, str]]:
     from skills.knowledge_qa.tools import _is_url_accessible
 
-    bing_query = f'site:hifleet.com "{query}"'
-    if "hifleet" not in query.lower() and "船队在线" not in query:
-        bing_query = f'site:hifleet.com "HiFleet" "{query}"'
-    search_url = f"{BING_SEARCH_URL}?q={quote_plus(bing_query)}&count=6&setlang=en"
-    try:
-        response = requests.get(search_url, timeout=10, headers=REQUESTS_HEADERS)
-        response.raise_for_status()
-    except Exception as exc:
-        logger.warning("agent_browser_deep_search bing error: %s", exc)
-        return []
-
-    html = response.text
-    matches = re.finditer(
-        r'<li class="b_algo".*?<h2><a href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p>(.*?)</p>)?.*?</li>',
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
     candidates: list[dict[str, str]] = []
     seen_urls: set[str] = set()
-    for match in matches:
-        url = str(match.group(1) or "").strip()
-        if not _is_public_http_url(url) or "hifleet.com" not in url.lower():
+    search_specs: list[tuple[str, str]] = []
+    for variant in _query_variants(query, "HiFleet"):
+        official_query = f'site:hifleet.com "{variant}"'
+        if "hifleet" not in variant.lower() and "船队在线" not in variant:
+            official_query = f'site:hifleet.com "HiFleet" "{variant}"'
+        search_specs.append((variant, official_query))
+    for variant in _query_variants(query, "HiFleet"):
+        public_query = f'"HiFleet" "{variant}"'
+        if public_query not in {item[1] for item in search_specs}:
+            search_specs.append((variant, public_query))
+
+    for variant, bing_query in search_specs:
+        search_url = f"{BING_SEARCH_URL}?q={quote_plus(bing_query)}&count=8&setlang=en"
+        try:
+            response = requests.get(search_url, timeout=10, headers=REQUESTS_HEADERS)
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("agent_browser_deep_search bing error: %s", exc)
             continue
-        if url in seen_urls or not _is_url_accessible(url):
-            continue
-        seen_urls.add(url)
-        candidates.append(
-            {
-                "url": url,
-                "title": _strip_html_tags(match.group(2) or "") or "HiFleet 页面",
-                "summary": _strip_html_tags(match.group(3) or ""),
-                "source": "bing",
-                "query": query,
-            }
+
+        html = response.text
+        matches = re.finditer(
+            r'<li class="b_algo".*?<h2><a href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p>(.*?)</p>)?.*?</li>',
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
         )
-        if len(candidates) >= 4:
-            break
-    return candidates
+        for match in matches:
+            url = str(match.group(1) or "").strip()
+            if not _is_public_http_url(url):
+                continue
+            if url in seen_urls or not _is_url_accessible(url):
+                continue
+            seen_urls.add(url)
+            candidates.append(
+                {
+                    "url": url,
+                    "title": _strip_html_tags(match.group(2) or "") or "HiFleet 页面",
+                    "summary": _strip_html_tags(match.group(3) or ""),
+                    "source": "bing",
+                    "query": bing_query,
+                }
+            )
+            if len(candidates) >= 8:
+                return sorted(candidates, key=lambda item: _candidate_priority(item, query), reverse=True)[:5]
+    candidates = sorted(candidates, key=lambda item: _candidate_priority(item, query), reverse=True)
+    official = [item for item in candidates if _is_hifleet_official_url(item.get("url", ""))]
+    fallback = [item for item in candidates if not _is_hifleet_official_url(item.get("url", ""))]
+    return (official + fallback)[:5]
 
 
 def _candidate_urls(query: str) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     seen_urls: set[str] = set()
-    candidate_sources = _bing_search_candidates(query) + _preferred_hifleet_candidates(query) if _needs_specific_hifleet_page(query) else _preferred_hifleet_candidates(query) + _bing_search_candidates(query)
+    has_hifleet_scope = "hifleet" in (query or "").lower() or "船队在线" in (query or "")
+    needs_specific_page = _needs_specific_hifleet_page(query)
+    if needs_specific_page:
+        candidate_sources = _bing_search_candidates(query) + _preferred_hifleet_candidates(query)
+    elif has_hifleet_scope:
+        candidate_sources = _preferred_hifleet_candidates(query) + _bing_search_candidates(query)
+    else:
+        candidate_sources = _bing_search_candidates(query)
     for item in candidate_sources:
         url = item.get("url", "")
         if not url or url in seen_urls:
@@ -220,7 +405,7 @@ def _candidate_urls(query: str) -> list[dict[str, str]]:
         candidates.append(item)
         if len(candidates) >= 5:
             break
-    return candidates
+    return sorted(candidates, key=lambda item: _candidate_priority(item, query), reverse=True)
 
 
 def _explicit_target_url_candidates(target_urls: str) -> list[dict[str, str]]:
@@ -267,7 +452,7 @@ def _extract_json_payload(raw_stdout: str) -> dict[str, object]:
 def _sandbox_search_script(query: str) -> str:
     query_literal = json.dumps(query, ensure_ascii=False)
     preferred_literal = json.dumps(PREFERRED_HIFLEET_PAGES, ensure_ascii=False)
-    return f"""import json
+    return rf"""import json
 import re
 import urllib.parse
 import urllib.request
@@ -384,6 +569,11 @@ def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
                 "excerpt": excerpt,
                 "match_reason": _page_match_reason(query, title, body, summary),
                 "official": _is_hifleet_official_url(url),
+                "source": page.get("source", ""),
+                "source_query": page.get("query", ""),
+                "used_snapshot": bool(page.get("used_snapshot")),
+                "image_count": int(page.get("image_count", 0) or 0),
+                "screenshot_path": page.get("screenshot_path", ""),
             }
         )
     if not evidence_pages:
@@ -393,6 +583,12 @@ def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
             "type": "hifleet_browser_evidence",
             "query": query,
             "source_scope": "hifleet_official_public_pages",
+            "search_strategy": {
+                "keywords": _query_keywords(query)[:8],
+                "variants": _query_variants(query, "HiFleet"),
+                "official_first": True,
+                "image_support": True,
+            },
             "pages": evidence_pages,
         },
         ensure_ascii=False,
@@ -419,28 +615,27 @@ def verify_public_page(url: str) -> str:
 
 @tool
 def agent_browser_deep_search(query: str, target_urls: str = "", site_hint: str = "") -> str:
-    """Fetch public-page evidence with agent-browser when knowledge search has no useful hit."""
+    """最后一轮网页验证工具：关键词扩展、候选链接筛选、正文解析、必要时截图取证。"""
     sanitized_query = _sanitize_query(query)
     if not sanitized_query:
         return NO_HIT_TEXT
 
     explicit_targets = _explicit_target_url_candidates(target_urls)
     has_hifleet_scope = "hifleet" in sanitized_query.lower() or "hifleet" in (site_hint or "").lower() or _needs_specific_hifleet_page(sanitized_query)
-    if not explicit_targets and not has_hifleet_scope:
-        return NO_HIT_TEXT
 
     candidates = explicit_targets
     if not candidates:
-        candidates = _candidate_urls(sanitized_query) if _needs_specific_hifleet_page(sanitized_query) else (_sandbox_hifleet_candidates(sanitized_query) or _candidate_urls(sanitized_query))
-    if not candidates:
+        candidates = _candidate_urls(sanitized_query)
+    if not candidates and has_hifleet_scope:
         candidates = _sandbox_hifleet_candidates(sanitized_query)
     if not candidates:
         return NO_HIT_TEXT
 
     pages: list[dict[str, str]] = []
+    browser_session = _new_agent_browser_session()
     for candidate in candidates:
         try:
-            title, body = _browser_capture_page_text(candidate["url"])
+            title, body, capture_meta = _browser_capture_page_text(candidate["url"], sanitized_query, session=browser_session)
         except FileNotFoundError:
             logger.warning("agent-browser CLI not found")
             break
@@ -453,6 +648,11 @@ def agent_browser_deep_search(query: str, target_urls: str = "", site_hint: str 
                 "url": candidate["url"],
                 "body": body,
                 "summary": candidate.get("summary", ""),
+                "source": candidate.get("source", ""),
+                "query": candidate.get("query", sanitized_query),
+                "used_snapshot": bool(capture_meta.get("used_snapshot")),
+                "image_count": int(capture_meta.get("image_count", 0) or 0),
+                "screenshot_path": str(capture_meta.get("screenshot_path", "") or ""),
             }
         )
         if len(pages) >= 2:

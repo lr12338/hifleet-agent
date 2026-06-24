@@ -29,6 +29,7 @@ from agents.customer_support_router import (
     HARNESSED_ROUTES,
     BROWSER_VERIFY_BUNDLE,
     FILE_BUNDLE,
+    HIFLEET_CHART_ICON_GUIDE_URL,
     KNOWLEDGE_BUNDLE,
     MessageEntities,
     MULTIMODAL_BUNDLE,
@@ -37,6 +38,7 @@ from agents.customer_support_router import (
     build_llm_context_window,
     build_customer_support_plan,
     build_multimodal_search_query,
+    chart_symbol_initial_identification,
     build_conversation_context,
     classify_multimodal_message,
     refine_multimodal_route_with_perception,
@@ -58,6 +60,8 @@ from agents.customer_support_router import (
     execute_update_chain,
     extract_attachments,
     extract_entities,
+    format_unverified_chart_symbol_answer,
+    format_verified_chart_symbol_answer,
     latest_user_text as latest_customer_user_text,
     make_trace,
     resolve_entities_with_context,
@@ -66,7 +70,7 @@ from agents.customer_support_router import (
 )
 from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
 from coze_coding_utils.runtime_ctx.context import default_headers
-from llm_config import DEFAULT_MULTIMODAL_MODEL, load_llm_config
+from llm_config import DEFAULT_MULTIMODAL_MODEL, DEFAULT_TEXT_MODEL, build_thinking_payload, load_llm_config, resolve_thinking_settings
 from skills import SkillLoader
 from storage.memory.memory_saver import get_memory_saver
 from utils.llm_route_state import get_current_llm_route
@@ -74,8 +78,6 @@ from utils.llm_route_state import get_current_llm_route
 LLM_CONFIG = "config/agent_llm_config.json"
 SYSTEM_PROMPT_BASE = "config/system_prompt_base.md"
 MAX_MESSAGES = 40
-CONTEXT_COMPRESS_TRIGGER_MESSAGES = int(os.getenv("HIFLEET_CONTEXT_COMPRESS_TRIGGER_MESSAGES", "8"))
-CONTEXT_SUMMARY_RECENT_QUESTIONS = int(os.getenv("HIFLEET_CONTEXT_SUMMARY_RECENT_QUESTIONS", "3"))
 DEFAULT_SKILLS = {"hifleet_ship_service", "knowledge_qa"}
 EMPLOYEE_MAX_LOOPS = int(os.getenv("HIFLEET_EMPLOYEE_MAX_LOOPS", "4"))
 TABULAR_SUFFIXES = (".csv", ".xls", ".xlsx")
@@ -326,7 +328,7 @@ def _build_customer_support_json_llm(ctx, cfg: dict[str, Any], model_override: s
         temperature=0.1,
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body={"thinking": build_thinking_payload("disabled")},
         default_headers=headers,
     )
 
@@ -512,7 +514,7 @@ def _run_customer_support_perception_agent(
         temperature=0.0,
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body={"thinking": build_thinking_payload("disabled")},
         default_headers=_safe_default_headers(ctx),
     )
     content: list[dict[str, Any]] = [{"type": "text", "text": f"用户问题：{text}\n请识别附件并只返回 JSON。"}]
@@ -1177,22 +1179,6 @@ def _heuristic_image_perception(attachments: list[Attachment], text: str = "") -
     return {}
 
 
-def _message_text_for_context_summary(msg: AnyMessage) -> str:
-    content = getattr(msg, "content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
-                elif item.get("type") in {"image_url", "video_url", "input_audio"}:
-                    parts.append("（历史多媒体内容已省略）")
-        return " ".join(part for part in parts if part)
-    return str(content or "")
-
-
 def _sanitize_historical_multimodal_content(content: Any) -> Any:
     """Drop stale media URLs from historical turns while preserving text context."""
     if not isinstance(content, list):
@@ -1212,62 +1198,9 @@ def _sanitize_historical_multimodal_content(content: Any) -> Any:
     return kept
 
 
-def _clean_context_summary_text(text: str, *, max_chars: int = 120) -> str:
-    value = sanitize_customer_output(text or "")
-    value = re.sub(r"(?mi)^综合摘要[:：]?\s*", "", value)
-    value = re.sub(r"(?mi)^查询\d+[（(].*?[）)][:：]?\s*", "", value)
-    value = re.sub(r"\b(?:local_kb_search|web_search_agent_browser|web_search|smart_search|agent_browser_deep_search)\b", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"https?://[^\s]+", "", value)
-    value = re.sub(r"\s+", " ", value).strip()
-    if len(value) > max_chars:
-        value = value[:max_chars].rstrip(" ，。；;,.!?！？:") + "..."
-    return value
-
-
 def _is_explicit_context_followup(text: str) -> bool:
     q = text or ""
     return any(marker in q for marker in ["上面", "上述", "刚才", "刚刚", "继续", "这艘船", "该船", "这个问题", "为我输出具体数据", "具体数据"])
-
-
-def _build_compressed_history_message(messages: list[AnyMessage], latest_user_idx: int) -> SystemMessage | None:
-    history = messages[:latest_user_idx] if latest_user_idx >= 0 else messages
-    user_questions: list[str] = []
-    assistant_summaries: list[str] = []
-    ship_bits: list[str] = []
-    pending_bits: list[str] = []
-    for msg in history:
-        text = _clean_context_summary_text(_message_text_for_context_summary(msg))
-        if not text:
-            continue
-        if isinstance(msg, HumanMessage):
-            if text not in user_questions:
-                user_questions.append(text)
-            entities = extract_entities(text)
-            for label, value in [("船名", entities.ship_name), ("MMSI", entities.mmsi), ("IMO", entities.imo)]:
-                if value:
-                    bit = f"{label} {value}"
-                    if bit not in ship_bits:
-                        ship_bits.append(bit)
-        elif isinstance(msg, AIMessage):
-            if text not in assistant_summaries:
-                assistant_summaries.append(text)
-            if any(marker in text for marker in ["请补充", "需要提供", "只需要一个", "请提供"]):
-                pending_bits.append(text)
-
-    parts = ["历史上下文摘要："]
-    if user_questions:
-        parts.append("用户此前咨询过：" + " / ".join(user_questions[-CONTEXT_SUMMARY_RECENT_QUESTIONS:]))
-    if ship_bits:
-        parts.append("最近确认的船舶实体：" + "，".join(ship_bits[-3:]))
-    if pending_bits:
-        parts.append("未解决/待补充事项：" + pending_bits[-1])
-    elif assistant_summaries:
-        parts.append("最近助手结论：" + assistant_summaries[-1])
-    parts.append("除非用户明确引用历史（如上面、刚才、继续、这艘船、具体数据），否则优先按当前最新问题独立处理。")
-    content = "\n".join(parts)
-    if len(parts) <= 2:
-        return None
-    return SystemMessage(content=content)
 
 
 def _copy_message_with_content(msg: AnyMessage, content: Any) -> AnyMessage:
@@ -1281,7 +1214,7 @@ def _copy_message_with_content(msg: AnyMessage, content: Any) -> AnyMessage:
         return msg
 
 
-def _windowed_messages(old, new):
+def _sanitize_message_history(old, new):
     merged = add_messages(old, new)
     cleaned = []
     for msg in merged:
@@ -1298,13 +1231,9 @@ def _windowed_messages(old, new):
         else:
             cleaned.append(msg)
     latest_user_idx = -1
-    latest_system_idx = -1
     for i in range(len(cleaned) - 1, -1, -1):
-        if latest_user_idx < 0 and isinstance(cleaned[i], HumanMessage):
+        if isinstance(cleaned[i], HumanMessage):
             latest_user_idx = i
-        if latest_system_idx < 0 and isinstance(cleaned[i], SystemMessage):
-            latest_system_idx = i
-        if latest_user_idx >= 0 and latest_system_idx >= 0:
             break
 
     for idx, msg in enumerate(list(cleaned)):
@@ -1313,26 +1242,11 @@ def _windowed_messages(old, new):
             if new_content != msg.content:
                 cleaned[idx] = _copy_message_with_content(msg, new_content)
 
-    latest_user = cleaned[latest_user_idx] if latest_user_idx >= 0 else None
-    latest_system = cleaned[latest_system_idx] if latest_system_idx >= 0 else None
-    use_compressed_context = len(cleaned) > CONTEXT_COMPRESS_TRIGGER_MESSAGES
+    return cleaned
 
-    if not use_compressed_context:
-        return cleaned[-MAX_MESSAGES:]
 
-    summary_message = _build_compressed_history_message(cleaned, latest_user_idx)
-    result: list[AnyMessage] = []
-    if latest_system is not None:
-        result.append(latest_system)
-    if summary_message is not None:
-        result.append(summary_message)
-
-    if latest_user is not None and latest_user not in result:
-        result.append(latest_user)
-
-    # Once compressed, keep the graph input tight: latest system + summary + latest user.
-    # Follow-up resolution reads the summary instead of replaying old raw turns.
-    return result[-MAX_MESSAGES:] if result else cleaned[-MAX_MESSAGES:]
+def _windowed_messages(old, new):
+    return _sanitize_message_history(old, new)
 
 
 def _iter_message_content_parts(messages: list[AnyMessage] | list[Any] | None):
@@ -1397,6 +1311,7 @@ def _fallback_multimodal_perception(messages: list[AnyMessage] | list[Any] | Non
         "attachment_type": attachment_type or _primary_multimodal_type(messages),
         "recognized_text": "",
         "summary": "",
+        "visible_features": "",
         "visible_text": "",
         "suspected_symbol": "",
         "suspected_issue": "",
@@ -1414,8 +1329,12 @@ def _normalize_multimodal_perception(raw: dict[str, Any], fallback: dict[str, An
     if confidence not in {"high", "medium", "low"}:
         confidence = "low"
     value["confidence"] = confidence
-    for key in ("recognized_text", "summary", "visible_text", "suspected_symbol", "suspected_issue", "attachment_type"):
+    for key in ("recognized_text", "summary", "visible_features", "visible_text", "suspected_symbol", "suspected_issue", "attachment_type"):
+        if isinstance(value.get(key), list):
+            value[key] = "，".join(str(item).strip() for item in value.get(key) or [] if str(item).strip())
         value[key] = str(value.get(key) or "").strip()
+    if not value["visible_features"] and value["summary"]:
+        value["visible_features"] = value["summary"]
     value["source"] = str(value.get("source") or "direct_multimodal_model")
     return value
 
@@ -1443,16 +1362,19 @@ def _run_direct_multimodal_perception(
         temperature=0.0,
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
-        extra_body={"thinking": {"type": "disabled"}},
+        extra_body={"thinking": build_thinking_payload("disabled")},
         default_headers=_safe_default_headers(ctx),
     )
     prompt = (
         "你是 HiFleet 多模态感知层。只输出 JSON，不要解释。\n"
-        "字段：attachment_type(audio|image|video|unknown), recognized_text, summary, visible_text, "
+        "字段：attachment_type(audio|image|video|unknown), recognized_text, summary, visible_features, visible_text, "
         "suspected_symbol, suspected_issue, confidence(high|medium|low)。\n"
         "音频：尽量转写语音内容到 recognized_text。\n"
-        "图片：识别可见文字、界面元素、海图符号、报错信息。\n"
-        "视频：基于可访问内容或首帧能力总结到 summary；不确定时 confidence=low。"
+        "图片：只客观描述可见文字、界面元素、颜色、形状、位置关系、图标外观或报错文字。\n"
+        "图标/海图符号场景：visible_features 只写客观特征，例如“红色圆形、中心黑点、无文字”。"
+        "不要判断含义，不要下定义，不要写“表示/用于/意味着/属于/危险/安全”等解释性结论；"
+        "suspected_symbol 和 suspected_issue 也只能写“待检索确认的图标/符号”，不能写具体含义。\n"
+        "视频：基于可访问内容或首帧能力做客观摘要；不确定时 confidence=low。"
     )
     try:
         result = llm.invoke([SystemMessage(content=prompt), HumanMessage(content=_latest_human_content(messages))])
@@ -1469,6 +1391,30 @@ def _multimodal_perception_has_signal(perception: dict[str, Any]) -> bool:
     if str(perception.get("confidence") or "").lower() in {"high", "medium"}:
         return True
     return any(str(perception.get(key) or "").strip() for key in ("recognized_text", "summary", "visible_text", "suspected_symbol", "suspected_issue"))
+
+
+def _is_chart_symbol_image_request(text: str, messages: list[AnyMessage] | list[Any] | None) -> bool:
+    q = (text or "").lower()
+    if not _has_current_multimodal_media(messages):
+        return False
+    markers = ["全球海图", "海图", "图标", "符号", "图中", "标志", "这个在", "是什么意思"]
+    return any(marker in q for marker in markers)
+
+
+def _objective_multimodal_text(perception: dict[str, Any], user_text: str = "") -> str:
+    parts: list[str] = []
+    recognized = str(perception.get("recognized_text") or "").strip()
+    features = str(perception.get("visible_features") or perception.get("summary") or "").strip()
+    visible = str(perception.get("visible_text") or "").strip()
+    if recognized:
+        parts.append(f"语音识别内容：{recognized}")
+    if features:
+        parts.append(f"附件可见特征：{features}")
+    if visible:
+        parts.append(f"可见文字：{visible}")
+    if user_text:
+        parts.append(f"用户补充：{user_text}")
+    return "\n".join(parts).strip() or user_text
 
 
 def _multimodal_failure_response() -> str:
@@ -1518,11 +1464,11 @@ def _messages_with_text_replacement(messages: list[AnyMessage] | list[Any], repl
 
 
 class AgentState(TypedDict, total=False):
-    messages: Annotated[list[AnyMessage], _windowed_messages]
+    messages: Annotated[list[AnyMessage], _sanitize_message_history]
 
 
 class EmployeeAgentState(TypedDict, total=False):
-    messages: Annotated[list[AnyMessage], _windowed_messages]
+    messages: Annotated[list[AnyMessage], _sanitize_message_history]
     session_id: str
     user_id: str
     source_channel: str
@@ -1530,7 +1476,7 @@ class EmployeeAgentState(TypedDict, total=False):
     intent_hint: str
     status: str
     loop_count: int
-    phase: Literal["route", "knowledge", "download", "plan", "act", "check", "loop", "done", "failed", "delegated"]
+    phase: Literal["route", "ship", "knowledge", "download", "plan", "act", "check", "loop", "done", "failed", "delegated"]
     phase_history: list[str]
     workspace_task: bool
     task_goal: str
@@ -1547,7 +1493,7 @@ class EmployeeAgentState(TypedDict, total=False):
 
 
 class CustomerSupportState(TypedDict, total=False):
-    messages: Annotated[list[AnyMessage], _windowed_messages]
+    messages: Annotated[list[AnyMessage], _sanitize_message_history]
     session_id: str
     user_id: str
     source_channel: str
@@ -1592,6 +1538,28 @@ class CustomerSupportState(TypedDict, total=False):
     fallback_reason: str
 
 
+class LightweightCustomerSupportState(TypedDict, total=False):
+    messages: Annotated[list[AnyMessage], _sanitize_message_history]
+    session_id: str
+    user_id: str
+    source_channel: str
+    agent_profile: str
+    intent_hint: str
+    status: str
+    phase: Literal["preprocess", "delegate", "finalize", "done"]
+    phase_history: list[str]
+    task_goal: str
+    perception_result: dict[str, Any]
+    generated_answer: str
+    generated_tool_calls: list[str]
+    response_modalities: list[str]
+    output_assets: list[dict[str, Any]]
+    route_trace: dict[str, Any]
+    check_result: dict[str, Any]
+    delegate_input_message_count: int
+    delegate_answer: str
+
+
 def _resolve_intent_hint(ctx=None, explicit_intent: str = "") -> str:
     if explicit_intent:
         return explicit_intent.strip().lower()
@@ -1628,6 +1596,8 @@ def classify_intent_fast(user_text: str, has_media: bool = False) -> str:
     ship_strong_patterns = [
         r"\bmmsi\b", r"\bimo\b", r"\b\d{9}\b", "查询船位", "更新船位", "上传船位",
         r"查.*船位", r"船位.*查", r"查.*位置", r"位置.*查",
+        r"(查询|查).*(历史轨迹|轨迹|挂靠|靠港|航次|停靠|目的港)",
+        r".*(历史轨迹|轨迹|挂靠|靠港|航次|停靠|目的港).*(查询|查)",
         "船舶档案", "psc记录", "区域船舶", "海峡通航", "更新静态信息",
     ]
     for p in ship_strong_patterns:
@@ -1637,6 +1607,12 @@ def classify_intent_fast(user_text: str, has_media: bool = False) -> str:
 
 
 SENSITIVE_DISCLOSURE_REFUSAL = "抱歉，这部分属于系统内部安全信息，不能提供。我可以继续协助您处理 HiFleet 平台使用、船舶查询或业务问题。"
+STANDARD_AGENT_MESSAGE_STATE_FALLBACK = "抱歉，当前会话上下文状态暂时不稳定，我已停止继续处理以避免给出错误结果。请您重新发送当前问题，我会继续协助处理。"
+
+
+def _is_standard_agent_message_state_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}"
+    return "last_ai_index" in text or "cannot access local variable" in text
 
 
 def is_sensitive_internal_request(user_text: str) -> bool:
@@ -1703,6 +1679,52 @@ def _load_all_tools(profile: AgentProfile) -> list:
     return all_tools
 
 
+def _invoke_tool_for_chart_symbol(tool_map: dict[str, Any], trace: dict[str, Any], name: str, args: dict[str, Any]) -> str:
+    tool = tool_map.get(name)
+    if not tool:
+        return ""
+    sequence = list(trace.get("tool_call_sequence", []) or [])
+    if name not in sequence:
+        sequence.append(name)
+    trace["tool_call_sequence"] = sequence
+    try:
+        return str(tool.invoke(args) or "")
+    except Exception as exc:
+        logger.warning("[ChartSymbolVerify] %s failed: %s", name, exc)
+        return ""
+
+
+def _verify_chart_symbol_with_tools(text: str, perception: dict[str, Any], tool_map: dict[str, Any], route_trace: dict[str, Any]) -> tuple[str, list[str]]:
+    features = chart_symbol_initial_identification(perception)
+    query = " ".join(part for part in ["HiFleet 全球海图", features, "图标 含义"] if part).strip()
+    outputs: list[str] = []
+    if "local_kb_search" in tool_map:
+        outputs.append(_invoke_tool_for_chart_symbol(tool_map, route_trace, "local_kb_search", {"query": query}))
+    if "web_search" in tool_map:
+        outputs.append(_invoke_tool_for_chart_symbol(tool_map, route_trace, "web_search", {"query": query, "sites": "hifleet.com|www.hifleet.com|www.hifleet.com/wp/communities"}))
+    if "web_search_agent_browser" in tool_map:
+        outputs.append(
+            _invoke_tool_for_chart_symbol(
+                tool_map,
+                route_trace,
+                "web_search_agent_browser",
+                {"query": query, "target_urls": HIFLEET_CHART_ICON_GUIDE_URL, "site_hint": "hifleet.com"},
+            )
+        )
+    elif "agent_browser_deep_search" in tool_map:
+        outputs.append(
+            _invoke_tool_for_chart_symbol(
+                tool_map,
+                route_trace,
+                "agent_browser_deep_search",
+                {"query": query, "target_urls": HIFLEET_CHART_ICON_GUIDE_URL, "site_hint": "hifleet.com"},
+            )
+        )
+    combined = "\n\n".join(output for output in outputs if output)
+    answer = format_verified_chart_symbol_answer(perception, combined) if combined else format_unverified_chart_symbol_answer(perception)
+    return answer, outputs
+
+
 def _load_llm_config(workspace_path: str) -> dict[str, Any]:
     return load_llm_config(workspace_path)
 
@@ -1712,9 +1734,13 @@ def _resolve_runtime_llm_settings(ctx, cfg: dict[str, Any]) -> dict[str, str]:
     route = get_current_llm_route()
     requested_model = str(route.get("model", "")).strip()
     requested_thinking = str(route.get("thinking_type", "")).strip()
-    model = requested_model or str(config.get("text_model") or config.get("model") or "doubao-seed-2-0-pro-260215").strip()
-    thinking_type = requested_thinking or str(config.get("thinking_type") or "disabled").strip()
-    return {"model": model, "thinking_type": thinking_type}
+    requested_effort = str(route.get("reasoning_effort", "")).strip()
+    model = requested_model or str(config.get("text_model") or config.get("model") or DEFAULT_TEXT_MODEL).strip()
+    thinking = resolve_thinking_settings(
+        requested_thinking or config.get("thinking_type") or "enabled",
+        requested_effort or config.get("reasoning_effort") or "medium",
+    )
+    return {"model": model, **thinking}
 
 
 def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
@@ -1722,9 +1748,10 @@ def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
     base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
     runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
     logger.info(
-        "[MainAgent] Resolved model=%s thinking=%s streaming=%s",
+        "[MainAgent] Resolved model=%s thinking=%s effort=%s streaming=%s",
         runtime_settings["model"],
         runtime_settings["thinking_type"],
+        runtime_settings["reasoning_effort"],
         streaming,
     )
     return ChatOpenAI(
@@ -1734,7 +1761,7 @@ def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
         temperature=cfg["config"].get("temperature", 0.7),
         streaming=streaming,
         timeout=cfg["config"].get("timeout", 600),
-        extra_body={"thinking": {"type": runtime_settings["thinking_type"]}},
+        extra_body={"thinking": build_thinking_payload(runtime_settings["thinking_type"], runtime_settings["reasoning_effort"])},
         default_headers=_safe_default_headers(ctx),
     )
 
@@ -1816,7 +1843,7 @@ def _extract_expected_artifact(text: str, source_file: str) -> str:
 
 
 def _detect_workspace_task(profile: AgentProfile, messages: list[AnyMessage]) -> bool:
-    if profile.profile_id != "employee_assistant":
+    if "employee_workspace" not in set(profile.skills or []):
         return False
     text = _latest_user_text(messages)
     if not text:
@@ -1913,7 +1940,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         expected_artifact = _extract_expected_artifact(user_text, target_file_path or source_file_url)
         workspace_task = bool((target_file_path or source_file_url) and any(keyword in user_text for keyword in ["分析", "表格", "csv", "excel", "xlsx", "报价", "统计", "数据", "生成", "python", "下载", "链接"]))
         resolved_intent = str(state.get("intent_hint") or intent_hint or "").strip().lower()
-        phase = "knowledge" if resolved_intent == "knowledge" and not workspace_task else "route"
+        phase = "ship" if resolved_intent == "ship" and not workspace_task else "knowledge" if resolved_intent == "knowledge" and not workspace_task else "route"
         return {
             "phase": phase,
             "phase_history": ["route"],
@@ -1924,6 +1951,36 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             "source_file_url": source_file_url,
             "expected_artifact": expected_artifact,
             "loop_count": int(state.get("loop_count") or 0),
+        }
+
+    def ship_node(state: EmployeeAgentState) -> dict[str, Any]:
+        messages = list(state.get("messages", []) or [])
+        question = str(state.get("task_goal") or _latest_user_text(messages) or "").strip()
+        context = build_conversation_context(messages)
+        entities = resolve_entities_with_context(extract_entities(question), context)
+        decision = classify_message(question, entities, context)
+        trace = make_trace(decision, entities, session_id=str(state.get("session_id", "")), run_id=str(getattr(ctx, "run_id", "") or ""))
+        tool_map = {tool.name: tool for tool in _load_all_tools(profile)}
+        if decision.route in {"ship_complex", "ship_context"}:
+            answer = execute_complex_ship_chain(question, entities, tool_map, trace)
+        elif decision.route == "ship_update":
+            answer = execute_update_chain(question, entities, tool_map, trace)
+        elif decision.route == "ship_stats":
+            answer = execute_stats_chain(question, entities, tool_map, trace)
+        else:
+            answer = execute_simple_ship_chain(question, decision, entities, tool_map, trace)
+        trace_dict = asdict(trace)
+        final_answer = sanitize_customer_output(answer)
+        return {
+            "phase": "done",
+            "status": "success",
+            "phase_history": list(state.get("phase_history", [])) + ["ship"],
+            "workspace_task": False,
+            "task_goal": question,
+            "messages": [AIMessage(content=final_answer)],
+            "generated_answer": final_answer,
+            "generated_tool_calls": list(trace_dict.get("tool_call_sequence", []) or []),
+            "route_trace": trace_dict,
         }
 
     def knowledge_node(state: EmployeeAgentState) -> dict[str, Any]:
@@ -1972,7 +2029,30 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             "agent_profile": state.get("agent_profile", profile.profile_id),
             "intent_hint": state.get("intent_hint", intent_hint),
         }
-        delegated = standard_agent.invoke(payload, context=ctx)
+        try:
+            try:
+                delegated = standard_agent.invoke(
+                    payload,
+                    config={"configurable": {"thread_id": delegate_thread_id}},
+                    context=ctx,
+                )
+            except TypeError as type_exc:
+                if "config" not in str(type_exc):
+                    raise
+                delegated = standard_agent.invoke(payload, context=ctx)
+        except Exception as exc:
+            if not _is_standard_agent_message_state_error(exc):
+                raise
+            return {
+                "phase": "done",
+                "status": "success",
+                "phase_history": list(state.get("phase_history", [])) + ["delegated", "fallback"],
+                "workspace_task": False,
+                "messages": [AIMessage(content=STANDARD_AGENT_MESSAGE_STATE_FALLBACK)],
+                "generated_answer": STANDARD_AGENT_MESSAGE_STATE_FALLBACK,
+                "generated_tool_calls": [],
+                "route_trace": {"fallback_reason": "standard_agent_message_state_error"},
+            }
         delegated["phase"] = "delegated"
         delegated["status"] = delegated.get("status", "delegated")
         delegated["phase_history"] = list(state.get("phase_history", [])) + ["delegated"]
@@ -2085,6 +2165,8 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     def route_after_entry(state: EmployeeAgentState) -> str:
         if state.get("phase") == "done":
             return "delegate"
+        if state.get("phase") == "ship":
+            return "ship"
         if state.get("phase") == "knowledge":
             return "knowledge"
         if state.get("workspace_task"):
@@ -2100,6 +2182,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
 
     graph = StateGraph(EmployeeAgentState)
     graph.add_node("route", route_node)
+    graph.add_node("ship", ship_node)
     graph.add_node("knowledge", knowledge_node)
     graph.add_node("delegate", delegate_node)
     graph.add_node("plan", plan_node)
@@ -2109,7 +2192,8 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     graph.add_node("finalize", finalize_node)
     graph.add_node("fail", fail_node)
     graph.add_edge(START, "route")
-    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "knowledge": "knowledge", "plan": "plan"})
+    graph.add_conditional_edges("route", route_after_entry, {"delegate": "delegate", "ship": "ship", "knowledge": "knowledge", "plan": "plan"})
+    graph.add_edge("ship", END)
     graph.add_edge("knowledge", END)
     graph.add_edge("delegate", END)
     graph.add_edge("plan", "act")
@@ -2127,6 +2211,10 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
 
 
 def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
+    """Deprecated customer_support graph kept for rollback only.
+
+    The active customer_support entrypoint is _build_lightweight_customer_support_agent.
+    """
     logger.info("[MainAgent] Building customer_support standard-agent graph")
     standard_agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
     allowed_write = bool((profile.tool_policy or {}).get("allow_write_actions", False))
@@ -2515,6 +2603,290 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
     return graph.compile(checkpointer=checkpointer)
 
 
+def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
+    logger.info("[MainAgent] Building lightweight customer_support skills graph")
+    standard_agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+    guard_fallback = "抱歉，我暂时没能稳定确认这个问题的答案。请补充一个关键细节，或联系人工客服继续处理：400-963-6899，微信客服 hifleetkhzs。"
+    loaded_tools = _load_all_tools(profile)
+    tool_map = {tool.name: tool for tool in loaded_tools}
+    allowed_tool_names = [tool.name for tool in loaded_tools]
+
+    def _extract_tool_sequence(messages: list[AnyMessage]) -> list[str]:
+        sequence: list[str] = []
+        seen: set[str] = set()
+        for msg in messages or []:
+            tool_calls: list[dict[str, Any]] = []
+            if isinstance(msg, AIMessage):
+                tool_calls = list(getattr(msg, "tool_calls", []) or [])
+            elif isinstance(msg, dict):
+                tool_calls = list(msg.get("tool_calls", []) or [])
+            for item in tool_calls:
+                name = str(item.get("name", "")).strip()
+                if name and name not in seen:
+                    sequence.append(name)
+                    seen.add(name)
+        return sequence
+
+    def _is_metadata_only_answer(answer: str) -> bool:
+        text = (answer or "").strip()
+        if not text:
+            return True
+        metadata_markers = [
+            "音频类附件，无对应可视化页面内容",
+            "附件识别和资料检索判断",
+            "can_analyze_with_multimodal_model",
+            '"category"',
+            '"suffix"',
+        ]
+        return any(marker in text for marker in metadata_markers)
+
+    def _extract_final_answer(messages: list[AnyMessage]) -> str:
+        for msg in reversed(messages or []):
+            content = ""
+            if isinstance(msg, AIMessage):
+                content = _content_to_text(msg.content)
+            elif isinstance(msg, dict):
+                role = str(msg.get("role") or msg.get("type") or "").lower()
+                if role in {"assistant", "ai"}:
+                    content = _content_to_text(msg.get("content", ""))
+            if content and not _is_metadata_only_answer(content):
+                return content
+        return ""
+
+    def _extract_output_assets(answer: str) -> list[dict[str, Any]]:
+        assets: list[dict[str, Any]] = []
+        for url in re.findall(r"https?://[^\s)）\]】>\"']+", answer or ""):
+            clean = url.rstrip(".,;!?，。；！？）】》")
+            if not clean or any(item.get("url") == clean for item in assets):
+                continue
+            parsed = clean.lower().split("?", 1)[0]
+            asset_type = "image" if parsed.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")) else "link"
+            assets.append({"type": asset_type, "url": clean})
+        return assets[:8]
+
+    def preprocess_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
+        messages = list(state.get("messages", []) or [])
+        text = _latest_user_text(messages)
+        route_trace = {
+            "run_id": str(getattr(ctx, "run_id", "") or ""),
+            "session_id": str(state.get("session_id", "")),
+            "route": "lightweight_skills_agent",
+            "task_type": "multimodal_tool_calling",
+            "tool_bundle": list(allowed_tool_names),
+            "tool_call_sequence": [],
+            "reasoning_trace": {
+                "pipeline": [
+                    "multimodal_input_parse",
+                    "deep_thinking_reasoning",
+                    "model_driven_tool_calling",
+                    "response_synthesis",
+                    "memory_checkpoint",
+                ],
+                "deprecated_customer_router_bypassed": True,
+                "v1_output_modalities": ["text", "link"],
+            },
+        }
+        if is_sensitive_internal_request(text):
+            return {
+                "phase": "done",
+                "status": "success",
+                "phase_history": ["preprocess", "done"],
+                "task_goal": text,
+                "messages": [AIMessage(content=SENSITIVE_DISCLOSURE_REFUSAL)],
+                "generated_answer": SENSITIVE_DISCLOSURE_REFUSAL,
+                "generated_tool_calls": [],
+                "response_modalities": ["text"],
+                "output_assets": [],
+                "route_trace": {
+                    **route_trace,
+                    "check_result": {"blocked": True, "pre_guard": True},
+                    "answer_confidence": "high",
+                },
+            }
+
+        perception: dict[str, Any] = {}
+        is_chart_symbol_request = _is_chart_symbol_image_request(text, messages)
+        if _has_current_multimodal_media(messages):
+            perception = _run_direct_multimodal_perception(ctx=ctx, cfg=cfg, messages=messages)
+            if _multimodal_perception_has_signal(perception) and not is_chart_symbol_request:
+                text = _objective_multimodal_text(perception, text)
+                messages = _messages_with_text_replacement(messages, text)
+            else:
+                # Keep the original media for the standard multimodal model if perception was weak.
+                text = text or _latest_user_text(messages)
+        route_trace["reasoning_trace"]["perception_summary"] = {
+            "attachment_type": str(perception.get("attachment_type") or ""),
+            "recognized_text": str(perception.get("recognized_text") or "")[:200],
+            "summary": str(perception.get("summary") or "")[:300],
+            "visible_text": str(perception.get("visible_text") or "")[:300],
+            "suspected_symbol": str(perception.get("suspected_symbol") or ""),
+            "suspected_issue": str(perception.get("suspected_issue") or ""),
+            "visible_features": str(perception.get("visible_features") or ""),
+            "confidence": str(perception.get("confidence") or ""),
+        }
+        if is_chart_symbol_request:
+            answer, evidence_outputs = _verify_chart_symbol_with_tools(text, perception, tool_map, route_trace)
+            route_trace["check_result"] = {
+                "has_answer": True,
+                "chart_symbol_verified": "验证链接：" in answer,
+                "evidence_output_count": len([item for item in evidence_outputs if item]),
+                "deprecated_customer_router_bypassed": True,
+            }
+            route_trace["answer_confidence"] = "high" if "验证链接：" in answer else "low"
+            return {
+                "phase": "done",
+                "phase_history": ["preprocess", "chart_symbol_verify", "done"],
+                "status": "success",
+                "task_goal": text,
+                "messages": [AIMessage(content=answer)],
+                "perception_result": perception,
+                "generated_answer": answer,
+                "delegate_answer": answer,
+                "generated_tool_calls": list(route_trace.get("tool_call_sequence", []) or []),
+                "delegate_input_message_count": len(messages),
+                "output_assets": _extract_output_assets(answer),
+                "check_result": dict(route_trace.get("check_result", {}) or {}),
+                "intent_hint": "knowledge",
+                "route_trace": route_trace,
+                "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
+            }
+        return {
+            "phase": "preprocess",
+            "phase_history": ["preprocess"],
+            "status": "running",
+            "task_goal": text,
+            "messages": messages,
+            "perception_result": perception,
+            "generated_answer": "",
+            "delegate_answer": "",
+            "generated_tool_calls": [],
+            "delegate_input_message_count": len(messages),
+            "output_assets": [],
+            "check_result": {},
+            "intent_hint": classify_intent_fast(text, has_media=_has_current_multimodal_media(messages)),
+            "route_trace": route_trace,
+            "response_modalities": ["text", "link"],
+        }
+
+    def delegate_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
+        if state.get("phase") == "done" and state.get("messages"):
+            return dict(state)
+        input_messages = list(state.get("messages", []) or [])
+        delegate_thread_id = f"{state.get('session_id', '') or getattr(ctx, 'run_id', '')}:standard_agent"
+        payload = {
+            "messages": input_messages,
+            "session_id": delegate_thread_id,
+            "user_id": state.get("user_id", ""),
+            "source_channel": state.get("source_channel", ""),
+            "agent_profile": state.get("agent_profile", profile.profile_id),
+            "intent_hint": state.get("intent_hint", intent_hint),
+        }
+        try:
+            try:
+                delegated = standard_agent.invoke(
+                    payload,
+                    config={"configurable": {"thread_id": delegate_thread_id}},
+                    context=ctx,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'config'" not in str(exc):
+                    raise
+                delegated = standard_agent.invoke(payload, context=ctx)
+        except Exception as exc:
+            if not _is_standard_agent_message_state_error(exc):
+                raise
+            route_trace = dict(state.get("route_trace", {}) or {})
+            route_trace["fallback_reason"] = "standard_agent_message_state_error"
+            return {
+                "phase": "delegate",
+                "status": "success",
+                "phase_history": list(state.get("phase_history", [])) + ["delegate", "fallback"],
+                "task_goal": state.get("task_goal", ""),
+                "delegate_input_message_count": len(input_messages),
+                "messages": [AIMessage(content=STANDARD_AGENT_MESSAGE_STATE_FALLBACK)],
+                "generated_answer": STANDARD_AGENT_MESSAGE_STATE_FALLBACK,
+                "delegate_answer": STANDARD_AGENT_MESSAGE_STATE_FALLBACK,
+                "generated_tool_calls": [],
+                "perception_result": dict(state.get("perception_result", {}) or {}),
+                "route_trace": route_trace,
+                "response_modalities": ["text"],
+            }
+        messages = list(delegated.get("messages", []) or [])
+        new_messages = messages[len(input_messages):] if len(messages) > len(input_messages) else messages
+        delegate_answer = _extract_final_answer(new_messages)
+        tool_sequence = _extract_tool_sequence(new_messages)
+        if not tool_sequence:
+            tool_sequence = _extract_tool_sequence(messages)
+        route_trace = dict(state.get("route_trace", {}) or {})
+        route_trace["tool_call_sequence"] = tool_sequence
+        route_trace["delegate_thread_id"] = delegate_thread_id
+        delegated["phase"] = "delegate"
+        delegated["status"] = delegated.get("status", "delegated")
+        delegated["phase_history"] = list(state.get("phase_history", [])) + ["delegate"]
+        delegated["task_goal"] = state.get("task_goal", "")
+        delegated["delegate_input_message_count"] = len(input_messages)
+        delegated["delegate_answer"] = delegate_answer
+        delegated["generated_answer"] = delegate_answer
+        delegated["generated_tool_calls"] = tool_sequence
+        delegated["perception_result"] = dict(state.get("perception_result", {}) or {})
+        delegated["route_trace"] = route_trace
+        delegated["response_modalities"] = list(state.get("response_modalities", ["text", "link"]))
+        return delegated
+
+    def finalize_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
+        messages = list(state.get("messages", []) or [])
+        delegate_answer = str(state.get("delegate_answer") or "").strip()
+        raw_answer = str(delegate_answer or state.get("generated_answer") or _extract_final_answer(messages) or "").strip()
+        sanitized = sanitize_customer_output(raw_answer)
+        if not sanitized:
+            sanitized = guard_fallback
+        output_assets = _extract_output_assets(sanitized)
+        route_trace = dict(state.get("route_trace", {}) or {})
+        tool_sequence = list(state.get("generated_tool_calls", []) or route_trace.get("tool_call_sequence", []) or _extract_tool_sequence(messages))
+        check_result = {
+            "has_answer": bool(raw_answer),
+            "sanitized": sanitized != raw_answer,
+            "post_guard_applied": sanitized == guard_fallback or sanitized == SENSITIVE_REFUSAL,
+            "deprecated_customer_router_bypassed": True,
+            "output_asset_count": len(output_assets),
+        }
+        route_trace["tool_call_sequence"] = tool_sequence
+        route_trace["check_result"] = check_result
+        route_trace["answer_confidence"] = "medium" if tool_sequence else "high"
+        return {
+            "phase": "done",
+            "status": "success",
+            "phase_history": list(state.get("phase_history", [])) + ["finalize"],
+            "messages": [AIMessage(content=sanitized)],
+            "generated_answer": sanitized,
+            "generated_tool_calls": tool_sequence,
+            "response_modalities": ["text", "link"] if output_assets else ["text"],
+            "output_assets": output_assets,
+            "check_result": check_result,
+            "route_trace": route_trace,
+        }
+
+    def route_after_preprocess(state: LightweightCustomerSupportState) -> str:
+        if state.get("phase") == "done":
+            return "finalize"
+        return "delegate"
+
+    graph = StateGraph(LightweightCustomerSupportState)
+    graph.add_node("preprocess", preprocess_node)
+    graph.add_node("delegate", delegate_node)
+    graph.add_node("finalize", finalize_node)
+    graph.add_edge(START, "preprocess")
+    graph.add_conditional_edges("preprocess", route_after_preprocess, {"delegate": "delegate", "finalize": "finalize"})
+    graph.add_edge("delegate", "finalize")
+    graph.add_edge("finalize", END)
+    try:
+        checkpointer = get_memory_saver()
+    except Exception as exc:
+        logger.warning("lightweight customer_support graph falling back to MemorySaver during compile: %s", exc)
+        checkpointer = MemorySaver()
+    return graph.compile(checkpointer=checkpointer)
+
+
 def build_agent(ctx=None, intent: str = ""):
     logger.info("[MainAgent] Building Hifleet agent graph")
     workspace_path = os.getenv("COZE_WORKSPACE_PATH")
@@ -2523,13 +2895,13 @@ def build_agent(ctx=None, intent: str = ""):
     cfg = _load_llm_config(workspace_path)
     intent_hint = _resolve_intent_hint(ctx, explicit_intent=intent)
     profile = _resolve_agent_profile(ctx)
-    if profile.profile_id == "employee_assistant":
-        agent = _build_employee_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
-        logger.info("[MainAgent] Employee loop graph built successfully")
+    if profile.profile_id == "customer_ceshi":
+        agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+        logger.info("[MainAgent] Employee standard tool-calling agent built successfully")
         return agent
     if profile.profile_id == "customer_support":
-        agent = _build_customer_support_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
-        logger.info("[MainAgent] Customer support routed graph built successfully")
+        agent = _build_lightweight_customer_support_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+        logger.info("[MainAgent] Lightweight customer support skills graph built successfully")
         return agent
     agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
     logger.info("[MainAgent] Standard agent built successfully")

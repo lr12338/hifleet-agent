@@ -348,6 +348,7 @@ def _resolve_request_llm_route(payload: Dict[str, Any]) -> Dict[str, Any]:
         has_multimodal_input=messages_have_multimodal_content(payload.get("messages")),
         requested_model=str(payload.get("model", "")).strip(),
         requested_thinking=str(payload.get("thinking", "")).strip(),
+        requested_reasoning_effort=str(payload.get("reasoning_effort", "")).strip(),
     )
     payload["llm_route"] = resolved
     return resolved
@@ -377,6 +378,8 @@ def classify_intent_hint(payload: Dict[str, Any]) -> str:
     ship_strong_patterns = [
         r"\bmmsi\b", r"\bimo\b", r"\b\d{9}\b", "查询船位", "更新船位", "上传船位",
         r"查.*船位", r"船位.*查", r"查.*位置", r"位置.*查",
+        r"(查询|查).*(历史轨迹|轨迹|挂靠|靠港|航次|停靠|目的港)",
+        r".*(历史轨迹|轨迹|挂靠|靠港|航次|停靠|目的港).*(查询|查)",
         "船舶档案", "psc记录", "区域船舶", "海峡通航", "更新静态信息",
     ]
     for p in ship_strong_patterns:
@@ -784,7 +787,8 @@ async def http_run(request: Request) -> Dict[str, Any]:
             f"Received request for /run: "
             f"run_id={run_id}, session_id={session_id}, "
             f"source_channel={source_channel}, profile={agent_profile}, intent_hint={intent_hint}, "
-            f"llm_model={llm_route.get('model')}, llm_modality={llm_route.get('modality')}, llm_thinking={llm_route.get('thinking_type')}"
+            f"llm_model={llm_route.get('model')}, llm_modality={llm_route.get('modality')}, "
+            f"llm_thinking={llm_route.get('thinking_type')}, llm_effort={llm_route.get('reasoning_effort')}"
         )
 
         # 创建任务并记录 - 这是关键，让我们可以通过run_id取消任务
@@ -1035,7 +1039,8 @@ async def http_stream_run(request: Request):
         f"Received request for /stream_run: "
         f"run_id={run_id}, session_id={session_id}, "
         f"source_channel={source_channel}, profile={agent_profile}, intent_hint={intent_hint}, "
-        f"llm_model={llm_route.get('model')}, llm_modality={llm_route.get('modality')}, llm_thinking={llm_route.get('thinking_type')}"
+        f"llm_model={llm_route.get('model')}, llm_modality={llm_route.get('modality')}, "
+        f"llm_thinking={llm_route.get('thinking_type')}, llm_effort={llm_route.get('reasoning_effort')}"
     )
     stream_payload = ensure_stream_compatible_payload(payload)
     

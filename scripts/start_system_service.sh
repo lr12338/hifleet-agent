@@ -6,6 +6,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${COZE_WORKSPACE_PATH:-$(dirname "$SCRIPT_DIR")}"
 export COZE_WORKSPACE_PATH="$WORK_DIR"
 
+# Default to one HTTP worker to avoid cross-request browser session contention.
+export COZE_HTTP_WORKERS="${COZE_HTTP_WORKERS:-1}"
+
+# Chrome for Testing often needs this in Linux service/container contexts.
+if [ -z "${AGENT_BROWSER_ARGS:-}" ]; then
+  export AGENT_BROWSER_ARGS="--no-sandbox"
+elif [[ ",${AGENT_BROWSER_ARGS}," != *",--no-sandbox,"* ]]; then
+  export AGENT_BROWSER_ARGS="${AGENT_BROWSER_ARGS},--no-sandbox"
+fi
+
 # 系统服务固定端口（按需求统一为 10123）
 PORT=10123
 

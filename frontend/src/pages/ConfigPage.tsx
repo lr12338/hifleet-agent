@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Alert, AutoComplete, Button, Card, Col, Form, Row, Space, Switch, Tag, Typography, message } from 'antd';
+import { Alert, AutoComplete, Button, Card, Col, Form, Row, Select, Space, Tag, Typography, message } from 'antd';
 
 import { fetchLlmConfig, saveLlmConfig, type LlmRuntimeConfigResponse } from '../api/client';
 import { ContextBar } from '../components/page/ContextBar';
@@ -9,7 +9,8 @@ import './ConfigPage.css';
 interface ConfigFormValues {
   text_model: string;
   multimodal_model: string;
-  deep_thinking_enabled: boolean;
+  thinking_type: 'enabled' | 'disabled';
+  reasoning_effort: 'minimal' | 'low' | 'medium' | 'high';
 }
 
 function toOptions(values: string[]) {
@@ -33,7 +34,8 @@ export function ConfigPage() {
         form.setFieldsValue({
           text_model: data.text_model,
           multimodal_model: data.multimodal_model,
-          deep_thinking_enabled: data.deep_thinking_enabled
+          thinking_type: data.thinking_type,
+          reasoning_effort: data.reasoning_effort
         });
       } catch (error) {
         const msg = error instanceof Error ? error.message : '加载配置失败';
@@ -55,17 +57,20 @@ export function ConfigPage() {
   const handleSubmit = async (values: ConfigFormValues) => {
     setSaving(true);
     try {
+      const reasoningEffort = values.thinking_type === 'disabled' ? 'minimal' : values.reasoning_effort;
       const payload = {
         text_model: values.text_model.trim(),
         multimodal_model: values.multimodal_model.trim(),
-        thinking_type: values.deep_thinking_enabled ? 'enabled' : 'disabled'
+        thinking_type: values.thinking_type,
+        reasoning_effort: reasoningEffort
       } as const;
       const data = await saveLlmConfig(payload);
       setConfig(data);
       form.setFieldsValue({
         text_model: data.text_model,
         multimodal_model: data.multimodal_model,
-        deep_thinking_enabled: data.deep_thinking_enabled
+        thinking_type: data.thinking_type,
+        reasoning_effort: data.reasoning_effort
       });
       message.success('模型配置已更新');
     } catch (error) {
@@ -83,9 +88,12 @@ export function ConfigPage() {
     form.setFieldsValue({
       text_model: config.text_model,
       multimodal_model: config.multimodal_model,
-      deep_thinking_enabled: config.deep_thinking_enabled
+      thinking_type: config.thinking_type,
+      reasoning_effort: config.reasoning_effort
     });
   };
+
+  const thinkingType = Form.useWatch('thinking_type', form);
 
   return (
     <div className="config-page">
@@ -97,8 +105,8 @@ export function ConfigPage() {
         <Space size={[8, 8]} wrap>
           <Tag color="blue">纯文本 -&gt; 文本模型</Tag>
           <Tag color="gold">图片 / 音频 / 视频 -&gt; 多模态模型</Tag>
-          <Tag color={config?.deep_thinking_enabled ? 'green' : 'default'}>
-            深度思考：{config?.deep_thinking_enabled ? '开启' : '关闭'}
+          <Tag color={config?.thinking_type === 'disabled' ? 'default' : 'green'}>
+            深度思考：{config?.thinking_type === 'enabled' ? `开启 / ${config.reasoning_effort}` : '关闭 / minimal'}
           </Tag>
         </Space>
       </ContextBar>
@@ -127,7 +135,7 @@ export function ConfigPage() {
                   >
                     <AutoComplete
                       options={toOptions(config?.text_model_presets || [])}
-                      placeholder="例如 doubao-seed-2-0-pro-260215"
+                      placeholder="例如 doubao-seed-2-0-lite-260428"
                       filterOption={(input, option) => String(option?.value || '').toLowerCase().includes(input.toLowerCase())}
                     />
                   </Form.Item>
@@ -149,11 +157,37 @@ export function ConfigPage() {
               </Row>
 
               <div className="config-page-thinking-row">
-                <Form.Item label="深度思考模式" name="deep_thinking_enabled" valuePropName="checked" style={{ marginBottom: 0 }}>
-                  <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                <Form.Item label="深度思考模式" name="thinking_type" style={{ marginBottom: 0, minWidth: 160 }}>
+                  <Select
+                    onChange={(value) => {
+                      if (value === 'disabled') {
+                        form.setFieldValue('reasoning_effort', 'minimal');
+                      }
+                    }}
+                    options={[
+                      { label: '强制开启', value: 'enabled' },
+                      { label: '强制关闭', value: 'disabled' }
+                    ]}
+                  />
+                </Form.Item>
+                <Form.Item
+                  label="推理深度"
+                  name="reasoning_effort"
+                  style={{ marginBottom: 0, minWidth: 160 }}
+                  dependencies={['thinking_type']}
+                >
+                  <Select
+                    disabled={thinkingType === 'disabled'}
+                    options={[
+                      { label: 'minimal', value: 'minimal' },
+                      { label: 'low', value: 'low' },
+                      { label: 'medium', value: 'medium' },
+                      { label: 'high', value: 'high' }
+                    ]}
+                  />
                 </Form.Item>
                 <Typography.Text type="secondary">
-                  开启后默认向模型下发 `thinking.type=enabled`；关闭时使用 `disabled`。
+                  Seed Lite 不支持 `auto`。开启时可用 minimal / low / medium / high；关闭时服务端会强制使用 minimal。
                 </Typography.Text>
               </div>
 
@@ -181,7 +215,7 @@ export function ConfigPage() {
               </div>
               <div className="config-page-summary-item">
                 <span className="config-page-summary-label">思考策略</span>
-                <strong>{config?.thinking_type || '-'}</strong>
+                <strong>{config ? `${config.thinking_type} / ${config.reasoning_effort}` : '-'}</strong>
               </div>
             </div>
             <Alert

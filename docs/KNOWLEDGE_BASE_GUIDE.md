@@ -17,13 +17,13 @@
 
 ## 1. 当前主链
 
-`customer_support` 收到知识问题后，会先跑需求理解 agent，再进入 `knowledge_qa`。
+`customer_support` 收到知识问题后，当前由轻量全模态 skills agent 让模型自主调用 `knowledge_qa` 工具。历史 router 链仅保留为回滚与兼容测试参考，不再是当前 customer 入口。
 
 ```mermaid
 flowchart TD
-    Q[知识问题] --> U[需求理解 agent]
-    U --> V["query_type / search_query_candidates / should_limit_to_hifleet_sites"]
-    V --> A[local_kb_search]
+    Q[知识问题] --> W[customer_support lightweight wrapper]
+    W --> M[standard tool-calling skills agent]
+    M --> A[local_kb_search]
     A -->|FAQ 强命中| Done[直接回答]
     A -->|不足| B[web_search]
     B -->|命中具体事实页| Done
@@ -41,12 +41,14 @@ flowchart TD
 约束：
 
 - tool 只做本层事情，不在内部偷偷串下一层
-- agent 或 `smart_search` facade 才负责编排
-- browser 没有 `target_urls` 或明确 HiFleet 域提示时不允许裸跑
+- skills agent 或 `smart_search` facade 才负责编排
+- browser 不是第一轮搜索工具；但在 `web_search` 弱命中后，可用短关键词通过 Bing 优先召回 HiFleet 官方候选页
 
-## 2. 首步需求理解如何影响检索
+## 2. 模型主导检索如何影响查询
 
-当前首步固定使用 `doubao-seed-2-0-lite-260428` 生成 understanding 契约。知识检索最关心这几个字段：
+当前默认使用 `doubao-seed-2-0-lite-260428`、`thinking_type=enabled` 和 `reasoning_effort=medium`。模型会根据当前 `agent_profile` prompt、当前轮多模态摘要和会话记忆选择查询词、是否先查本地知识库、是否升级 web/browser。
+
+旧 router 链中曾有 understanding 契约，仍可作为历史 trace 或回滚参考。知识检索最关心的语义仍是：
 
 - `rewritten_user_need`
 - `query_type`
@@ -57,10 +59,11 @@ flowchart TD
 
 影响方式：
 
-- `execute_knowledge_chain()` 和 `execute_planned_knowledge_chain()` 优先使用 `search_query_candidates[0]` 作为主查询
+- 当前 skills agent 会把用户问题、多模态摘要和必要上下文一起传给 knowledge 工具
+- 历史 router 的知识链仅作为回滚与兼容测试入口保留，新逻辑优先落在 skills agent 和三工具实现里
 - 不再默认套旧的 `_rewrite_hifleet_knowledge_query()` 模板
 - browser 的 `site_hint` 优先使用 `should_limit_to_hifleet_sites`
-- trace 中会落 `understanding_summary` 和 `retrieval_trace`
+- 当前 trace 优先观察 `generated_tool_calls`、`route_trace.reasoning_trace.pipeline`、`perception_summary` 和 `retrieval_trace`
 
 示例：
 
@@ -164,7 +167,7 @@ query 规则：
 
 ### 3.4 `web_search_agent_browser`
 
-这个工具不独立做开放式搜索，只负责“目标页已锁定后抓正文”。
+这个工具不做第一轮开放式搜索，主要负责“目标页已锁定后抓正文”。当 `web_search` 无有效命中且问题仍可能属于 HiFleet 平台/产品/社区/帮助内容时，也允许用短关键词触发 Bing 官方候选召回。
 
 它只是 `knowledge_qa` 对 `browser_verify.agent_browser_deep_search` 的包装桥接：
 
@@ -174,7 +177,8 @@ query 规则：
 
 严格限制：
 
-- 没有 `target_urls` 且没有 HiFleet 域提示时，不运行
+- 无 `target_urls` 时必须来自 `web_search` 弱命中后的最后核验，且 `query` 必须是短关键词串
+- 候选排序始终优先 HiFleet 官方社区、官网、帮助中心；无官方正文证据时保守失败
 - 不允许把首页、社区目录页、帮助中心入口页当成成功证据
 
 ## 4. `smart_search` 当前定位
@@ -233,7 +237,7 @@ https://www.hifleet.com/helpcenter/?i18n=zh
 
 ## 7. Linux 部署配置
 
-当前项目启动入口 [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py) 会在启动时加载：
+当前项目启动入口 [src/main.py](../src/main.py) 会在启动时加载：
 
 ```text
 COZE_WORKSPACE_PATH/.env
@@ -271,7 +275,7 @@ ark_websearch_api_key=
 
 若仍带 `Sites`，优先检查：
 
-- `customer_support_router` 是否正确透传 `query_type`
+- skills agent 传给 `web_search` 的 query 是否已经被 profile prompt 错误限制到 HiFleet 站点
 - `web_search_runtime.looks_like_authoritative_data_query(...)`
 - fallback trace 是否覆盖了真实请求画像
 
@@ -281,13 +285,13 @@ ark_websearch_api_key=
 
 期望：
 
-- `route=knowledge`
-- `task_type=platform_troubleshooting`
-- knowledge 检索应优先吃 understanding 产出的主查询
+- `customer_support` 下 `route_trace.route=lightweight_skills_agent`
+- `employee_assistant` 下可进入 knowledge 快捷链
+- knowledge 检索应优先围绕平台问题本身，不误调船舶读写工具
 
 若误入船舶链路，检查：
 
-- `src/agents/agent.py` 中 understanding prompt 或 schema 是否被近期修改
+- `config/profiles/customer_support.md` 中船舶写操作和平台知识边界是否被近期修改
 - 会话上下文是否错误继承了上一个船舶实体
 
 ### 8.3 搜索太慢
@@ -327,13 +331,13 @@ VOLC_WEB_SEARCH_DEFAULT_COUNT=5
    - `10406` 免费额度用尽
    - `700429` QPS 限流
 
-### 8.5 `.venv-test` 下 router 测试导入失败
+### 8.5 `.venv-test` 下历史 router 测试导入失败
 
 当前已知环境阻塞：
 
 - `.venv-test` 缺少 `docker` Python 包
 - 导致 `browser_verify` skill 导入失败
-- 这会影响完整 `tests/test_customer_support_router.py`，不是本次知识链改造本身引入的问题
+- 这会影响历史兼容测试 `tests/test_customer_support_router.py`，不是当前轻量 customer 主链本身引入的问题
 
 可先做的最小验证：
 

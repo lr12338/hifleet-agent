@@ -40,7 +40,7 @@ class FakeResponse:
 
 def main() -> int:
     request_context.set(new_context(method="test_employee_workspace"))
-    set_current_agent_profile("employee_assistant")
+    set_current_agent_profile("customer_ceshi")
 
     with tempfile.TemporaryDirectory(prefix="employee_ws_") as tmpdir:
         csv_path = Path(tmpdir) / "quotes.csv"

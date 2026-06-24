@@ -4,6 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from skills.knowledge_qa.browser_bridge import build_browser_bridge_payload
 from skills.knowledge_qa import tools
 
 
@@ -270,3 +271,60 @@ def test_web_search_agent_browser_wraps_pages(monkeypatch):
 
     assert "浏览器开始记忆船队" in output
     assert "https://www.hifleet.com/wp/communities/fleet/zhuyiliulanqikaishijiyichuanduishaixuanle" in output
+
+
+def test_web_search_agent_browser_trace_keeps_raw_no_hit(monkeypatch):
+    payload = build_browser_bridge_payload(
+        "获取该海图图标说明页面的完整内容",
+        "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming#post-305",
+        "",
+        {},
+        "未检索到足够可信的信息",
+        "JSONDecodeError",
+    )
+
+    assert payload["status"] == "no_hit"
+    assert payload["trace"]["target_urls_present"] is True
+    assert payload["trace"]["raw_status"] == "parse_error"
+    assert payload["trace"]["raw_summary"] == "未检索到足够可信的信息"
+    assert payload["trace"]["parse_error"] == "JSONDecodeError"
+
+
+def test_web_search_agent_browser_trace_supports_keyword_bing_success():
+    parsed = {
+        "type": "hifleet_browser_evidence",
+        "query": "船队筛选记忆功能",
+        "pages": [
+            {
+                "title": "注意！浏览器开始记忆船队“筛选”了",
+                "url": "https://www.hifleet.com/wp/communities/fleet/zhuyiliulanqikaishijiyichuanduishaixuanle",
+                "excerpt": "在显示-船队-筛选上增加了浏览器记忆功能。",
+                "official": True,
+                "source_query": "HiFleet 船队筛选记忆功能",
+            }
+        ],
+    }
+
+    payload = build_browser_bridge_payload(
+        "船队筛选记忆功能",
+        "",
+        "",
+        parsed,
+        json.dumps(parsed, ensure_ascii=False),
+        "",
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["trace"]["target_urls_present"] is False
+    assert payload["trace"]["raw_status"] == "hifleet_browser_evidence"
+    assert payload["pages"][0]["source_query"] == "HiFleet 船队筛选记忆功能"
+
+
+def test_agent_browser_keyword_fallback_prompt_rules_are_documented():
+    repo_root = Path(__file__).resolve().parents[1]
+    skill_text = (repo_root / "src/skills/knowledge_qa/SKILL.md").read_text(encoding="utf-8")
+    profile_text = (repo_root / "config/profiles/customer_support.md").read_text(encoding="utf-8")
+
+    assert "web_search" in skill_text and "Bing" in skill_text and "官方候选" in skill_text
+    assert "无有效命中" in profile_text
+    assert "短关键词" in profile_text

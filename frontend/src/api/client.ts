@@ -77,7 +77,8 @@ export async function fetchDashboardSummary(params: URLSearchParams) {
 export interface LlmRuntimeConfigResponse {
   text_model: string;
   multimodal_model: string;
-  thinking_type: "enabled" | "disabled" | "auto";
+  thinking_type: "enabled" | "disabled";
+  reasoning_effort: "minimal" | "low" | "medium" | "high";
   deep_thinking_enabled: boolean;
   text_model_presets: string[];
   multimodal_model_presets: string[];
@@ -90,7 +91,8 @@ export async function fetchLlmConfig() {
 export async function saveLlmConfig(payload: {
   text_model: string;
   multimodal_model: string;
-  thinking_type: "enabled" | "disabled" | "auto";
+  thinking_type: "enabled" | "disabled";
+  reasoning_effort: "minimal" | "low" | "medium" | "high";
 }) {
   return requestJson<LlmRuntimeConfigResponse>("/admin/config/llm", {
     method: "PUT",

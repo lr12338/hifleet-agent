@@ -19,13 +19,13 @@
 
 在进入 employee loop 之前，请求会先经过统一模型路由层：
 
-- 纯文本消息默认走文本模型 `doubao-seed-2-0-pro-260215`
+- 纯文本消息默认走文本模型 `doubao-seed-2-0-lite-260428`
 - 图片/音频/视频消息默认走多模态模型 `doubao-seed-2-0-lite-260428`
 - 运行态路由结果会回写到 `llm_route`，用于调试页和 `/run` 返回体对齐
 
 随后才进入以下 employee 执行流程：
 
-1. `/run` 或 `/stream_run` 进入 `src/main.py`，解析 `agent_profile/source_channel`。
+1. `/run` 或 `/stream_run` 进入 `src/main.py`，按 `agent_profile` 或 `x-agent-profile` 选择 Profile，并记录 `source_channel` 作为观测字段。
 2. `src/agents/agent.py` 在 `employee_assistant` 下识别是否为“表格分析/产物任务”。
 3. 命中后进入 `route -> plan -> act -> check -> loop/finalize/fail`。
 4. 如果输入是公开 URL，`plan` 先调用 `download_public_file_to_artifact`。
@@ -48,14 +48,14 @@
 
 对应代码入口：
 
-- [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+- [src/main.py](../src/main.py)
   - `normalize_request_payload(...)`
   - `/run`
   - `/stream_run`
-- [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+- [src/agents/agent.py](../src/agents/agent.py)
   - `_detect_workspace_task(...)`
   - `_build_employee_agent(...)`
-- [src/skills/employee_workspace/tools.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/skills/employee_workspace/tools.py)
+- [src/skills/employee_workspace/tools.py](../src/skills/employee_workspace/tools.py)
   - `inspect_tabular_file(...)`
   - `run_sandboxed_python(...)`
 
@@ -109,10 +109,8 @@ flowchart TD
 
 如果你当前要看的不是 sandbox 闭环，而是“employee 普通问答链”，直接跳到：
 
-- [docs/AGENT_TECHNICAL_DOCUMENTATION.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/docs/AGENT_TECHNICAL_DOCUMENTATION.md)
-  - `8.1.1 employee 标准问答 agent`
-  - `8.1.2 standard agent 的装配结构`
-  - `8.1.5 读普通问答链时该怎么看源码`
+- [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
+  - `9. employee_assistant 当前链路`
 
 ### 2.4 plan 节点为什么必须先 inspect
 
@@ -205,13 +203,13 @@ flowchart TD
 
 按下面顺序读，理解成本最低：
 
-1. [src/main.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/main.py)
+1. [src/main.py](../src/main.py)
    先看 `normalize_request_payload(...)` 和 `/stream_run`，知道请求怎么进入 graph。
-2. [src/agents/agent.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/agents/agent.py)
+2. [src/agents/agent.py](../src/agents/agent.py)
    重点看 `_build_employee_agent(...)` 的 `route/plan/act/check/loop/finalize/fail`。
-3. [src/skills/employee_workspace/tools.py](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/src/skills/employee_workspace/tools.py)
+3. [src/skills/employee_workspace/tools.py](../src/skills/employee_workspace/tools.py)
    重点看 `inspect_tabular_file(...)` 和 `run_sandboxed_python(...)`。
-4. [docs/AGENT_TECHNICAL_DOCUMENTATION.md](/Users/raymondlu/LocalProject/AIPM/智能客服/客服开发/本地agent/hifleet-agent/docs/AGENT_TECHNICAL_DOCUMENTATION.md)
+4. [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
    对照两个 profile 的职责差异。
 
 ### 2.9 用 customer_support 做对照来理解

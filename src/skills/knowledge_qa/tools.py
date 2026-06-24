@@ -749,11 +749,13 @@ def web_search_agent_browser(query: str, target_urls: str = "", site_hint: str =
     from skills.browser_verify.tools import agent_browser_deep_search
 
     browser_output = agent_browser_deep_search.invoke({"query": query, "target_urls": target_urls, "site_hint": site_hint})
+    parse_error = ""
     try:
         parsed = json.loads(browser_output)
-    except Exception:
+    except Exception as exc:
         parsed = {}
-    payload = build_browser_bridge_payload(query, target_urls, site_hint, parsed)
+        parse_error = type(exc).__name__
+    payload = build_browser_bridge_payload(query, target_urls, site_hint, parsed, browser_output, parse_error)
     return json.dumps(payload, ensure_ascii=False)
 
 

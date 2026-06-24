@@ -2,7 +2,10 @@
   "default_profile": "customer_support",
   "profiles": {
     "customer_support": {
-      "description": "External customer support agent. Focuses on understanding customer needs, retrieving reliable information, and replying with helpful customer-facing answers.",
+      "description": "Lightweight external HiFleet customer support test agent. Uses the multimodal model and allowed skills directly, including ship data read/write tools, without employee sandbox or workspace capabilities.",
+      "aliases": [
+        "employee_assistant"
+      ],
       "source_channels": [
         "websdk",
         "wechat_mp",
@@ -14,7 +17,6 @@
         "knowledge_qa",
         "hifleet_ship_service",
         "multimodal_support",
-        "customer_workspace",
         "browser_verify"
       ],
       "prompt_file": "config/profiles/customer_support.md",
@@ -22,18 +24,20 @@
       "requires_auth": false,
       "sandbox_enabled": false,
       "tool_policy": {
-        "allow_file_tools": true,
-        "allow_python": true,
+        "allow_file_tools": false,
+        "allow_python": false,
         "allow_write_actions": true,
         "prefer_search_before_answer": true,
         "allow_browser_verify": true,
         "allow_multimodal": true,
-        "allow_artifact_links": true
+        "allow_artifact_links": false,
+        "lightweight_skills_agent": true
       },
       "disabled_tools": []
     },
-    "employee_assistant": {
+    "customer_ceshi": {
       "description": "Internal digital employee assistant. Supports knowledge QA, file processing, data analysis, and controlled artifact generation.",
+      "aliases": [],
       "source_channels": [
         "admin_panel",
         "internal_web",

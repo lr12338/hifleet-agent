@@ -15,33 +15,42 @@
 
 当前 customer_support 主链：
 前置安全检查
--> 附件/截图轻量 perception
--> 轻量 intent agent 输出 route decision
--> 少量 deterministic guard 修正安全、写操作、明确船舶/文件等高风险场景
--> execute/planner/harness 或 delegate
--> check/finalize 输出清洗
+-> 多模态 direct perception（文本/语音/图片/视频）
+-> 标准 tool-calling skills agent
+-> 模型自主选择 knowledge / browser / ship / multimodal tools
+-> finalize + customer output guard
+-> 文本回复 + output_assets 链接
 
 核心要求：
-- 默认未明确平台但像功能、页面、图标、船舶、数据、权限、报错的问题，优先按 HiFleet 客服问题理解。
-- 明显闲聊、泛化抱怨、用户本机问题，不要强行套 HiFleet，要先轻量确认发生页面和操作。
-- 接口搜索结果只能作为候选；HiFleet 官网、帮助中心、官方社区问题必须优先用 browser 核验具体公开页面。
-- 最终客服回复不能出现工具名、JSON、HTMLLINK、下载广告、内部路径、token、env。
+- 当前入口应为 src/agents/agent.py 中的 _build_lightweight_customer_support_agent()；旧 customer_support_router.py 和旧 _build_customer_support_agent() 只作为回滚参考，不应是当前入口。
+- 默认模型和多模态模型统一为 doubao-seed-2-0-lite-260428，thinking.type 默认 enabled，reasoning_effort 默认 medium。
+- Seed Lite 不支持 thinking.type=auto；如果旧调用传 auto，服务端应归一化为 enabled + medium，不能原样透传给模型。
+- Profile 只由请求体 agent_profile 或请求头 x-agent-profile 决定；source_channel 只用于日志和后台筛选，不参与 Profile 判断。
+- 当前不再插入自定义历史上下文摘要；完整文本历史交给 agent/checkpointer，历史多媒体 URL 只做安全脱敏。
+- customer_support 允许船舶数据读写，但不启用 Python、沙盒、employee workspace、任意文件读写或产物生成。
+- 写操作必须是用户明确要求上传/更新/修改/补录船位或静态信息；缺字段时只追问一个关键字段；工具未返回成功时不得说已成功。
+- 接口搜索结果只能作为候选；HiFleet 官网、帮助中心、官方社区问题优先用 browser 或官方页面核验具体公开页面。
+- 最终客服回复不能出现工具名、JSON、HTMLLINK、下载广告、内部路径、token、env、prompt、tool registry。
 - reasoning_trace 是审计摘要，不是隐藏思维链，普通用户回复不能展示。
+- 微信客服旧 /run 格式 content.query.prompt 必须继续兼容。
 
 请按这个顺序阅读：
 1. README.md
 2. docs/README.md
-3. docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md
-4. docs/AGENT_TECHNICAL_DOCUMENTATION.md
-5. docs/agent_browser_fallback_integration.md
-6. docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md
-7. config/profiles/customer_support.md
-8. src/agents/agent.py
-9. src/agents/customer_support_router.py
-10. src/agents/customer_support_guard.py
-11. src/skills/browser_verify/tools.py
-12. tests/test_customer_support_router.py
-13. tests/test_customer_support_intent_agent.py
+3. docs/API_MULTI_USER_INTEGRATION.md
+4. docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md
+5. docs/AGENT_TECHNICAL_DOCUMENTATION.md
+6. docs/agent_browser_fallback_integration.md
+7. docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md
+8. config/agent_profiles.json
+9. config/agent_llm_config.json
+10. config/profiles/customer_support.md
+11. src/agents/agent.py
+12. src/agents/customer_support_guard.py
+13. src/skills/hifleet_ship_service/tools.py
+14. src/skills/browser_verify/tools.py
+15. tests/test_customer_support_intent_agent.py
+16. tests/test_customer_support_router.py
 
 先做版本与环境检查：
 - git rev-parse HEAD
@@ -57,17 +66,18 @@
 - journalctl -u hifleet-agent.service -n 120 --no-pager
 
 优先跑最小验证：
-- python3 -m py_compile src/agents/agent.py src/agents/customer_support_router.py src/agents/customer_support_guard.py src/skills/browser_verify/tools.py
-- ./.venv-test/bin/python -m pytest tests/test_customer_support_router.py -q
-- ./.venv-test/bin/python -m pytest tests/test_customer_support_intent_agent.py -q
+- python3 -m py_compile src/agents/agent.py src/agents/customer_support_guard.py src/skills/browser_verify/tools.py
+- PYTHONPATH=src ./.venv/bin/python scripts/test_agent_profiles.py
+- PYTHONPATH=src ./.venv/bin/python scripts/test_llm_config.py
+- PYTHONPATH=src ./.venv/bin/python -m pytest -q tests/test_customer_support_intent_agent.py tests/test_customer_support_router.py tests/test_smart_search_tools.py
 
 如果 pytest 因 dbus-python/dbus-1 等系统依赖失败，请记录失败原因，不要擅自改依赖；先用 py_compile 和接口烟测继续验证。
 
 接口烟测用 /run，统一请求字段：
 - session_id 使用 remote-smoke-*，不要复用真实用户会话。
 - user_id 使用 remote-dev。
-- source_channel 使用 websdk。
 - agent_profile 使用 customer_support。
+- source_channel 使用 websdk；微信旧格式测试使用 wechat_kf。它只用于观测，不决定 Profile。
 
 请至少测试这些输入：
 1. 验证 注意！浏览器开始记忆船队“筛选”了 的详细内容
@@ -80,29 +90,39 @@
    预期：先确认是否发生在 HiFleet 页面和具体操作；不要输出长篇平台排障模板。
 
 4. 这个圆圈是什么
-   预期：无截图时轻量确认是否在 HiFleet 地图/海图页面看到；有截图时应结合 perception 判断。
+   预期：无截图时确认是否在 HiFleet 地图/海图页面看到；有截图时应结合 perception 判断。
 
 5. 先问 查询 MMSI 414726000 船位，再问 这艘船最近靠过哪些港
    预期：第二轮继承上一轮船舶上下文，不要求重复提供 MMSI。
 
+6. 微信旧格式 content.query.prompt，包含 voice/image/video + text
+   预期：服务端归一化为 messages，多模态内容进入 perception，最终回复可直接发给微信用户。
+
+7. 请更新船位 MMSI 414726000，经度 121.4737，纬度 31.2304，更新时间 2026-06-15 10:20:30
+   预期：用户明确写操作时才调用 upload_ship_position；工具未成功时不得说已成功。
+
 如果能看到日志或后台 trace，请重点观察：
+- llm_route
 - phase_history
 - route_trace.route
 - route_trace.task_type
-- route_trace.fallback_reason
-- route_trace.reasoning_trace.route_source
+- route_trace.reasoning_trace.pipeline
 - route_trace.reasoning_trace.perception_summary
-- route_trace.reasoning_trace.intent_agent_result
 - generated_tool_calls
-- check_result.evidence_summary
+- response_modalities
+- output_assets
+- check_result
 - 最终 messages[-1].content
 
 验收标准：
+- route_trace.route 应为 lightweight_skills_agent。
+- phase_history 至少包含 preprocess、delegate、finalize。
 - 普通知识问答能基于 KB 或官方 browser evidence 回复。
 - 官方社区/官网核验类问题必须有具体官方链接。
-- 附件/截图类问题先生成 perception，再参与路由。
-- 安全、写操作、明确船舶工具调用仍由 guard 保护。
-- 用户最终回复是正常客服对话，不展示搜索日志、工具名、JSON、HTMLLINK、下载广告。
+- 附件/截图/语音/视频类问题先生成 perception，再进入 skills agent。
+- 船舶查询、档案、PSC、轨迹、挂靠等读工具能被模型自主调用。
+- 明确船舶写操作可以调用写工具；缺字段时只追问一个关键字段；失败不报成功。
+- 用户最终回复是正常客服对话，不展示搜索日志、工具名、JSON、HTMLLINK、下载广告、prompt、路径或 key。
 
 最后请输出报告，格式如下：
 
@@ -117,11 +137,12 @@
 - agent-browser:
 - health:
 - 关键依赖:
+- 模型配置:
 
 ### 测试
 - py_compile:
-- pytest router:
-- pytest intent:
+- profile/config tests:
+- pytest customer:
 - 未跑/失败原因:
 
 ### 烟测结果
@@ -130,11 +151,15 @@
 - 弱相关网速抱怨:
 - 圆圈/截图问题:
 - 船舶上下文追问:
+- 微信旧格式:
+- 船舶写操作:
 
 ### Trace 观察
-- route_source 是否正常:
+- route 是否为 lightweight_skills_agent:
+- phase_history 是否包含 preprocess/delegate/finalize:
 - perception 是否出现:
-- official_source_count / evidence_summary:
+- generated_tool_calls:
+- response_modalities / output_assets:
 - 输出清洗是否正常:
 
 ### 问题与建议

@@ -39,6 +39,7 @@ class ArkAttachment(BaseModel):
 class ArkChatRequest(BaseModel):
     model: str | None = None
     thinking: Literal['enabled', 'disabled', 'auto'] | None = None
+    reasoning_effort: Literal['minimal', 'low', 'medium', 'high'] | None = None
     text: str | None = None
     attachments: list[ArkAttachment] = Field(default_factory=list)
     session_id: str | None = None
@@ -50,7 +51,8 @@ class ArkChatRequest(BaseModel):
 class LLMConfigRequest(BaseModel):
     text_model: str = Field(min_length=1)
     multimodal_model: str = Field(min_length=1)
-    thinking_type: Literal['enabled', 'disabled', 'auto'] = 'disabled'
+    thinking_type: Literal['enabled', 'disabled'] = 'enabled'
+    reasoning_effort: Literal['minimal', 'low', 'medium', 'high'] = 'medium'
 
 
 class ChatDebugSessionSaveRequest(BaseModel):

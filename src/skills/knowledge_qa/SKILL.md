@@ -38,8 +38,10 @@
   - `trace.risk_flags`
 
 ### web_search_agent_browser
-- 仅在 `web_search` 已给出候选 URL 或明确 HiFleet 官方域范围时再调用
-- 用于抓取具体页面正文，不用于裸跑兜底
+- 仅作为最后一轮公开页面核验，不作为第一轮搜索工具
+- 有明确页面时传 `target_urls`，用于抓取具体页面正文
+- 当 `web_search` 无有效命中、`can_answer=false` 或候选摘要不足，且问题仍可能属于 HiFleet 平台/产品/社区/帮助内容时，可以不传 `target_urls`，只传关键词 `query`
+- 无 `target_urls` 时，`query` 必须是短关键词串；browser 会通过 Bing 优先寻找 HiFleet 官方社区、官网、帮助中心候选页
 - 若无正文、仅目录页、或抓取失败，不要伪装成成功答案
 
 ### smart_search
@@ -53,8 +55,9 @@
 2. 若 `can_answer=true`，直接基于知识库回答
 3. 若 `should_continue=true`，调用 `web_search`
 4. 若 `web_search.can_answer=true`，直接回答
-5. 若 `web_search.continue_with=agent_browser` 且存在 `best_urls`，再调用 `web_search_agent_browser`
-6. 最终回答时优先引用本地知识库或官方页面
+5. 若 `web_search.continue_with=agent_browser` 且存在 `best_urls`，传入 `target_urls` 调用 `web_search_agent_browser`
+6. 若 `web_search` 无有效命中但问题可能属于 HiFleet 平台/产品/社区/帮助内容，可用关键词 `query` 调用 `web_search_agent_browser`，让 browser 用 Bing 找官方候选页
+7. 最终回答时优先引用本地知识库或官方页面
 
 ## 输出要求
 

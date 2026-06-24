@@ -29,25 +29,33 @@ def tool_names(profile_id: str):
 
 def main() -> int:
     assert resolve_profile_id(source_channel="websdk") == "customer_support"
-    assert resolve_profile_id(source_channel="wechat_mp") == "customer_support"
-    assert resolve_profile_id(source_channel="admin_panel") == "employee_assistant"
-    assert resolve_profile_id(source_channel="employee_api") == "employee_assistant"
+    assert resolve_profile_id(source_channel="hifleet_mp", requested_profile="employee_assistant") == "customer_support"
+    assert resolve_profile_id(source_channel="employee_api") == "customer_support"
+    assert resolve_profile_id(source_channel="websdk", requested_profile="employee_assistant") == "customer_support"
+    assert resolve_profile_id(headers={"x-agent-profile": "employee_assistant"}) == "customer_support"
+    assert resolve_profile_id(requested_profile="customer_ceshi") == "customer_ceshi"
 
     customer_tools = tool_names("customer_support")
-    employee_tools = tool_names("employee_assistant")
-    assert "smart_search" in customer_tools
+    employee_tools = tool_names("customer_ceshi")
+    assert "local_kb_search" in customer_tools
+    assert "web_search" in customer_tools
+    assert "web_search_agent_browser" in customer_tools
     assert "run_sandboxed_python" not in customer_tools
-    assert "upload_ship_position" not in customer_tools
-    assert "update_ship_static_info" not in customer_tools
+    assert "download_public_file_to_artifact" not in customer_tools
+    assert "inspect_tabular_file" not in customer_tools
+    assert "inspect_customer_file" not in customer_tools
+    assert "upload_customer_artifact" not in customer_tools
+    assert "upload_ship_position" in customer_tools
+    assert "update_ship_static_info" in customer_tools
     assert "run_sandboxed_python" in employee_tools
     assert "upload_ship_position" in employee_tools
 
     request_context.set(new_context(method="test_agent_profiles"))
     set_current_agent_profile("customer_support")
     blocked = employee_workspace_tools.run_sandboxed_python.invoke({"code": "print(1 + 1)"})
-    assert "only available in employee_assistant" in blocked
+    assert "only available in customer_ceshi" in blocked
 
-    set_current_agent_profile("employee_assistant")
+    set_current_agent_profile("customer_ceshi")
     original_run_in_docker = employee_workspace_tools._run_in_docker
 
     def fake_run_in_docker(_job_dir: Any, input_file_name: str = "") -> dict[str, Any]:

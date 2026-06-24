@@ -57,7 +57,7 @@ def sanitize_customer_output(text: str) -> str:
     value = re.sub(r"(?mi)^来源[:：].*$", "", value)
     value = re.sub(r"(?mi)^内容摘要[:：]\s*", "", value)
     value = re.sub(r"(?mi)^详细内容[:：]\s*", "", value)
-    value = re.sub(r"(?mis)<a\s+href=\"[^\"]+\">.*?</a>", "", value)
+    value = re.sub(r"(?mis)<a\s+href=\"([^\"]+)\">\s*([^<]{0,80})\s*</a>", lambda m: f"{m.group(2).strip() or '查看详情'}：{m.group(1)}", value)
     value = re.sub(r"(?mi)^如需更多帮助，请继续补充.*$", "", value)
     value = re.sub(r"(?mi)^请用中文回复。?\s*$", "", value)
     value = re.sub(r"(?mi)^下载APP,?手机查船更方便.*$", "", value)

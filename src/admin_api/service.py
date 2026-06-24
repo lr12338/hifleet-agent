@@ -13,7 +13,7 @@ from fastapi import HTTPException, UploadFile
 
 from observability import repository
 from observability.schemas import LogListFilters
-from llm_config import export_llm_config_view, load_llm_config, resolve_model_selection, save_llm_config
+from llm_config import build_thinking_payload, export_llm_config_view, load_llm_config, resolve_model_selection, save_llm_config
 from storage.s3.s3_storage import S3SyncStorage
 
 from .schemas import AdminTestRunRequest, ArkAttachment, ArkChatRequest, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LLMConfigRequest, LogListQuery, SessionListQuery
@@ -127,6 +127,7 @@ def update_llm_config(req: LLMConfigRequest) -> dict[str, Any]:
     cfg['config']['text_model'] = req.text_model.strip()
     cfg['config']['multimodal_model'] = req.multimodal_model.strip()
     cfg['config']['thinking_type'] = req.thinking_type
+    cfg['config']['reasoning_effort'] = req.reasoning_effort
     cfg['config']['deep_thinking_enabled'] = req.thinking_type != 'disabled'
     cfg['config']['model'] = cfg['config']['text_model']
     normalized = save_llm_config(cfg)
@@ -372,8 +373,8 @@ def _extract_text(value: Any) -> str:
     return ""
 
 
-def _thinking_payload(thinking_type: str) -> dict[str, str]:
-    return {"type": str(thinking_type or "disabled").strip() or "disabled"}
+def _thinking_payload(thinking_type: str, reasoning_effort: str = "") -> dict[str, str]:
+    return build_thinking_payload(thinking_type, reasoning_effort)
 
 
 def _normalize_ark_content(attachments: list[ArkAttachment], text: str | None) -> list[dict[str, Any]]:
@@ -437,10 +438,11 @@ async def stream_ark_chat(req: ArkChatRequest):
         has_multimodal_input=bool(req.attachments),
         requested_model=str(req.model or "").strip(),
         requested_thinking=str(req.thinking or "").strip(),
+        requested_reasoning_effort=str(req.reasoning_effort or "").strip(),
     )
     request_body = {
         "model": resolved["model"],
-        "thinking": _thinking_payload(resolved["thinking_type"]),
+        "thinking": _thinking_payload(resolved["thinking_type"], resolved["reasoning_effort"]),
         "stream": True,
         "input": [
             {
@@ -481,6 +483,7 @@ async def stream_ark_chat(req: ArkChatRequest):
                     "source_channel": req.source_channel,
                     "model": resolved["model"],
                     "thinking": resolved["thinking_type"],
+                    "reasoning_effort": resolved["reasoning_effort"],
                     "modality": resolved["modality"],
                 },
             )

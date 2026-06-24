@@ -18,7 +18,7 @@ import requests
 from docker.errors import DockerException, ImageNotFound
 from langchain.tools import tool
 
-from agents.profiles import get_current_agent_profile_id
+from agents.profiles import get_current_agent_profile_id, load_profiles_config
 from coze_coding_utils.log.write_log import request_context
 from observability import schedule_agent_error_log
 from skills.common.tool_result import ToolResult, emit_tool_metric
@@ -105,12 +105,27 @@ def _emit(tool_name: str, result: ToolResult, tool_args: Dict[str, Any] | None =
 
 
 def _is_employee_profile() -> bool:
-    if get_current_agent_profile_id() == "employee_assistant":
+    config = load_profiles_config()
+    profiles = config.get("profiles", {}) or {}
+
+    def canonicalize(profile_id: str) -> str:
+        normalized = (profile_id or "").strip()
+        if not normalized:
+            return ""
+        if normalized in profiles:
+            return normalized
+        for canonical_id, data in profiles.items():
+            aliases = data.get("aliases", []) if isinstance(data, dict) else []
+            if normalized in {str(alias).strip() for alias in aliases if str(alias).strip()}:
+                return canonical_id
+        return normalized
+
+    if canonicalize(get_current_agent_profile_id()) == "customer_ceshi":
         return True
     ctx = request_context.get()
     headers = getattr(ctx, "headers", {}) if ctx else {}
     if isinstance(headers, dict):
-        return headers.get("x-agent-profile") == "employee_assistant"
+        return canonicalize(str(headers.get("x-agent-profile", ""))) == "customer_ceshi"
     return False
 
 
@@ -331,7 +346,7 @@ def download_public_file_to_artifact(file_url: str, filename: str = "") -> str:
     args = {"file_url": file_url, "filename": filename}
     try:
         if not _is_employee_profile():
-            raise PermissionError("download_public_file_to_artifact is only available in employee_assistant profile")
+            raise PermissionError("download_public_file_to_artifact is only available in customer_ceshi profile")
         parsed = urlparse(file_url)
         if parsed.scheme not in {"http", "https"}:
             raise ValueError("only public http/https file URLs are supported")
@@ -390,7 +405,7 @@ def inspect_tabular_file(file_path: str, max_rows: int = 5) -> str:
     args = {"file_path": file_path, "max_rows": max_rows}
     try:
         if not _is_employee_profile():
-            raise PermissionError("inspect_tabular_file is only available in employee_assistant profile")
+            raise PermissionError("inspect_tabular_file is only available in customer_ceshi profile")
         path = _resolve_allowed_path(file_path)
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"file not found: {path}")
@@ -456,7 +471,7 @@ def run_sandboxed_python(code: str, expected_artifact: str = "", attempt: int = 
     }
     try:
         if not _is_employee_profile():
-            raise PermissionError("run_sandboxed_python is only available in employee_assistant profile")
+            raise PermissionError("run_sandboxed_python is only available in customer_ceshi profile")
         if not code or len(code) > MAX_CODE_CHARS:
             raise ValueError(f"code must be non-empty and <= {MAX_CODE_CHARS} chars")
 

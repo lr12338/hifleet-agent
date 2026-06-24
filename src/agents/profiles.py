@@ -15,7 +15,10 @@ _CURRENT_PROFILE_ID: ContextVar[str] = ContextVar("hifleet_agent_profile", defau
 
 
 def set_current_agent_profile(profile_id: str) -> None:
-    _CURRENT_PROFILE_ID.set((profile_id or "").strip())
+    config = load_profiles_config()
+    profiles = config.get("profiles", {}) or {}
+    default_profile = config.get("default_profile") or DEFAULT_PROFILE_ID
+    _CURRENT_PROFILE_ID.set(_canonicalize_profile_id(profile_id, profiles, default_profile))
 
 
 def get_current_agent_profile_id() -> str:
@@ -26,6 +29,7 @@ def get_current_agent_profile_id() -> str:
 class AgentProfile:
     profile_id: str
     description: str = ""
+    aliases: List[str] = field(default_factory=list)
     source_channels: List[str] = field(default_factory=list)
     skills: List[str] = field(default_factory=list)
     disabled_tools: List[str] = field(default_factory=list)
@@ -51,15 +55,37 @@ def load_profiles_config() -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _canonicalize_profile_id(
+    profile_id: str,
+    profiles: Dict[str, Any] | None = None,
+    default_profile: str = DEFAULT_PROFILE_ID,
+) -> str:
+    normalized = (profile_id or "").strip()
+    if not normalized:
+        return default_profile
+
+    profile_map = profiles or (load_profiles_config().get("profiles", {}) or {})
+    if normalized in profile_map:
+        return normalized
+
+    for canonical_id, data in profile_map.items():
+        aliases = data.get("aliases", []) if isinstance(data, dict) else []
+        if normalized in {str(alias).strip() for alias in aliases if str(alias).strip()}:
+            return canonical_id
+
+    return default_profile
+
+
 def get_profile(profile_id: str = "") -> AgentProfile:
     config = load_profiles_config()
     profiles = config.get("profiles", {}) or {}
     default_profile = config.get("default_profile") or DEFAULT_PROFILE_ID
-    selected = profile_id if profile_id in profiles else default_profile
+    selected = _canonicalize_profile_id(profile_id, profiles, default_profile)
     data = profiles.get(selected, {})
     return AgentProfile(
         profile_id=selected,
         description=str(data.get("description", "")),
+        aliases=list(data.get("aliases", []) or []),
         source_channels=list(data.get("source_channels", []) or []),
         skills=list(data.get("skills", []) or []),
         disabled_tools=list(data.get("disabled_tools", []) or []),
@@ -90,14 +116,9 @@ def resolve_profile_id(
             candidates.append(str(header_profile))
 
     for candidate in candidates:
-        normalized = candidate.strip()
+        normalized = _canonicalize_profile_id(candidate, profiles, default_profile)
         if normalized in profiles:
             return normalized
-
-    channel = (source_channel or "").strip()
-    for profile_id, data in profiles.items():
-        if channel in set(data.get("source_channels", []) or []):
-            return profile_id
 
     return default_profile
 

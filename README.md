@@ -4,8 +4,9 @@
 
 当前不是单一客服 Bot，而是 **一个主 Agent + 多 Agent Profile** 的架构：
 
-- `customer_support`：外部客服 Agent，面向客户、客服渠道、CRM，强调需求理解、知识检索和友好回复。
-- `employee_assistant`：内部数字员工 Agent，面向员工和后台，支持知识问答、业务工具、文件检查和受控 Python 分析。
+- `customer_support`：正式客服 Agent，面向客户、微信客服、WebSDK、CRM，采用轻量全模态 skills agent，支持知识检索、公开网页核验和船舶数据读写，禁用沙盒/Python/employee workspace。
+- `employee_assistant`：`customer_support` 的兼容别名，继续可被旧调用方使用。
+- `customer_ceshi`：测试/内部 Agent，保留知识问答、业务工具、文件检查和受控 Python 分析能力。
 
 详细架构请优先阅读：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
 如果是在其他服务器上部署联调，先看：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`。
@@ -17,7 +18,7 @@
 coze_ai/
 ├── config/
 │   ├── agent_llm_config.json       # 模型和工具配置
-│   ├── agent_profiles.json         # customer_support / employee_assistant 权限边界
+│   ├── agent_profiles.json         # customer_support / customer_ceshi 权限边界与别名
 │   ├── profiles/                   # 各 Profile 的系统提示词
 │   └── system_prompt_base.md       # 通用基础提示词
 ├── src/
@@ -33,12 +34,12 @@ coze_ai/
 
 ## 2. Agent Profile
 
-Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profile` -> `source_channel` 映射 -> 默认 `customer_support`。
+Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profile` -> 默认 `customer_support`。`source_channel` 只用于日志、观测和业务来源记录，不参与 Profile 选择。
 
 | Profile | 典型 source_channel | 能力 |
 | --- | --- | --- |
-| `customer_support` | `websdk`, `wechat_mp`, `wechat_kf`, `customer_api`, `crm` | 知识库/联网搜索、HiFleet 平台和业务问答、只读船舶业务工具 |
-| `employee_assistant` | `admin_panel`, `internal_web`, `employee_api`, `employee_assistant` | 客服能力 + 内部业务工具 + 表格检查 + 受控 Python 沙盒 |
+| `customer_support` | `websdk`, `wechat_mp`, `wechat_kf`, `customer_api`, `crm` | 正式客服 profile；`employee_assistant` 作为兼容别名也会落到这里 |
+| `customer_ceshi` | `admin_panel`, `internal_web`, `employee_api`, `employee_assistant` | 测试/内部 profile；包含 employee workspace、表格检查和受控 Python 沙盒 |
 
 ## 3. 快速启动
 
@@ -114,12 +115,14 @@ curl -X POST http://127.0.0.1:10123/run \
   }'
 ```
 
+微信客服现有旧 `/run` 调用可继续使用 `content.query.prompt`，服务端会归一化为 `messages`；新接入建议直接使用上面的 OpenAI 风格 `messages`。
+
 流式接口：
 
 ```bash
 curl -N -X POST http://127.0.0.1:10123/stream_run \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"请流式介绍HiFleet轨迹功能"}],"session_id":"websdk:u1:c1","user_id":"u1","source_channel":"websdk"}'
+  -d '{"messages":[{"role":"user","content":"请流式介绍HiFleet轨迹功能"}],"session_id":"websdk:u1:c1","user_id":"u1","source_channel":"websdk","agent_profile":"customer_support"}'
 ```
 
 更多接入规范：`docs/API_MULTI_USER_INTEGRATION.md`。

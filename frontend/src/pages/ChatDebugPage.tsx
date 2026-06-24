@@ -14,7 +14,7 @@ import {
 } from "../api/client";
 import { JsonViewer } from "../components/common/JsonViewer";
 import { StatusTag } from "../components/common/StatusTag";
-import { ARK_MODEL_OPTIONS, AUTO_ROUTE_MODEL_OPTION, modelSupportsAutoThinking } from "../config/arkModels";
+import { ARK_MODEL_OPTIONS, AUTO_ROUTE_MODEL_OPTION } from "../config/arkModels";
 import { useAdminShell } from "../layouts/AdminShell";
 import "./ChatDebugPage.css";
 
@@ -66,7 +66,7 @@ interface TimelineEvent {
 
 interface SessionMeta {
   model: string;
-  thinking: "enabled" | "disabled" | "auto";
+  thinking: "enabled" | "disabled";
   session_id: string;
   user_id: string;
   source_channel: string;
@@ -486,15 +486,13 @@ export function ChatDebugPage() {
   }, [activeSession]);
 
   const textValue = Form.useWatch("text", form) || "";
-  const selectedModel = Form.useWatch("model", form) || AUTO_ROUTE_MODEL_OPTION.value;
   const selectedThinkingMode = Form.useWatch("thinkingMode", form) || "enabled";
-  const supportsAutoThinking = selectedModel === AUTO_ROUTE_MODEL_OPTION.value ? true : modelSupportsAutoThinking(selectedModel);
 
   useEffect(() => {
-    if (!supportsAutoThinking && selectedThinkingMode === "auto") {
+    if (selectedThinkingMode === "auto") {
       form.setFieldValue("thinkingMode", "enabled");
     }
-  }, [form, selectedThinkingMode, supportsAutoThinking]);
+  }, [form, selectedThinkingMode]);
 
   const stopStream = () => {
     abortRef.current?.abort();
@@ -1213,8 +1211,7 @@ export function ChatDebugPage() {
                       getPopupContainer={getSelectPopupContainer}
                       options={[
                         { label: "强制开启", value: "enabled" },
-                        { label: "强制关闭", value: "disabled" },
-                        { label: "自动判断", value: "auto", disabled: !supportsAutoThinking }
+                        { label: "强制关闭", value: "disabled" }
                       ]}
                     />
                   </Form.Item>
@@ -1238,7 +1235,7 @@ export function ChatDebugPage() {
               </div>
 
               <div className="chat-debug-input-hints">
-                {!supportsAutoThinking ? <Typography.Text type="secondary">当前模型不支持自动判断</Typography.Text> : <Typography.Text type="secondary">默认按配置页自动路由，也可在此手动覆盖。</Typography.Text>}
+                <Typography.Text type="secondary">Seed Lite 仅支持开启或关闭深度思考；旧 auto 请求会由服务端归一化。</Typography.Text>
                 <Space size={12} wrap>
                   <Tooltip title="上传依赖环境变量：优先 COZE_BUCKET_NAME / COZE_BUCKET_ENDPOINT_URL / COZE_BUCKET_ACCESS_KEY / COZE_BUCKET_SECRET_KEY；兼容 OSS_BUCKET_NAME / OSS_ENDPOINT / OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET">
                     <Typography.Text style={{ color: "#2563eb", cursor: "help" }}>OSS配置提示</Typography.Text>
