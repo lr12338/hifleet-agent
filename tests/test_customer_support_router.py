@@ -798,7 +798,7 @@ def test_complex_ship_fallback_when_identifier_missing():
 
 def test_update_chain_executes_when_fields_are_complete():
     upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']} lon={args['lon']} lat={args['lat']}")
-    text = "请更新船位 MMSI 414726000 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    text = "请更新船位 MMSI 414726000 经度 121.4737 纬度 31.2304 航速 5 船首向 120 吃水 9.6 航行状态 在航 更新时间 2026-06-15 10:20:30"
     entities = extract_entities(text)
     decision = classify_message(text, entities)
     trace = make_trace(decision, entities)
@@ -811,11 +811,137 @@ def test_update_chain_executes_when_fields_are_complete():
             "mmsi": "414726000",
             "lon": "121.4737",
             "lat": "31.2304",
+            "speed": "5",
+            "heading": "120",
+            "draft": "9.6",
+            "navstatus": "在航",
             "updatetime": "2026-06-15 10:20:30",
         }
     ]
     assert "更新成功" in output
     assert trace.check_result["write_result"] is True
+
+
+def test_update_chain_executes_with_minimum_position_fields():
+    upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']} lon={args['lon']} lat={args['lat']}")
+    text = "请更新船位 MMSI 414726000 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+
+    output = execute_update_chain(text, entities, {"upload_ship_position": upload}, trace)
+
+    assert upload.calls == [
+        {
+            "mmsi": "414726000",
+            "lon": "121.4737",
+            "lat": "31.2304",
+            "updatetime": "2026-06-15 10:20:30",
+        }
+    ]
+    assert "更新成功" in output
+
+
+def test_update_chain_ship_name_unique_match_requires_confirmation():
+    search = FakeTool("ship_search", lambda args: "YU MING\nMMSI: 414726000 | IMO: 9613886")
+    upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']}")
+    text = "请更新船位 船名 YU MING 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"ship_search": search, "upload_ship_position": upload}, trace)
+
+    assert search.calls == [{"keyword": "YU MING"}]
+    assert upload.calls == []
+    assert "请确认是否更新该 MMSI" in output
+    assert "414726000" in output
+
+
+def test_update_chain_ship_name_multiple_matches_asks_for_mmsi():
+    search = FakeTool("ship_search", lambda args: "A MMSI: 111111111\nB MMSI: 222222222")
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    text = "请更新船位 船名 YU MING 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"ship_search": search, "upload_ship_position": upload}, trace)
+
+    assert upload.calls == []
+    assert "未能唯一确认目标船舶" in output
+    assert "111111111" in output
+    assert "222222222" in output
+
+
+def test_update_chain_ship_name_no_match_asks_for_identifier():
+    search = FakeTool("ship_search", lambda args: "未找到匹配的船舶。")
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    text = "请更新船位 船名 中文简称 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"ship_search": search, "upload_ship_position": upload}, trace)
+
+    assert upload.calls == []
+    assert "请补充 9 位 MMSI、IMO 或更准确的标准船名" in output
+
+
+def test_update_chain_imo_unique_match_updates_with_mmsi():
+    search = FakeTool("ship_search", lambda args: "IMO: 9613886\nMMSI: 414726000")
+    upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']}")
+    text = "请更新船位 IMO 9613886 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"ship_search": search, "upload_ship_position": upload}, trace)
+
+    assert search.calls == [{"keyword": "9613886"}]
+    assert upload.calls[0]["mmsi"] == "414726000"
+    assert "更新成功" in output
+
+
+def test_update_chain_does_not_reuse_history_for_bare_update():
+    messages = [
+        HumanMessage(content="查询 MMSI 352002867 船位"),
+        AIMessage(content="MMSI: 352002867\n船位查询完成"),
+    ]
+    context = build_conversation_context(messages)
+    text = "更新一下"
+    entities = resolve_entities_with_context(
+        extract_entities(text),
+        context,
+        allow_ship_context=should_use_ship_context("ship_update", text),
+    )
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    trace = make_trace(classify_message(text, entities, context), entities)
+
+    output = execute_update_chain(text, entities, {"upload_ship_position": upload}, trace)
+
+    assert entities.mmsi == ""
+    assert upload.calls == []
+    assert "需要明确船舶身份标识" in output
+
+
+def test_update_chain_requires_confirmation_for_context_ship_reference():
+    messages = [
+        HumanMessage(content="查询 MMSI 352002867 船位"),
+        AIMessage(content="MMSI: 352002867\n船位查询完成"),
+    ]
+    context = build_conversation_context(messages)
+    text = "这艘船更新一下，经度 121.4737 纬度 31.2304 航速 5 船首向 120 吃水 9.6 航行状态 在航 更新时间 2026-06-15 10:20:30"
+    entities = resolve_entities_with_context(
+        extract_entities(text),
+        context,
+        allow_ship_context=should_use_ship_context("ship_update", text),
+    )
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    trace = make_trace(classify_message(text, entities, context), entities)
+
+    output = execute_update_chain(text, entities, {"upload_ship_position": upload}, trace)
+
+    assert entities.mmsi == "352002867"
+    assert upload.calls == []
+    assert "请确认本次要更新的目标船舶标识" in output
+    assert trace.fallback_reason == "update_requires_explicit_ship_identifier"
 
 
 def test_update_chain_asks_one_key_question_when_mmsi_missing():

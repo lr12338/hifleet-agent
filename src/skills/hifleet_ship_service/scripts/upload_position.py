@@ -10,7 +10,7 @@
 注意：
     - 经纬度必须为十进制度格式（东经/北纬为正，西经/南纬为负）
     - 度分秒格式需先通过 coord_utils.py 转换
-    - 仅上传用户明确提供的参数，不设置默认值（updatetime 除外）
+    - 仅上传用户明确提供的参数，不设置默认值
     - API返回纯文本，非JSON
 """
 import os
@@ -18,7 +18,6 @@ import sys
 import json
 import urllib.request
 import urllib.parse
-from datetime import datetime
 
 
 def upload_position(data: dict, usertoken: str = "") -> str:
@@ -50,24 +49,22 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="船位上传")
     parser.add_argument("--mmsi", required=True, help="船舶 MMSI 编号")
-    parser.add_argument("--lon", type=float, default=None, help="经度（十进制度）")
-    parser.add_argument("--lat", type=float, default=None, help="纬度（十进制度）")
+    parser.add_argument("--lon", type=float, required=True, help="经度（十进制度）")
+    parser.add_argument("--lat", type=float, required=True, help="纬度（十进制度）")
     parser.add_argument("--speed", type=float, default=None, help="航速（节）")
     parser.add_argument("--heading", type=float, default=None, help="航首向（度）")
     parser.add_argument("--course", type=float, default=None, help="航迹向（度）")
     parser.add_argument("--destination", default=None, help="目的港")
     parser.add_argument("--eta", default=None, help="预抵时间（yyyy-MM-dd HH:mm:ss）")
     parser.add_argument("--draft", type=float, default=None, help="吃水（米）")
-    parser.add_argument("--updatetime", default=None, help="更新时间（yyyy-MM-dd HH:mm:ss），若用户指定则使用指定时间")
+    parser.add_argument("--updatetime", required=True, help="更新时间（yyyy-MM-dd HH:mm:ss），必须来自用户或附件")
+    parser.add_argument("--navstatus", default=None, help="航行状态（中文文本）")
     args = parser.parse_args()
 
-    # 构造请求体 - 包含必要字段
-    # 优先使用用户指定的更新时间，否则使用当前时间
-    actual_update_time = args.updatetime if args.updatetime else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     data = {
         "name": args.mmsi,
         "mmsi": args.mmsi,       # API 需要单独的 mmsi 字段
-        "updatetime": actual_update_time,
+        "updatetime": args.updatetime,
         "checkFly": "0",         # 跳过飞行位置检查
         "bindCheck": "0"         # 跳过群组绑定检查
     }
@@ -88,12 +85,8 @@ if __name__ == "__main__":
         data["eta"] = args.eta
     if args.draft is not None:
         data["draught"] = args.draft  # API 字段名为 draught
-
-    # 检查是否有实质性更新数据
-    update_fields = [k for k in data if k not in ("name", "mmsi", "updatetime", "checkFly", "bindCheck")]
-    if not update_fields:
-        print(json.dumps({"error": "未提供任何可更新的数据，请至少提供经纬度/航速/航向等参数"}, ensure_ascii=False, indent=2))
-        sys.exit(1)
+    if args.navstatus:
+        data["status"] = args.navstatus
 
     result = upload_position(data)
     print(result)

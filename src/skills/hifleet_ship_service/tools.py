@@ -980,8 +980,8 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
     """上传/更新船舶动态位置数据（经纬度、航速、航向等）。
 
     适用场景：用户要更新某艘船的位置、航速等动态信息。
-    直接执行无需确认。经纬度支持度分秒格式（如30°08′51N），工具内部自动转换。
-    若仅有船名需先调用ship_search获取MMSI。
+    仅当本轮用户输入或附件明确提供目标船舶、经纬度、更新时间时执行。经纬度支持度分秒格式（如30°08′51N），工具内部自动转换。
+    若仅有船名需先调用ship_search获取MMSI；禁止复用历史船舶标识直接写入。
 
     Args:
         mmsi: 船舶MMSI编号
@@ -993,7 +993,7 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
         destination: 目的港，如 "SHANGHAI"
         eta: 预抵时间，如 "2026-05-10 20:00:00"
         draft: 吃水（米），如 "9.6"
-        updatetime: 更新时间（用户指定的船位时间），如 "2026-06-05 15:30:00"。若用户明确提供了更新时间则必须传入
+        updatetime: 更新时间（用户指定的船位时间），如 "2026-06-05 15:30:00"。必须由用户或附件明确提供，工具不自动生成
         navstatus: 航行状态（中文），如 "机动船在航"、"锚泊"、"系泊"、"搁浅"、"捕鱼"等，API直接接收中文文本
         ship_name: 船名（英文），如 "YU MING"。若用户提供了船名则传入
         wechatgroup: 微信群组ID，用于绑定船队
@@ -1006,13 +1006,33 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
         ctx = request_context.get() or new_context(method="upload_ship_position")
         _ensure_imports()
 
+        def _validation_error(output: str) -> str:
+            _emit_result(
+                "upload_ship_position",
+                ctx,
+                ToolResult(status="error", code="UPLOAD_POSITION_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"),
+            )
+            return output
+
+        missing_required = []
+        if not mmsi or not mmsi.strip():
+            missing_required.append("船舶标识（MMSI）")
+        if not lon or not str(lon).strip():
+            missing_required.append("经度")
+        if not lat or not str(lat).strip():
+            missing_required.append("纬度")
+        if not updatetime or not str(updatetime).strip():
+            missing_required.append("更新时间")
+        if missing_required:
+            return _validation_error(
+                "船位更新缺少必填参数：" + "、".join(missing_required) + "。请补充后再更新；我不会复用历史船舶或自动生成更新时间。"
+            )
+
         # 构造请求体 - 包含必要字段
-        # 优先使用用户指定的更新时间，否则使用当前时间
-        actual_update_time = updatetime.strip() if updatetime and updatetime.strip() else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         data = {
             "name": ship_name or mmsi,  # API必选：优先用船名，缺省用MMSI
             "mmsi": mmsi,           # API 需要单独的 mmsi 字段
-            "updatetime": actual_update_time,
+            "updatetime": updatetime.strip(),
             "checkFly": "0",       # 跳过飞行位置检查
             "bindCheck": "0"       # 跳过群组绑定检查
         }
@@ -1024,12 +1044,7 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
                 data["lon"] = converted_lon
             else:
                 output = f"经度格式无法识别: {lon}，请使用十进制度（如123.227）或度分秒（如123°13′38E）格式。"
-                _emit_result(
-                    "upload_ship_position",
-                    ctx,
-                    ToolResult(status="error", code="UPLOAD_POSITION_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"),
-                )
-                return output
+                return _validation_error(output)
 
         if lat:
             converted_lat = _coord_utils.dms_to_decimal(lat)
@@ -1037,29 +1052,19 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
                 data["lat"] = converted_lat
             else:
                 output = f"纬度格式无法识别: {lat}，请使用十进制度（如30.147）或度分秒（如30°08′51N）格式。"
-                _emit_result(
-                    "upload_ship_position",
-                    ctx,
-                    ToolResult(status="error", code="UPLOAD_POSITION_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"),
-                )
-                return output
+                return _validation_error(output)
 
         if speed:
             try:
                 data["speed"] = float(speed)
             except ValueError:
                 output = f"航速格式错误: {speed}，请提供数字。"
-                _emit_result(
-                    "upload_ship_position",
-                    ctx,
-                    ToolResult(status="error", code="UPLOAD_POSITION_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"),
-                )
-                return output
+                return _validation_error(output)
         if heading:
             try:
                 data["heading"] = float(heading)
             except ValueError:
-                pass
+                return _validation_error(f"船首向格式错误: {heading}，请提供数字。")
         if course:
             try:
                 data["course"] = float(course)
@@ -1073,7 +1078,7 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
             try:
                 data["draught"] = float(draft)  # API文档字段名为 draught
             except ValueError:
-                pass
+                return _validation_error(f"吃水格式错误: {draft}，请提供数字。")
         # 航行状态：API直接接收中文文本（如"机动船在航"、"锚泊"等）
         if navstatus:
             navstatus_stripped = navstatus.strip()
@@ -1095,16 +1100,7 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
         if wechatgroup:
             data["wechatgroup"] = wechatgroup
 
-        # 检查是否有实质性更新数据
         update_fields = [k for k in data if k not in ("name", "mmsi", "updatetime", "checkFly", "bindCheck")]
-        if not update_fields:
-            output = "未提供任何可更新的数据，请至少提供经纬度/航速/航向等参数。"
-            _emit_result(
-                "upload_ship_position",
-                ctx,
-                ToolResult(status="error", code="UPLOAD_POSITION_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"),
-            )
-            return output
 
         logger.info(f"[UploadPosition] mmsi={mmsi}, fields={update_fields}")
 
@@ -1155,14 +1151,23 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
                     lines.append(f"目的港: {data['destination']}")
                 if "eta" in data:
                     lines.append(f"ETA: {data['eta']}")
-                if "draft" in data:
-                    lines.append(f"吃水: {data['draft']} 米")
-                elif "draught" in data:
+                if "draught" in data:
                     lines.append(f"吃水: {data['draught']} 米")
                 if "status" in data:
                     # status已经是中文文本，直接显示
                     lines.append(f"航行状态: {data['status']}")
                 lines.append(f"更新时间：{data['updatetime']} (UTC+8)")
+                optional_missing = []
+                if "speed" not in data:
+                    optional_missing.append("航速")
+                if "heading" not in data:
+                    optional_missing.append("船首向")
+                if "draught" not in data:
+                    optional_missing.append("吃水")
+                if "status" not in data:
+                    optional_missing.append("航行状态")
+                if optional_missing:
+                    lines.append("本次未更新" + "、".join(optional_missing) + "等字段，如需同步可继续补充。")
                 lines.append("数据同步：预计 5 分钟内生效")
                 output = "\n".join(lines)
                 _emit_result(

@@ -1413,6 +1413,19 @@ def _is_chart_symbol_image_request(text: str, messages: list[AnyMessage] | list[
     return any(marker in q for marker in markers)
 
 
+def _is_ship_position_update_request(text: str) -> bool:
+    q = str(text or "").lower()
+    troubleshooting_markers = [
+        "更新慢", "更新很慢", "更新这么慢", "不更新", "不刷新", "不显示", "不准确",
+        "延迟", "为什么", "原因", "怎么回事", "无法", "失败", "报错", "异常",
+    ]
+    if any(marker in q for marker in troubleshooting_markers):
+        return False
+    has_write = any(marker in q for marker in ["更新", "上传", "修改", "补录", "update"])
+    has_position = any(marker in q for marker in ["船位", "位置", "定位", "坐标", "ais", "经度", "纬度", "lat", "lon", "posn", "position"])
+    return has_write and has_position
+
+
 def _objective_multimodal_text(perception: dict[str, Any], user_text: str = "") -> str:
     parts: list[str] = []
     recognized = str(perception.get("recognized_text") or "").strip()
@@ -1969,7 +1982,13 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         messages = list(state.get("messages", []) or [])
         question = str(state.get("task_goal") or _latest_user_text(messages) or "").strip()
         context = build_conversation_context(messages)
-        entities = resolve_entities_with_context(extract_entities(question), context)
+        raw_entities = extract_entities(question)
+        preliminary_decision = classify_message(question, raw_entities, context)
+        entities = resolve_entities_with_context(
+            raw_entities,
+            context,
+            allow_ship_context=should_use_ship_context(preliminary_decision.route, question),
+        )
         decision = classify_message(question, entities, context)
         trace = make_trace(decision, entities, session_id=str(state.get("session_id", "")), run_id=str(getattr(ctx, "run_id", "") or ""))
         tool_map = {tool.name: tool for tool in _load_all_tools(profile)}
@@ -2283,7 +2302,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
         entities = resolve_entities_with_context(
             raw_entities,
             context,
-            allow_ship_context=should_use_ship_context(decision.route),
+            allow_ship_context=should_use_ship_context(decision.route, text),
         )
         return decision, _state_dict_from_model(entities), [asdict(item) for item in attachments], perception, intent_agent_result, route_source
 
@@ -2736,6 +2755,51 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "visible_features": str(perception.get("visible_features") or ""),
             "confidence": str(perception.get("confidence") or ""),
         }
+        if _is_ship_position_update_request(text):
+            context = build_conversation_context(messages)
+            raw_entities = extract_entities(text)
+            entities = resolve_entities_with_context(
+                raw_entities,
+                context,
+                allow_ship_context=should_use_ship_context("ship_update", text),
+            )
+            answer, trace_dict = _execute_customer_support_harness(
+                text=text,
+                route="ship_update",
+                task_type="ship_update",
+                tool_bundle=SHIP_UPDATE_BUNDLE,
+                entities=entities,
+                context=context,
+                attachments=extract_attachments(messages),
+                perception=perception,
+                session_id=str(state.get("session_id", "")),
+                run_id=str(getattr(ctx, "run_id", "") or ""),
+            )
+            preflight_perception_summary = dict(route_trace["reasoning_trace"].get("perception_summary", {}) or {})
+            route_trace.update(trace_dict)
+            route_trace["route"] = "ship_update"
+            route_trace["reasoning_trace"] = {
+                **dict(trace_dict.get("reasoning_trace", {}) or {}),
+                "route_source": "write_preflight_guard",
+                "perception_summary": preflight_perception_summary,
+            }
+            return {
+                "phase": "done",
+                "phase_history": ["preprocess", "write_preflight_guard", "done"],
+                "status": "success",
+                "task_goal": text,
+                "messages": [AIMessage(content=answer)],
+                "perception_result": perception,
+                "generated_answer": answer,
+                "delegate_answer": answer,
+                "generated_tool_calls": list(trace_dict.get("tool_call_sequence", []) or []),
+                "delegate_input_message_count": len(messages),
+                "output_assets": _extract_output_assets(answer),
+                "check_result": dict(trace_dict.get("check_result", {}) or {}),
+                "intent_hint": "ship_update",
+                "route_trace": route_trace,
+                "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
+            }
         if is_chart_symbol_request:
             answer, evidence_outputs = _verify_chart_symbol_with_tools(text, perception, tool_map, route_trace)
             route_trace["check_result"] = {
