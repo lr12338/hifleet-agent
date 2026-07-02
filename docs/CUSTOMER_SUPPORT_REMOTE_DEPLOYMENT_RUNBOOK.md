@@ -384,6 +384,22 @@ curl -X POST http://127.0.0.1:10123/run \
 2. 多 worker 下是否复用了同一 `session_id`。
 3. 是否还有旧服务进程未重启。
 
+如果确认是脏会话导致的上下文污染，可在远端机器直接按 `session_id` 清理：
+
+```bash
+cd /home/ecs-user/coze_ai
+.venv/bin/python scripts/clear_session_context.py --dry-run \
+  'remote-context-001'
+
+.venv/bin/python scripts/clear_session_context.py \
+  'remote-context-001'
+```
+
+说明：
+
+- 脚本会同时清理主会话和内部 `:standard_agent` 子线程。
+- 如果只是想让下一轮不继承旧上下文，优先直接换新的 `session_id`。
+
 ### 7.3 日志里能看到工具调用，但客户回复不对
 
 优先排查：

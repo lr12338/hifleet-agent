@@ -134,6 +134,19 @@ curl -N -X POST http://127.0.0.1:10123/stream_run \
 
 更多接入规范：`docs/API_MULTI_USER_INTEGRATION.md`。
 
+按 `session_id` 清理上下文：
+
+```bash
+cd /home/ecs-user/coze_ai
+.venv/bin/python scripts/clear_session_context.py --dry-run \
+  'wechat_kf:hifleet:openid_xxx:c_default'
+
+.venv/bin/python scripts/clear_session_context.py \
+  'wechat_kf:hifleet:openid_xxx:c_default'
+```
+
+如果只是想开始一段全新对话，优先直接更换新的 `session_id`，不必删除历史数据。
+
 ## 6. 后台管理
 
 后台管理系统包含：

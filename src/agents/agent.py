@@ -1086,7 +1086,7 @@ def _execute_customer_support_harness(
     elif route == "ship_stats":
         answer = execute_stats_chain(text, entities, tool_map, trace)
     elif route == "ship_update":
-        answer = execute_update_chain(text, entities, tool_map, trace)
+        answer = execute_update_chain(text, entities, tool_map, trace, perception=perception)
     else:
         trace.fallback_reason = "unsupported_harness_route"
         answer = ""
@@ -1981,10 +1981,14 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     def ship_node(state: EmployeeAgentState) -> dict[str, Any]:
         messages = list(state.get("messages", []) or [])
         question = str(state.get("task_goal") or _latest_user_text(messages) or "").strip()
+        perception = {}
+        if _has_current_multimodal_media(messages):
+            perception = _run_direct_multimodal_perception(ctx=ctx, cfg=cfg, messages=messages)
         context = build_conversation_context(messages)
         raw_entities = extract_entities(question)
         preliminary_decision = classify_message(question, raw_entities, context)
-        entities = resolve_entities_with_context(
+        is_ship_update_write = preliminary_decision.route == "ship_update" or _is_ship_position_update_request(question)
+        entities = raw_entities if is_ship_update_write else resolve_entities_with_context(
             raw_entities,
             context,
             allow_ship_context=should_use_ship_context(preliminary_decision.route, question),
@@ -1995,7 +1999,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         if decision.route in {"ship_complex", "ship_context"}:
             answer = execute_complex_ship_chain(question, entities, tool_map, trace)
         elif decision.route == "ship_update":
-            answer = execute_update_chain(question, entities, tool_map, trace)
+            answer = execute_update_chain(question, entities, tool_map, trace, perception=perception)
         elif decision.route == "ship_stats":
             answer = execute_stats_chain(question, entities, tool_map, trace)
         else:
@@ -2299,7 +2303,7 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             else:
                 decision = fallback_decision
                 route_source = "fallback_rule"
-        entities = resolve_entities_with_context(
+        entities = raw_entities if decision.route == "ship_update" else resolve_entities_with_context(
             raw_entities,
             context,
             allow_ship_context=should_use_ship_context(decision.route, text),
@@ -2757,12 +2761,9 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         }
         if _is_ship_position_update_request(text):
             context = build_conversation_context(messages)
-            raw_entities = extract_entities(text)
-            entities = resolve_entities_with_context(
-                raw_entities,
-                context,
-                allow_ship_context=should_use_ship_context("ship_update", text),
-            )
+            current_user_text = _latest_user_text(messages)
+            raw_entities = extract_entities(current_user_text)
+            entities = raw_entities
             answer, trace_dict = _execute_customer_support_harness(
                 text=text,
                 route="ship_update",

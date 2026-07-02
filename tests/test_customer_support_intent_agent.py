@@ -765,6 +765,151 @@ def test_customer_support_graph_multimodal_ship_update_requires_current_identifi
     assert "需要明确船舶身份标识" in result["messages"][-1].content
 
 
+def test_customer_support_graph_ship_update_does_not_reuse_history_identifier(monkeypatch):
+    position = FakeTool("upload_ship_position", lambda args: "不应调用")
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position])
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None, config=None):
+            raise AssertionError("ship update preflight guard should not delegate")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-history-ship-update"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["hifleet_ship_service"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(content="查询 MMSI 352002867 船位"),
+                AIMessage(content="MMSI: 352002867\n船位查询完成"),
+                HumanMessage(content="这艘船更新一下，经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"),
+            ],
+            "session_id": "s-history-ship-update",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-history-ship-update"}},
+    )
+
+    assert position.calls == []
+    assert result["route_trace"]["route"] == "ship_update"
+    assert result["generated_tool_calls"] == []
+    assert "需要明确船舶身份标识" in result["messages"][-1].content
+
+
+def test_customer_support_graph_multimodal_ship_update_uses_upload_only(monkeypatch):
+    position = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
+    static_update = FakeTool("update_ship_static_info", lambda args: "不应调用")
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position, static_update])
+    monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {
+            "attachment_type": "image",
+            "visible_text": (
+                "MMSI:477167800 IMO:9261384 呼号:VRJQ8 AIS船名:SITC HAIPHONG "
+                "机动船在航 目的港/ETA:VNSGN/2026-07-03 09:00 (UTC) "
+                "位置:13°34.132'N 109°57.89'E 船艏/航迹向:204°/207° "
+                "对地/水航速:13.1 kn/13 kn 当前吃水:9 m 更新时间:2026-07-02 12:43 (UTC+8)"
+            ),
+            "visible_features": "电子海图界面，右侧为航行参数面板",
+            "summary": "船舶详情页面，包含AIS动态字段",
+            "confidence": "high",
+            "source": "test",
+        },
+    )
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None, config=None):
+            raise AssertionError("ship update preflight guard should not delegate")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-image-update-success"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["hifleet_ship_service"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=[
+                        {"type": "image_url", "image_url": {"url": "https://example.com/position.jpg"}},
+                        {"type": "text", "text": "更新船位"},
+                    ]
+                )
+            ],
+            "session_id": "s-image-update-success",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-image-update-success"}},
+    )
+
+    assert result["route_trace"]["route"] == "ship_update"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_preflight_guard"
+    assert result["generated_tool_calls"] == ["upload_ship_position"]
+    assert static_update.calls == []
+    assert len(position.calls) == 1
+    assert position.calls[0]["mmsi"] == "477167800"
+    assert position.calls[0]["lon"] == "109°57.89'E"
+    assert position.calls[0]["lat"] == "13°34.132'N"
+    assert result["route_trace"]["reasoning_trace"]["write_mode"] == "dynamic"
+
+
+def test_customer_support_graph_multimodal_ship_update_missing_fields_blocks_without_delegate(monkeypatch):
+    position = FakeTool("upload_ship_position", lambda args: "不应调用")
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position])
+    monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {
+            "attachment_type": "image",
+            "visible_text": "MMSI:477167800 呼号:VRJQ8 当前吃水:9 m",
+            "visible_features": "电子海图界面，字段不完整",
+            "summary": "仅识别到MMSI和当前吃水",
+            "confidence": "high",
+            "source": "test",
+        },
+    )
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None, config=None):
+            raise AssertionError("ship update preflight guard should not delegate")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-image-update-missing"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["hifleet_ship_service"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [
+                HumanMessage(
+                    content=[
+                        {"type": "image_url", "image_url": {"url": "https://example.com/position.jpg"}},
+                        {"type": "text", "text": "更新船位"},
+                    ]
+                )
+            ],
+            "session_id": "s-image-update-missing",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-image-update-missing"}},
+    )
+
+    assert position.calls == []
+    assert result["route_trace"]["route"] == "ship_update"
+    assert result["generated_tool_calls"] == []
+    assert "更新船位缺少必填字段：经度、纬度、更新时间" in result["messages"][-1].content
+    assert result["route_trace"]["reasoning_trace"]["missing_required_fields"] == ["经度", "纬度", "更新时间"]
+
+
 def test_lightweight_ship_position_troubleshooting_does_not_preflight_update(monkeypatch):
     position = FakeTool("upload_ship_position", lambda args: "不应调用")
     monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position])

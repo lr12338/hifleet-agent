@@ -204,6 +204,33 @@ class ConversationContext:
     last_ship_source: str = ""
 
 
+@dataclass
+class ShipUpdateFieldSpec:
+    name: str
+    required: bool = False
+    write: bool = True
+    labels: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass
+class ShipUpdateParseResult:
+    write_mode: str
+    resolved_identifier: dict[str, str] = field(default_factory=dict)
+    args: dict[str, str] = field(default_factory=dict)
+    field_sources: dict[str, str] = field(default_factory=dict)
+    missing_required_fields: list[str] = field(default_factory=list)
+    format_errors: list[str] = field(default_factory=list)
+    user_message: str = ""
+    needs_confirmation: bool = False
+    parsed_dynamic_fields: dict[str, str] = field(default_factory=dict)
+    parsed_static_fields: dict[str, str] = field(default_factory=dict)
+    instruction_text: str = ""
+    text_fields: dict[str, str] = field(default_factory=dict)
+    attachment_fields: dict[str, str] = field(default_factory=dict)
+    static_fields: list[str] = field(default_factory=list)
+    failure_reason: str = ""
+
+
 def extract_attachments(messages: list[AnyMessage]) -> list[Attachment]:
     attachments: list[Attachment] = []
 
@@ -2936,85 +2963,490 @@ def execute_stats_chain(text: str, entities: MessageEntities, tool_map: dict[str
     return out
 
 
-def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace) -> str:
-    raw_entities = extract_entities(text)
-    used_context_identifier = bool(
-        (entities.mmsi or entities.imo or entities.ship_name)
-        and not (raw_entities.mmsi or raw_entities.imo or raw_entities.ship_name)
-    )
-    if used_context_identifier:
-        trace.fallback_reason = "update_requires_explicit_ship_identifier"
-        trace.check_result = {"entity_resolved": False, "context_identifier_requires_confirmation": True}
-        identifier = entities.mmsi or entities.imo or _clean_ship_name_candidate(entities.ship_name)
-        return f"为避免更新错船，请确认本次要更新的目标船舶标识。当前上下文候选为 {identifier}，请回复 MMSI/IMO/船名并补齐船位参数后我再处理。"
+SHIP_UPDATE_STATIC_FIELD_ORDER = ("ship_name", "imo", "ship_type", "minotype", "length", "width", "dwt", "flag", "callsign", "built_year", "destination", "eta", "draft", "wechatgroup")
+SHIP_UPDATE_STATUS_VALUES = (
+    "机动船在航",
+    "操纵能力受限",
+    "正在捕鱼作业",
+    "帆船在航",
+    "限于吃水",
+    "锚泊",
+    "系泊",
+    "停泊",
+    "搁浅",
+    "失控",
+    "在航",
+    "未知",
+    "未定义",
+    "待定义",
+)
+SHIP_UPDATE_STATIC_INSTRUCTION_PATTERNS = {
+    "ship_name": r"(?:修改|更新|改|补充)\s*(?:船名|name|ship_name)",
+    "callsign": r"(?:修改|更新|改|补充)\s*(?:呼号|callsign)",
+    "ship_type": r"(?:修改|更新|改|补充)\s*(?:船型|ship_type|type)",
+    "length": r"(?:修改|更新|改|补充)\s*(?:船长|length)",
+    "width": r"(?:修改|更新|改|补充)\s*(?:船宽|width)",
+    "dwt": r"(?:修改|更新|改|补充)\s*(?:载重吨|dwt)",
+    "flag": r"(?:修改|更新|改|补充)\s*(?:船旗|flag)",
+    "destination": r"(?:修改|更新|改|补充)\s*(?:目的港|destination)",
+    "eta": r"(?:修改|更新|改|补充)\s*(?:eta|预抵)",
+    "draft": r"(?:修改|更新|改|补充)\s*(?:设计吃水|静态吃水|draft|draught)",
+}
+SHIP_UPDATE_DYNAMIC_FIELD_PATTERNS = {
+    "lon": r"(?:经度|lon|longitude)[:：\s]*([^\s，,；;]+)",
+    "lat": r"(?:纬度|lat|latitude)[:：\s]*([^\s，,；;]+)",
+    "speed": r"(?:航速|speed)[:：\s]*(\d+(?:\.\d+)?)",
+    "heading": r"(?:航首向|船首向|heading)[:：\s]*(\d+(?:\.\d+)?)",
+    "course": r"(?:航迹向|course)[:：\s]*(\d+(?:\.\d+)?)",
+    "draft": r"(?:当前吃水|吃水|draft|draught)[:：\s]*(\d+(?:\.\d+)?)",
+    "destination": r"(?:目的港|destination)[:：\s]*([A-Za-z0-9/_-]{2,40})",
+    "eta": r"(?:ETA|eta|预抵时间|预抵)[:：\s]*(20\d{2}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{1,2}(?::\d{1,2})?)?)",
+    "updatetime": r"(?:更新时间|updatetime)[:：\s]*(20\d{2}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{1,2}(?::\d{1,2})?)?)",
+    "navstatus": r"(?:航行状态|状态|navstatus)[:：\s]*([^\s，,。；;]+)",
+}
+SHIP_UPDATE_DYNAMIC_FIELD_SPECS = (
+    ShipUpdateFieldSpec(name="lon", required=True, labels=("经度",)),
+    ShipUpdateFieldSpec(name="lat", required=True, labels=("纬度",)),
+    ShipUpdateFieldSpec(name="updatetime", required=True, labels=("更新时间",)),
+    ShipUpdateFieldSpec(name="speed", labels=("航速",)),
+    ShipUpdateFieldSpec(name="heading", labels=("船首向", "航首向")),
+    ShipUpdateFieldSpec(name="course", labels=("航迹向",)),
+    ShipUpdateFieldSpec(name="draft", labels=("吃水",)),
+    ShipUpdateFieldSpec(name="navstatus", labels=("航行状态",)),
+    ShipUpdateFieldSpec(name="destination", labels=("目的港",)),
+    ShipUpdateFieldSpec(name="eta", labels=("ETA", "预抵时间")),
+    ShipUpdateFieldSpec(name="ship_name", labels=("船名",)),
+)
+SHIP_UPDATE_DYNAMIC_FIELD_SPEC_MAP = {spec.name: spec for spec in SHIP_UPDATE_DYNAMIC_FIELD_SPECS}
+SHIP_UPDATE_REQUIRED_LABELS = {"mmsi": "MMSI", "lon": "经度", "lat": "纬度", "updatetime": "更新时间"}
+SHIP_UPDATE_STATIC_VALUE_PATTERNS = {
+    "imo": r"(?:IMO|imo)[:：\s]*(\d{7})",
+    "ship_name": r"(?:船名|ship_name|name)[:：\s]*([A-Za-z0-9 ._-]{2,40})",
+    "callsign": r"(?:呼号|callsign)[:：\s]*([A-Za-z0-9]{2,20})",
+    "ship_type": r"(?:船型|ship_type|type)[:：\s]*([A-Za-z\u4e00-\u9fff0-9 _-]{2,40})",
+    "minotype": r"(?:minotype|MinoType)[:：\s]*([A-Za-z0-9_-]{1,20})",
+    "length": r"(?:船长|length)[:：\s]*(\d+(?:\.\d+)?)",
+    "width": r"(?:船宽|width)[:：\s]*(\d+(?:\.\d+)?)",
+    "dwt": r"(?:载重吨|dwt)[:：\s]*(\d+(?:\.\d+)?)",
+    "flag": r"(?:船旗|flag)[:：\s]*([A-Za-z\u4e00-\u9fff _-]{2,30})",
+    "built_year": r"(?:建造年份|建成年份|built_year|buildyear)[:：\s]*(\d{4})",
+    "destination": r"(?:目的港|destination)[:：\s]*([A-Za-z0-9/_-]{2,40})",
+    "eta": r"(?:ETA|eta|预抵时间|预抵)[:：\s]*(20\d{2}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{1,2}(?::\d{1,2})?)?)",
+    "draft": r"(?:设计吃水|静态吃水|draft|draught)[:：\s]*(\d+(?:\.\d+)?)",
+    "wechatgroup": r"(?:微信群|群组|wechatgroup)[:：\s]*([A-Za-z0-9@_-]{4,60})",
+}
 
-    mmsi = entities.mmsi
-    ship_name = _clean_ship_name_candidate(entities.ship_name)
-    if not mmsi and entities.imo and "ship_search" in tool_map:
-        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": entities.imo})
-        mmsi = _parse_unique_mmsi(search)
-        if not mmsi:
-            trace.fallback_reason = "update_imo_not_unique"
-            trace.check_result = {"entity_resolved": False, "imo": entities.imo}
-            candidates = _parse_mmsi_candidates(search)
-            if candidates:
-                return "根据 IMO 未能唯一确认目标船舶。请从候选 MMSI 中确认一个后再更新：" + "、".join(candidates)
-            return "根据 IMO 未能确认目标船舶。请补充 9 位 MMSI 或更准确的船名后再更新。"
-    if not mmsi and ship_name and "ship_search" in tool_map:
-        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": ship_name})
-        mmsi = _parse_unique_mmsi(search)
-        trace.fallback_reason = "update_ship_name_requires_confirmation"
-        trace.check_result = {"entity_resolved": False, "ship_name": ship_name, "requires_confirmation": True}
-        candidates = _parse_mmsi_candidates(search)
-        if mmsi:
-            return f"根据船名匹配到候选船舶 MMSI：{mmsi}。为避免更新错船，请确认是否更新该 MMSI；确认后我再按已识别的船位和更新时间继续更新。"
-        if candidates:
-            return "根据船名未能唯一确认目标船舶。请从候选 MMSI 中确认一个后再更新：" + "、".join(candidates)
-        return "根据船名未能确认目标船舶。请补充 9 位 MMSI、IMO 或更准确的标准船名后再更新。"
-    if not mmsi:
-        trace.fallback_reason = "update_requires_mmsi"
-        trace.check_result = {"entity_resolved": False}
-        return "更新船舶信息需要明确船舶身份标识。请提供 9 位 MMSI、IMO 或唯一船名，并提供经度、纬度、更新时间。"
 
-    lower = text.lower()
-    static_update_requested = (
-        "静态" in lower
-        or "呼号" in lower
-        or "尺度" in lower
-        or "船型" in lower
-        or re.search(r"(?:修改|更新|改|补充)\s*(?:船名|name|ship_name)", text, flags=re.IGNORECASE)
+def _extract_instruction_text_for_ship_update(text: str) -> str:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return ""
+    lines: list[str] = []
+    for raw_line in normalized.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("用户补充："):
+            lines.append(line.removeprefix("用户补充：").strip())
+            continue
+        if line.startswith("语音识别内容："):
+            lines.append(line.removeprefix("语音识别内容：").strip())
+            continue
+        if line.startswith("附件可见特征：") or line.startswith("可见文字："):
+            continue
+        lines.append(line)
+    return normalize_message_text("\n".join(lines))
+
+
+def _clean_update_value(value: str) -> str:
+    cleaned = normalize_message_text(value).strip("，,。；; ")
+    return cleaned
+
+
+def _normalize_update_time_value(value: str) -> str:
+    cleaned = re.sub(r"\([^)]*\)", "", value or "").strip()
+    cleaned = re.sub(r"（[^）]*）", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    match = re.search(r"(20\d{2}-\d{1,2}-\d{1,2})(?:\s+(\d{1,2}:\d{1,2})(?::(\d{1,2}))?)?", cleaned)
+    if not match:
+        return _clean_update_value(cleaned)
+    date_part = match.group(1)
+    hm_part = match.group(2) or "00:00"
+    sec_part = match.group(3) or "00"
+    return f"{date_part} {hm_part}:{sec_part}" if len(hm_part.split(":")) == 2 else f"{date_part} {hm_part}"
+
+
+def _extract_field_by_patterns(text: str, patterns: dict[str, str], *, normalize_time: bool = False) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    normalized = normalize_message_text(text)
+    for key, pattern in patterns.items():
+        matches = list(re.finditer(pattern, normalized, flags=re.IGNORECASE))
+        if not matches:
+            continue
+        value = _clean_update_value(matches[-1].group(1))
+        if not value:
+            continue
+        if normalize_time and key in {"updatetime", "eta"}:
+            value = _normalize_update_time_value(value)
+        parsed[key] = value
+    return parsed
+
+
+def _looks_like_coordinate_value(value: str) -> bool:
+    normalized = _clean_update_value(value)
+    if not normalized:
+        return False
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
+        return True
+    return bool(re.fullmatch(r"\d{1,3}°\s*\d+(?:\.\d+)?[′']?\s*[EWNSewns]", normalized))
+
+
+def _extract_position_pair_from_text(text: str) -> tuple[str, str]:
+    normalized = normalize_message_text(text)
+    match = re.search(
+        r"(?:位置|posn|position)[:：\s]*([0-9]{1,3}°\s*\d+(?:\.\d+)?[′']?\s*[NSns])\s+([0-9]{1,3}°\s*\d+(?:\.\d+)?[′']?\s*[EWew])",
+        normalized,
+        flags=re.IGNORECASE,
     )
-    if static_update_requested:
-        args = {"mmsi": mmsi}
-        ship_name_match = re.search(r"(?:船名|ship_name|name)[:：\s]*([A-Za-z0-9 ._-]{2,40})", text, flags=re.IGNORECASE)
-        if ship_name_match:
-            args["ship_name"] = ship_name_match.group(1).strip()
-        out = _invoke_tool(tool_map, trace, "update_ship_static_info", args)
-    else:
-        args = {"mmsi": mmsi}
-        field_patterns = {
-            "lon": r"(?:经度|lon|longitude)[:：\s]*(-?\d+(?:\.\d+)?)",
-            "lat": r"(?:纬度|lat|latitude)[:：\s]*(-?\d+(?:\.\d+)?)",
-            "speed": r"(?:航速|speed)[:：\s]*(\d+(?:\.\d+)?)",
-            "heading": r"(?:航首向|船首向|航向|heading)[:：\s]*(\d+(?:\.\d+)?)",
-            "course": r"(?:航迹向|course)[:：\s]*(\d+(?:\.\d+)?)",
-            "draft": r"(?:吃水|draft|draught)[:：\s]*(\d+(?:\.\d+)?)",
-        }
-        for key, pattern in field_patterns.items():
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                args[key] = match.group(1)
-        time_match = re.search(r"(?:更新时间|updatetime)[:：\s]*(20\d{2}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{1,2}:\d{1,2})?)", text, flags=re.IGNORECASE)
-        if time_match:
-            args["updatetime"] = time_match.group(1)
-        navstatus_match = re.search(
-            r"(?:航行状态|状态|navstatus)[:：\s]*([^\s，,。；;]+)",
-            text,
-            flags=re.IGNORECASE,
+    if not match:
+        return "", ""
+    return _clean_update_value(match.group(2)), _clean_update_value(match.group(1))
+
+
+def _extract_heading_course_from_text(text: str) -> tuple[str, str]:
+    normalized = normalize_message_text(text)
+    match = re.search(
+        r"(?:船艏/航迹向|船首向/航迹向|heading/course|hdg/cog)[:：\s]*(\d+(?:\.\d+)?)°?\s*/\s*(\d+(?:\.\d+)?)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+    return _clean_update_value(match.group(1)), _clean_update_value(match.group(2))
+
+
+def _extract_speed_from_text(text: str) -> str:
+    normalized = normalize_message_text(text)
+    match = re.search(
+        r"(?:对地/水航速|对地航速|speed|sog)[:：\s]*(\d+(?:\.\d+)?)\s*(?:kn|节)?(?:\s*/\s*\d+(?:\.\d+)?\s*(?:kn|节)?)?",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return _clean_update_value(match.group(1))
+    return ""
+
+
+def _extract_destination_eta_from_text(text: str) -> tuple[str, str]:
+    normalized = normalize_message_text(text)
+    match = re.search(
+        r"(?:目的港/ETA|destination/eta)[:：\s]*([A-Za-z0-9/_-]{2,40})\s*/\s*(20\d{2}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{1,2}(?::\d{1,2})?)?)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+    return _clean_update_value(match.group(1)), _normalize_update_time_value(match.group(2))
+
+
+def _extract_navstatus_from_text(text: str) -> str:
+    normalized = normalize_message_text(text)
+    for status in SHIP_UPDATE_STATUS_VALUES:
+        if status in normalized:
+            return status
+    return ""
+
+
+def _parse_ship_update_attachment_fields(perception: dict[str, Any] | None) -> dict[str, str]:
+    payload = dict(perception or {})
+    source_text = normalize_message_text(
+        "\n".join(
+            part
+            for part in [
+                str(payload.get("visible_text") or ""),
+                str(payload.get("summary") or ""),
+                str(payload.get("visible_features") or ""),
+            ]
+            if str(part or "").strip()
         )
-        if navstatus_match:
-            args["navstatus"] = navstatus_match.group(1).strip()
-        out = _invoke_tool(tool_map, trace, "upload_ship_position", args)
+    )
+    if not source_text:
+        return {}
+    fields = _extract_field_by_patterns(source_text, SHIP_UPDATE_DYNAMIC_FIELD_PATTERNS, normalize_time=True)
+    lon, lat = _extract_position_pair_from_text(source_text)
+    if lon and lat:
+        fields["lon"] = lon
+        fields["lat"] = lat
+    heading, course = _extract_heading_course_from_text(source_text)
+    if heading:
+        fields["heading"] = heading
+    if course:
+        fields["course"] = course
+    speed = _extract_speed_from_text(source_text)
+    if speed:
+        fields["speed"] = speed
+    destination, eta = _extract_destination_eta_from_text(source_text)
+    if destination:
+        fields["destination"] = destination
+    if eta:
+        fields["eta"] = eta
+    navstatus = _extract_navstatus_from_text(source_text)
+    if navstatus:
+        fields["navstatus"] = navstatus
+    fields = {key: value for key, value in fields.items() if value}
+    return fields
+
+
+def _parse_ship_update_text_fields(text: str) -> dict[str, str]:
+    fields = _extract_field_by_patterns(text, SHIP_UPDATE_DYNAMIC_FIELD_PATTERNS, normalize_time=True)
+    if "lon" in fields and not _looks_like_coordinate_value(fields["lon"]):
+        fields.pop("lon", None)
+    if "lat" in fields and not _looks_like_coordinate_value(fields["lat"]):
+        fields.pop("lat", None)
+    return fields
+
+
+def _merge_ship_update_fields(text_fields: dict[str, str], attachment_fields: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    merged = dict(attachment_fields)
+    field_sources = {key: "attachment" for key in attachment_fields}
+    for key, value in text_fields.items():
+        if value:
+            merged[key] = value
+            field_sources[key] = "text"
+    return merged, field_sources
+
+
+def _extract_ship_update_identifier_fields(text: str) -> dict[str, str]:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return {}
+    identifiers: dict[str, str] = {}
+    entities = extract_entities(normalized)
+    if entities.mmsi:
+        identifiers["mmsi"] = entities.mmsi
+    if entities.imo:
+        identifiers["imo"] = entities.imo
+    if entities.ship_name:
+        cleaned_name = _clean_ship_name_candidate(entities.ship_name)
+        if cleaned_name:
+            identifiers["ship_name"] = cleaned_name
+    value_fields = _extract_field_by_patterns(normalized, SHIP_UPDATE_STATIC_VALUE_PATTERNS, normalize_time=True)
+    for key in ("imo", "ship_name"):
+        value = _clean_ship_name_candidate(value_fields.get(key, "")) if key == "ship_name" else _clean_update_value(value_fields.get(key, ""))
+        if value:
+            identifiers[key] = value
+    mmsi_match = re.search(r"(?:MMSI[:：\s]*)?(\d{9})", normalized, flags=re.IGNORECASE)
+    if mmsi_match:
+        identifiers["mmsi"] = mmsi_match.group(1)
+    return identifiers
+
+
+def _ship_update_missing_required_fields(identifier: dict[str, str], fields: dict[str, str]) -> list[str]:
+    required_values = {
+        "mmsi": identifier.get("mmsi", ""),
+        "lon": fields.get("lon", ""),
+        "lat": fields.get("lat", ""),
+        "updatetime": fields.get("updatetime", ""),
+    }
+    missing: list[str] = []
+    for key in ("mmsi", "lon", "lat", "updatetime"):
+        if not str(required_values.get(key) or "").strip():
+            missing.append(SHIP_UPDATE_REQUIRED_LABELS[key])
+    return missing
+
+
+def _build_dynamic_update_args(identifier: dict[str, str], fields: dict[str, str]) -> dict[str, str]:
+    args = {"mmsi": identifier["mmsi"]}
+    for spec in SHIP_UPDATE_DYNAMIC_FIELD_SPECS:
+        if not spec.write:
+            continue
+        value = _clean_update_value(fields.get(spec.name, ""))
+        if value:
+            args[spec.name] = value
+    return args
+
+
+def _write_enabled_dynamic_fields() -> tuple[str, ...]:
+    return tuple(spec.name for spec in SHIP_UPDATE_DYNAMIC_FIELD_SPECS if spec.write)
+
+
+def _resolve_ship_update_identifier(
+    identifiers: dict[str, str],
+    tool_map: dict[str, Any],
+    trace: HarnessTrace,
+) -> tuple[dict[str, str], str, bool, str]:
+    resolved = {
+        "mmsi": _clean_update_value(identifiers.get("mmsi", "")),
+        "imo": _clean_update_value(identifiers.get("imo", "")),
+        "ship_name": _clean_ship_name_candidate(identifiers.get("ship_name", "")),
+    }
+    if resolved["mmsi"]:
+        return resolved, "", False, ""
+    if resolved["imo"] and "ship_search" in tool_map:
+        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": resolved["imo"]})
+        resolved_mmsi = _parse_unique_mmsi(search)
+        if resolved_mmsi:
+            resolved["mmsi"] = resolved_mmsi
+            return resolved, "", False, ""
+        candidates = _parse_mmsi_candidates(search)
+        if candidates:
+            return (
+                resolved,
+                "根据 IMO 未能唯一确认目标船舶。请从候选 MMSI 中确认一个后再更新：" + "、".join(candidates),
+                True,
+                "update_imo_not_unique",
+            )
+        return (
+            resolved,
+            "根据 IMO 未能确认目标船舶。请补充 9 位 MMSI 或更准确的船名后再更新。",
+            True,
+            "update_imo_not_unique",
+        )
+    if resolved["ship_name"] and "ship_search" in tool_map:
+        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": resolved["ship_name"]})
+        resolved_mmsi = _parse_unique_mmsi(search)
+        candidates = _parse_mmsi_candidates(search)
+        if resolved_mmsi:
+            return (
+                {**resolved, "mmsi": resolved_mmsi},
+                f"根据船名匹配到候选船舶 MMSI：{resolved_mmsi}。为避免更新错船，请确认是否更新该 MMSI；确认后我再按已识别的船位和更新时间继续更新。",
+                True,
+                "update_ship_name_requires_confirmation",
+            )
+        if candidates:
+            return (
+                resolved,
+                "根据船名未能唯一确认目标船舶。请从候选 MMSI 中确认一个后再更新：" + "、".join(candidates),
+                True,
+                "update_ship_name_requires_confirmation",
+            )
+        return (
+            resolved,
+            "根据船名未能确认目标船舶。请补充 9 位 MMSI、IMO 或更准确的标准船名后再更新。",
+            True,
+            "update_ship_name_requires_confirmation",
+        )
+    return resolved, "", False, ""
+
+
+def parse_ship_update_request(
+    text: str,
+    entities: MessageEntities,
+    tool_map: dict[str, Any],
+    trace: HarnessTrace,
+    perception: dict[str, Any] | None = None,
+) -> ShipUpdateParseResult:
+    _ = entities  # Compatibility placeholder; parsing intentionally uses current-turn raw text + perception only.
+    instruction_text = _extract_instruction_text_for_ship_update(text)
+    text_fields = _parse_ship_update_text_fields(instruction_text)
+    attachment_fields = _parse_ship_update_attachment_fields(perception)
+    merged_fields, field_sources = _merge_ship_update_fields(text_fields, attachment_fields)
+    text_identifiers = _extract_ship_update_identifier_fields(instruction_text)
+    attachment_identifiers = _extract_ship_update_identifier_fields(
+        normalize_message_text(
+            "\n".join(
+                part
+                for part in [
+                    str((perception or {}).get("visible_text") or ""),
+                    str((perception or {}).get("summary") or ""),
+                ]
+                if str(part or "").strip()
+            )
+        )
+    )
+    identifiers = dict(attachment_identifiers)
+    identifiers.update({key: value for key, value in text_identifiers.items() if value})
+    static_update_requested, static_fields = _static_update_requested(instruction_text)
+    write_mode = "static" if static_update_requested else "dynamic"
+    resolved_identifier, identifier_message, needs_confirmation, identifier_failure_reason = _resolve_ship_update_identifier(identifiers, tool_map, trace)
+    parse_result = ShipUpdateParseResult(
+        write_mode=write_mode,
+        resolved_identifier=resolved_identifier,
+        field_sources=field_sources,
+        instruction_text=instruction_text,
+        parsed_dynamic_fields=dict(merged_fields),
+        text_fields=text_fields,
+        attachment_fields=attachment_fields,
+        static_fields=static_fields,
+        failure_reason=identifier_failure_reason,
+    )
+    if write_mode == "static":
+        if not resolved_identifier.get("mmsi"):
+            parse_result.missing_required_fields = ["MMSI"]
+            parse_result.user_message = identifier_message or "更新船舶信息需要明确船舶身份标识。请提供 9 位 MMSI、IMO 或唯一船名。"
+            parse_result.needs_confirmation = needs_confirmation
+            if not parse_result.failure_reason:
+                parse_result.failure_reason = "update_requires_mmsi"
+            return parse_result
+        parse_result.parsed_static_fields = _extract_field_by_patterns(instruction_text, SHIP_UPDATE_STATIC_VALUE_PATTERNS, normalize_time=True)
+        parse_result.args = _extract_static_update_args(instruction_text, mmsi=resolved_identifier["mmsi"])
+        return parse_result
+    if identifier_message:
+        parse_result.user_message = identifier_message
+        parse_result.needs_confirmation = needs_confirmation
+        if not parse_result.failure_reason:
+            parse_result.failure_reason = "update_requires_mmsi"
+        return parse_result
+    missing_required = _ship_update_missing_required_fields(resolved_identifier, merged_fields)
+    parse_result.missing_required_fields = missing_required
+    if missing_required:
+        parse_result.user_message = "更新船位缺少必填字段：" + "、".join(missing_required) + "。请补充后我再更新；当前仅会按本轮明确提供的信息写入。"
+        parse_result.failure_reason = "update_missing_required_fields"
+        return parse_result
+    parse_result.args = _build_dynamic_update_args(resolved_identifier, merged_fields)
+    return parse_result
+
+
+def _extract_static_update_args(instruction_text: str, *, mmsi: str) -> dict[str, str]:
+    args = {"mmsi": mmsi}
+    parsed = _extract_field_by_patterns(instruction_text, SHIP_UPDATE_STATIC_VALUE_PATTERNS, normalize_time=True)
+    if "draft" in parsed:
+        parsed["draft"] = parsed["draft"]
+    for key in SHIP_UPDATE_STATIC_FIELD_ORDER:
+        value = parsed.get(key, "")
+        if value:
+            args[key] = value
+    return args
+
+
+def _static_update_requested(instruction_text: str) -> tuple[bool, list[str]]:
+    normalized = normalize_message_text(instruction_text)
+    matched_fields: list[str] = []
+    if "静态信息" in normalized or "静态" in normalized:
+        return True, ["static_info"]
+    for field, pattern in SHIP_UPDATE_STATIC_INSTRUCTION_PATTERNS.items():
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
+            matched_fields.append(field)
+    return bool(matched_fields), matched_fields
+
+
+def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace, perception: dict[str, Any] | None = None) -> str:
+    parse_result = parse_ship_update_request(text, entities, tool_map, trace, perception=perception)
+    trace.reasoning_trace = {
+        **dict(trace.reasoning_trace or {}),
+        "instruction_text": parse_result.instruction_text,
+        "parsed_dynamic_fields": dict(parse_result.parsed_dynamic_fields),
+        "parsed_static_fields": dict(parse_result.parsed_static_fields),
+        "field_sources": dict(parse_result.field_sources),
+        "missing_required_fields": list(parse_result.missing_required_fields),
+        "format_errors": list(parse_result.format_errors),
+        "write_mode": parse_result.write_mode,
+        "resolved_identifier": dict(parse_result.resolved_identifier),
+        "write_args": dict(parse_result.args),
+        "static_fields": list(parse_result.static_fields),
+    }
+    if parse_result.user_message:
+        trace.fallback_reason = parse_result.failure_reason
+        trace.check_result = {
+            "entity_resolved": bool(parse_result.resolved_identifier.get("mmsi")),
+            "missing_required_fields": list(parse_result.missing_required_fields),
+            "needs_confirmation": parse_result.needs_confirmation,
+        }
+        return parse_result.user_message
+    if parse_result.write_mode == "static":
+        out = _invoke_tool(tool_map, trace, "update_ship_static_info", parse_result.args)
+    else:
+        out = _invoke_tool(tool_map, trace, "upload_ship_position", parse_result.args)
     trace.check_result = {"entity_resolved": True, "write_result": "成功" in out or "更新成功" in out}
     trace.answer_confidence = "high" if trace.check_result["write_result"] else "medium"
     return out

@@ -100,6 +100,21 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 - 同一个 `session_id` 上的并发请求建议串行化，避免上下文竞争。
 - 长度建议不超过 128，字符建议使用字母、数字、`-`、`_`、`:`。
 
+上下文清理：
+
+- 软清理：直接更换新的 `session_id`，下一轮会按新会话开始。
+- 硬清理：在服务机器上执行 `scripts/clear_session_context.py`，按 `session_id` 删除持久化记忆和关联观测记录。
+- 脚本会自动补删内部 `:standard_agent` 子线程，不需要手工拼接。
+
+```bash
+cd /home/ecs-user/coze_ai
+.venv/bin/python scripts/clear_session_context.py --dry-run \
+  'websdk:tenant_a:u_10086:c_20260610_0001'
+
+.venv/bin/python scripts/clear_session_context.py \
+  'websdk:tenant_a:u_10086:c_20260610_0001'
+```
+
 ## 5. 客服调用示例
 
 ```json

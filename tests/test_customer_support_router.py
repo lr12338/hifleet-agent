@@ -26,6 +26,7 @@ from agents.customer_support_router import (
     execute_multimodal_chain,
     execute_simple_ship_chain,
     execute_update_chain,
+    parse_ship_update_request,
     format_unverified_chart_symbol_answer,
     format_verified_chart_symbol_answer,
     extract_attachments,
@@ -857,6 +858,50 @@ def test_update_chain_ship_name_unique_match_requires_confirmation():
     assert "414726000" in output
 
 
+def test_parse_ship_update_request_current_log_shape_includes_all_dynamic_args():
+    entities = extract_entities("更新船位")
+    trace = make_trace(classify_message("更新船位", entities), entities)
+    perception = {
+        "attachment_type": "image",
+        "summary": "该界面为船舶信息查询页面，展示船舶当前航程及AIS相关信息。",
+        "visible_text": (
+            "海丰海防、集装箱、<2999TEU、当前、轨迹、历史、MMSI:477167800、IMO:9261384、"
+            "呼号:VRJQ8、AIS船名:SITC HAIPHONG、机动船在航、"
+            "目的港/ETA:VNSGN/2026-07-03 09:00 (UTC)、位置:13°34.132'N 109°57.89'E、"
+            "船艏/航迹向:204°/207°、对地/水航速:13.1 kn/13 kn、当前吃水:9 m、"
+            "更新时间:2026-07-02 12:43 (UTC+8)"
+        ),
+        "visible_features": "电子海图界面，右侧为航行参数面板",
+        "confidence": "high",
+    }
+
+    result = parse_ship_update_request(
+        "附件可见特征：电子海图界面\n可见文字：MMSI:477167800\n用户补充：更新船位",
+        entities,
+        {},
+        trace,
+        perception=perception,
+    )
+
+    assert result.write_mode == "dynamic"
+    assert result.missing_required_fields == []
+    assert result.args == {
+        "mmsi": "477167800",
+        "lon": "109°57.89'E",
+        "lat": "13°34.132'N",
+        "updatetime": "2026-07-02 12:43:00",
+        "speed": "13.1",
+        "heading": "204",
+        "course": "207",
+        "draft": "9",
+        "navstatus": "机动船在航",
+        "destination": "VNSGN",
+        "eta": "2026-07-03 09:00:00",
+    }
+    assert result.field_sources["lon"] == "attachment"
+    assert result.field_sources["updatetime"] == "attachment"
+
+
 def test_update_chain_ship_name_multiple_matches_asks_for_mmsi():
     search = FakeTool("ship_search", lambda args: "A MMSI: 111111111\nB MMSI: 222222222")
     upload = FakeTool("upload_ship_position", lambda args: "不应调用")
@@ -921,7 +966,7 @@ def test_update_chain_does_not_reuse_history_for_bare_update():
     assert "需要明确船舶身份标识" in output
 
 
-def test_update_chain_requires_confirmation_for_context_ship_reference():
+def test_update_chain_context_reference_does_not_reuse_history_identifier():
     messages = [
         HumanMessage(content="查询 MMSI 352002867 船位"),
         AIMessage(content="MMSI: 352002867\n船位查询完成"),
@@ -940,8 +985,8 @@ def test_update_chain_requires_confirmation_for_context_ship_reference():
 
     assert entities.mmsi == "352002867"
     assert upload.calls == []
-    assert "请确认本次要更新的目标船舶标识" in output
-    assert trace.fallback_reason == "update_requires_explicit_ship_identifier"
+    assert "需要明确船舶身份标识" in output
+    assert trace.fallback_reason == "update_requires_mmsi"
 
 
 def test_update_chain_asks_one_key_question_when_mmsi_missing():
@@ -954,6 +999,187 @@ def test_update_chain_asks_one_key_question_when_mmsi_missing():
 
     assert "请提供 9 位 MMSI" in output
     assert trace.fallback_reason == "update_requires_mmsi"
+
+
+def test_update_chain_prefers_dynamic_fields_from_multimodal_perception():
+    upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']} lon={args['lon']} lat={args['lat']}")
+    static_update = FakeTool("update_ship_static_info", lambda args: "不应调用")
+    text = (
+        "附件可见特征：页面顶部有带白色星形图案的红色方形标识。\n"
+        "可见文字：海丰海防、集装箱、<2999TEU、当前、轨迹、历史、"
+        "MMSI:477167800、IMO:9261384、呼号:VRJQ8、AIS船名:SITC HAIPHONG、机动船在航、"
+        "目的港/ETA:VNSGN/2026-07-03 09:00 (UTC)、位置:13°34.132'N 109°57.89'E、"
+        "船艏/航迹向:204°/207°、对地/水航速:13.1 kn/13 kn、当前吃水:9 m、"
+        "更新时间:2026-07-02 12:43 (UTC+8)\n"
+        "用户补充：更新船位"
+    )
+    perception = {
+        "attachment_type": "image",
+        "summary": "该界面为船舶信息查询页面，展示船舶当前航程及AIS相关信息。",
+        "visible_text": (
+            "海丰海防、集装箱、<2999TEU、当前、轨迹、历史、MMSI:477167800、IMO:9261384、"
+            "呼号:VRJQ8、AIS船名:SITC HAIPHONG、机动船在航、"
+            "目的港/ETA:VNSGN/2026-07-03 09:00 (UTC)、位置:13°34.132'N 109°57.89'E、"
+            "船艏/航迹向:204°/207°、对地/水航速:13.1 kn/13 kn、当前吃水:9 m、"
+            "更新时间:2026-07-02 12:43 (UTC+8)"
+        ),
+        "visible_features": "电子海图界面，右侧为航行参数面板",
+        "confidence": "high",
+    }
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(
+        text,
+        entities,
+        {"upload_ship_position": upload, "update_ship_static_info": static_update},
+        trace,
+        perception=perception,
+    )
+
+    assert "更新成功" in output
+    assert static_update.calls == []
+    assert upload.calls == [
+        {
+            "mmsi": "477167800",
+            "lon": "109°57.89'E",
+            "lat": "13°34.132'N",
+            "speed": "13.1",
+            "heading": "204",
+            "course": "207",
+            "draft": "9",
+            "navstatus": "机动船在航",
+            "destination": "VNSGN",
+            "eta": "2026-07-03 09:00:00",
+            "updatetime": "2026-07-02 12:43:00",
+        }
+    ]
+    assert trace.reasoning_trace["write_mode"] == "dynamic"
+    assert trace.reasoning_trace["field_sources"]["lon"] == "attachment"
+    assert trace.reasoning_trace["missing_required_fields"] == []
+    assert trace.reasoning_trace["write_args"]["updatetime"] == "2026-07-02 12:43:00"
+
+
+def test_update_chain_multimodal_does_not_switch_to_static_when_image_contains_static_words():
+    upload = FakeTool("upload_ship_position", lambda args: "更新成功")
+    static_update = FakeTool("update_ship_static_info", lambda args: "不应调用")
+    text = "可见文字：MMSI:477167800、呼号:VRJQ8、AIS船名:SITC HAIPHONG、位置:13°34.132'N 109°57.89'E、更新时间:2026-07-02 12:43 (UTC+8)\n用户补充：更新船位"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(
+        text,
+        entities,
+        {"upload_ship_position": upload, "update_ship_static_info": static_update},
+        trace,
+        perception={"visible_text": "MMSI:477167800 呼号:VRJQ8 AIS船名:SITC HAIPHONG 位置:13°34.132'N 109°57.89'E 更新时间:2026-07-02 12:43 (UTC+8)", "confidence": "high"},
+    )
+
+    assert "更新成功" in output
+    assert len(upload.calls) == 1
+    assert static_update.calls == []
+    assert trace.reasoning_trace["write_mode"] == "dynamic"
+
+
+def test_update_chain_multimodal_missing_required_fields_blocks_write():
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    text = "可见文字：MMSI:477167800、呼号:VRJQ8、当前吃水:9 m\n用户补充：更新船位"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(
+        text,
+        entities,
+        {"upload_ship_position": upload},
+        trace,
+        perception={"visible_text": "MMSI:477167800 呼号:VRJQ8 当前吃水:9 m", "confidence": "high"},
+    )
+
+    assert upload.calls == []
+    assert "更新船位缺少必填字段：经度、纬度、更新时间" in output
+    assert trace.fallback_reason == "update_missing_required_fields"
+    assert trace.reasoning_trace["missing_required_fields"] == ["经度", "纬度", "更新时间"]
+
+
+def test_update_chain_explicit_static_update_still_calls_static_tool():
+    static_update = FakeTool("update_ship_static_info", lambda args: f"静态更新成功 MMSI={args['mmsi']} ship_name={args['ship_name']}")
+    text = "请更新船名 MMSI 477167800 船名 SITC HAIPHONG"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(
+        text,
+        entities,
+        {"update_ship_static_info": static_update},
+        trace,
+    )
+
+    assert "静态更新成功" in output
+    assert static_update.calls == [{"mmsi": "477167800", "ship_name": "SITC HAIPHONG"}]
+    assert trace.reasoning_trace["write_mode"] == "static"
+
+
+def test_parse_ship_update_request_ship_name_search_needs_confirmation_even_if_unique():
+    search = FakeTool("ship_search", lambda args: "YU MING\nMMSI: 414726000 | IMO: 9613886")
+    text = "请更新船位 船名 YU MING 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    result = parse_ship_update_request(
+        text,
+        entities,
+        {"ship_search": search},
+        trace,
+    )
+
+    assert search.calls == [{"keyword": "YU MING"}]
+    assert result.needs_confirmation is True
+    assert result.user_message
+    assert "请确认是否更新该 MMSI" in result.user_message
+    assert result.args == {}
+
+
+def test_parse_ship_update_request_imo_search_resolves_mmsi_once():
+    search = FakeTool("ship_search", lambda args: "IMO: 9613886\nMMSI: 414726000")
+    text = "请更新船位 IMO 9613886 经度 121.4737 纬度 31.2304 更新时间 2026-06-15 10:20:30"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    result = parse_ship_update_request(
+        text,
+        entities,
+        {"ship_search": search},
+        trace,
+    )
+
+    assert search.calls == [{"keyword": "9613886"}]
+    assert result.resolved_identifier["mmsi"] == "414726000"
+    assert result.args["mmsi"] == "414726000"
+
+
+def test_parse_ship_update_request_write_args_cover_all_write_enabled_dynamic_fields():
+    entities = extract_entities("更新船位")
+    trace = make_trace(classify_message("更新船位", entities), entities)
+    perception = {
+        "visible_text": (
+            "MMSI:477167800 机动船在航 目的港/ETA:VNSGN/2026-07-03 09:00 (UTC) "
+            "位置:13°34.132'N 109°57.89'E 船艏/航迹向:204°/207° "
+            "对地/水航速:13.1 kn/13 kn 当前吃水:9 m 更新时间:2026-07-02 12:43 (UTC+8)"
+        ),
+        "confidence": "high",
+    }
+
+    result = parse_ship_update_request(
+        "用户补充：更新船位",
+        extract_entities("更新船位"),
+        {},
+        trace,
+        perception=perception,
+    )
+
+    for field_name in ("lon", "lat", "updatetime", "speed", "heading", "course", "draft", "navstatus", "destination", "eta"):
+        assert result.args[field_name] == result.parsed_dynamic_fields[field_name]
+    assert result.args["updatetime"] == "2026-07-02 12:43:00"
 
 
 def test_context_memory_summary_does_not_route_to_search():

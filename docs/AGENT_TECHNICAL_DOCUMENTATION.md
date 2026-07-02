@@ -243,6 +243,31 @@ flowchart TD
 - 当前不再插入自定义“历史上下文摘要”系统消息；完整文本历史交给 LangGraph/checkpointer 和底层 agent 处理。
 - 历史多模态 `HumanMessage` 只做安全脱敏，避免旧音频、图片、视频 URL 在后续轮次重复发送；最新一轮多模态内容保持原样进入 perception。
 
+清理策略：
+
+- 如果只是想让下一轮不继承旧上下文，最简单的方式是直接更换新的 `session_id`。
+- 如果需要按 `session_id` 硬删除持久化上下文，可使用 `scripts/clear_session_context.py`；脚本会同时清理主会话和内部 `:standard_agent` 子线程。
+- 当前脚本会删除 `memory.checkpoints`、`memory.checkpoint_blobs`、`memory.checkpoint_writes`，以及对应 `observability` 会话记录。
+
+推荐命令：
+
+```bash
+cd /home/ecs-user/coze_ai
+.venv/bin/python scripts/clear_session_context.py --dry-run \
+  'wechat_kf:hifleet:openid_xxx:c_default'
+
+.venv/bin/python scripts/clear_session_context.py \
+  'wechat_kf:hifleet:openid_xxx:c_default'
+```
+
+如果只想清理 LangGraph 记忆、不删除观测日志：
+
+```bash
+cd /home/ecs-user/coze_ai
+.venv/bin/python scripts/clear_session_context.py --memory-only \
+  'wechat_kf:hifleet:openid_xxx:c_default'
+```
+
 ## 9. 观测字段
 
 排障时优先看：
