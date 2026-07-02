@@ -30,6 +30,43 @@ from skills.common.tool_result import ToolResult, emit_tool_metric
 
 logger = logging.getLogger(__name__)
 
+SHIP_TYPE_CATALOG = (
+    "散货船",
+    "杂货船",
+    "集装箱船",
+    "石油化学品船",
+    "油船",
+    "滚装船",
+    "气槽船",
+    "工程及服务船",
+    "客船",
+    "拖轮",
+    "拖带船",
+    "专用船",
+    "近海作业船",
+    "近海供应船",
+    "游艇",
+    "渔船",
+    "干散液散兼用船",
+    "其他类型液货船",
+    "其他类型干货船",
+    "其他",
+)
+SHIP_TYPE_CATALOG_SET = set(SHIP_TYPE_CATALOG)
+
+
+def _normalize_ship_type_value(value: str) -> str:
+    normalized = str(value or "").replace("\u3000", " ").strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _ship_type_confirmation_hint(invalid_value: str = "") -> str:
+    catalog = "、".join(SHIP_TYPE_CATALOG)
+    if invalid_value:
+        return f"船舶类型“{invalid_value}”不在支持目录内。请从以下标准船型中确认后重试：{catalog}"
+    return f"船舶类型仅支持以下标准目录，请确认后重试：{catalog}"
+
 
 def _emit_result(tool_name: str, ctx, result: ToolResult):
     run_id = getattr(ctx, "run_id", "")
@@ -1242,6 +1279,9 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
     try:
         ctx = request_context.get() or new_context(method="update_ship_static_info")
         _ensure_imports()
+        normalized_ship_type = _normalize_ship_type_value(ship_type)
+        normalized_minotype = _normalize_ship_type_value(minotype)
+        ship_type_warning = ""
 
         # 构造请求体 - 静态信息更新只需要 mmsi + bindCheck
         data = {
@@ -1255,8 +1295,6 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
         str_field_map = {
             "name": ship_name,       # ship_name → name
             "imonumber": imo,        # imo → imonumber
-            "type": ship_type,       # ship_type → type
-            "minotype": minotype,    # minotype 与API一致
             "flag": flag,
             "callsign": callsign,
             "destination": destination,
@@ -1266,6 +1304,19 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
         for api_key, val in str_field_map.items():
             if val:
                 data[api_key] = val
+        if normalized_ship_type or normalized_minotype:
+            if normalized_ship_type and normalized_minotype and normalized_ship_type != normalized_minotype:
+                ship_type_warning = (
+                    f"船舶类型字段存在冲突：ship_type=“{normalized_ship_type}”，minotype=“{normalized_minotype}”。"
+                    " 本次未更新船舶类型，请确认标准船型后重试。"
+                )
+            else:
+                candidate_ship_type = normalized_ship_type or normalized_minotype
+                if candidate_ship_type in SHIP_TYPE_CATALOG_SET:
+                    data["type"] = candidate_ship_type
+                    data["minotype"] = candidate_ship_type
+                else:
+                    ship_type_warning = _ship_type_confirmation_hint(candidate_ship_type) + " 本次未更新船舶类型。"
 
         # 数值字段（部分需要映射API字段名）
         num_field_map = {
@@ -1286,7 +1337,7 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
         # 检查是否有实质性更新数据
         update_fields = [k for k in data if k not in ("mmsi", "bindCheck")]
         if not update_fields:
-            output = "未提供任何可更新的数据，请至少提供一个更新字段。"
+            output = ship_type_warning or "未提供任何可更新的数据，请至少提供一个更新字段。"
             _emit_result(
                 "update_ship_static_info",
                 ctx,
@@ -1328,6 +1379,8 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
                 status = str(parsed.get("status", ""))
                 if status in ("0", "1"):
                     output = f"静态信息更新成功！\nMMSI: {mmsi}\n更新字段: {', '.join(update_fields)}"
+                    if ship_type_warning:
+                        output += f"\n{ship_type_warning}"
                     _emit_result(
                         "update_ship_static_info",
                         ctx,
@@ -1345,6 +1398,8 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
                 # 纯文本响应
                 if "成功" in result:
                     output = f"静态信息更新成功！\nMMSI: {mmsi}\n更新字段: {', '.join(update_fields)}"
+                    if ship_type_warning:
+                        output += f"\n{ship_type_warning}"
                     _emit_result(
                         "update_ship_static_info",
                         ctx,

@@ -842,6 +842,95 @@ def test_update_chain_executes_with_minimum_position_fields():
     assert "更新成功" in output
 
 
+def test_update_chain_uses_understanding_position_params_for_dash_coordinates():
+    upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']} lon={args['lon']} lat={args['lat']}")
+    text = "更新船位，船名：友好3，MMSI：413341920，更新时间 2026-07-01 21:27，位置：17-56.73N 115-47.69E，航速8.9节，航向120度"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+    understanding = {
+        "position_update_params": {
+            "mmsi": "413341920",
+            "ship_name": "友好3",
+            "lat": "17-56.73N",
+            "lon": "115-47.69E",
+            "updatetime": "2026-07-01 21:27",
+            "speed": "8.9",
+            "heading": "120",
+        }
+    }
+
+    output = execute_update_chain(text, entities, {"upload_ship_position": upload}, trace, understanding_result=understanding)
+
+    assert upload.calls == [
+        {
+            "mmsi": "413341920",
+            "ship_name": "友好3",
+            "lon": "115-47.69E",
+            "lat": "17-56.73N",
+            "speed": "8.9",
+            "heading": "120",
+            "updatetime": "2026-07-01 21:27",
+        }
+    ]
+    assert "更新成功" in output
+
+
+def test_update_chain_fallback_extracts_position_pair_when_understanding_missing():
+    upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']} lon={args['lon']} lat={args['lat']}")
+    text = "更新船位，MMSI：413341920，更新时间 2026-07-01 21:27，位置：17-56.73N 115-47.69E，航速8.9节，航向120度"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"upload_ship_position": upload}, trace)
+
+    assert upload.calls[0]["lon"] == "115-47.69E"
+    assert upload.calls[0]["lat"] == "17-56.73N"
+    assert "更新成功" in output
+
+
+def test_update_chain_uses_static_understanding_params():
+    update_static = FakeTool("update_ship_static_info", lambda args: f"静态更新成功 MMSI={args['mmsi']}")
+    text = "更新船舶静态信息，MMSI：613003594，目的港：RUPRI，ETA：2026-06-24 09:00:00，吃水：8.2"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+    understanding = {
+        "static_update_params": {
+            "mmsi": "613003594",
+            "destination": "RUPRI",
+            "eta": "2026-06-24 09:00:00",
+            "draft": "8.2",
+        }
+    }
+
+    output = execute_update_chain(text, entities, {"update_ship_static_info": update_static, "upload_ship_position": FakeTool("upload_ship_position", lambda args: "不应调用")}, trace, understanding_result=understanding)
+
+    assert update_static.calls == [
+        {"mmsi": "613003594", "destination": "RUPRI", "eta": "2026-06-24 09:00:00", "draft": "8.2"}
+    ]
+    assert "静态更新成功" in output
+
+
+def test_update_chain_static_ship_type_minotype_conflict_not_submitted():
+    update_static = FakeTool("update_ship_static_info", lambda args: f"静态更新成功 fields={','.join(sorted(args))}")
+    text = "更新静态信息 MMSI 414726000 ship_type=散货船 minotype=油船 目的港 NINGBO"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+    understanding = {
+        "static_update_params": {
+            "mmsi": "414726000",
+            "ship_type": "散货船",
+            "minotype": "油船",
+            "destination": "NINGBO",
+        }
+    }
+
+    output = execute_update_chain(text, entities, {"update_ship_static_info": update_static}, trace, understanding_result=understanding)
+
+    assert update_static.calls == [{"mmsi": "414726000", "destination": "NINGBO"}]
+    assert "静态更新成功" in output
+    assert trace.reasoning_trace["update_params"]["low_confidence_fields"]
+
+
 def test_update_chain_ship_name_unique_match_requires_confirmation():
     search = FakeTool("ship_search", lambda args: "YU MING\nMMSI: 414726000 | IMO: 9613886")
     upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']}")

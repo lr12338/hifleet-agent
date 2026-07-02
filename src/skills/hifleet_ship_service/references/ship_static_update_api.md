@@ -25,7 +25,7 @@
 | imonumber | 否 | string | IMO 编号 |
 | callsign | 否 | string | 呼号 |
 | type | 否 | string | 船型描述（如"散货船"、"渔船"）|
-| minotype | 否 | string | 船舶子类型（船舶详情显示的是该字段）|
+| minotype | 否 | string | 船舶子类型（船舶详情显示的是该字段；本地工具要求与 type 同步）|
 | width | 否 | string | **船宽**（米）⚠️ API文档描述误写为"船长"，实际为船宽 |
 | length | 否 | string | **船长**（米）⚠️ API文档描述误写为"船宽"，实际为船长 |
 | dwt | 否 | string | 载重吨 |
@@ -65,11 +65,13 @@
 |-----------|------------|------|
 | ship_name | name | 船名（英文）|
 | imo | imonumber | IMO编号 |
-| ship_type | type | 船型 |
+| ship_type | type | 船型；若传船舶类型，本地工具会同步写入 type 和 minotype |
 | built_year | buildyear | 建造年份 |
 | draft | draught | 吃水 ⚠️ 与船位上传API不同 |
 | callsign | callsign | 呼号 |
-| minotype | minotype | MINO船型代码 |
+| minotype | minotype | MINO船型代码；本地工具不建议单独更新，默认与 ship_type 同步 |
+
+> 本地工具额外规则：船舶类型仅支持标准目录值；目录外输入不会直接写入，会要求用户确认后再更新。
 | wechatgroup | wechatgroup | 微信群组 |
 | destination | destination | 目的港 |
 | eta | eta | 预抵时间 |

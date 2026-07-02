@@ -117,6 +117,39 @@ HIFLEET_PERMISSION_QUERY_MARKERS = {"历史轨迹", "轨迹", "气象预报", "�
 HIFLEET_POSITION_DISPLAY_MARKERS = {"船位", "最新船位", "实时船位", "位置", "不更新", "看不到最新"}
 GENERIC_CONTEXT_TOKENS = {"如何", "怎么", "怎样", "为什么", "步骤", "查询"}
 SHIP_UPDATE_CONTEXT_REFERENCE_MARKERS = {"这艘船", "该船", "此船", "这个船", "上一艘", "上一条船", "刚才查的船", "刚刚查的船"}
+POSITION_UPDATE_PARAM_KEYS = (
+    "mmsi",
+    "imo",
+    "ship_name",
+    "lon",
+    "lat",
+    "updatetime",
+    "speed",
+    "heading",
+    "course",
+    "draft",
+    "navstatus",
+    "destination",
+    "eta",
+    "wechatgroup",
+)
+STATIC_UPDATE_PARAM_KEYS = (
+    "mmsi",
+    "imo",
+    "ship_name",
+    "ship_type",
+    "minotype",
+    "length",
+    "width",
+    "dwt",
+    "flag",
+    "callsign",
+    "built_year",
+    "destination",
+    "eta",
+    "draft",
+    "wechatgroup",
+)
 T1_EVAL_PROMPT = """你是 HiFleet 客服检索评估器。
 只根据用户问题和 T1 检索结果，判断当前证据是否足够直接回答，还是必须升级到浏览器深挖。
 只返回 JSON，不要输出解释性文本。
@@ -2936,8 +2969,81 @@ def execute_stats_chain(text: str, entities: MessageEntities, tool_map: dict[str
     return out
 
 
-def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace) -> str:
+def _clean_update_param_group(raw: Any, allowed_keys: tuple[str, ...]) -> dict[str, str]:
+    source = raw if isinstance(raw, dict) else {}
+    params: dict[str, str] = {}
+    for key in allowed_keys:
+        value = source.get(key, "")
+        if isinstance(value, (dict, list, tuple, set)):
+            value = ""
+        params[key] = re.sub(r"\s+", " ", str(value or "").strip())
+    return params
+
+
+def _coord_token_pattern() -> str:
+    return r"\d{1,3}(?:[°]\s*\d+(?:\.\d+)?[′']?|\s*[-–—]\s*\d+(?:\.\d+)?|\.\d+)?\s*[NSEWnsew]"
+
+
+def _extract_position_pair(text: str) -> tuple[str, str]:
+    coord_re = _coord_token_pattern()
+    match = re.search(
+        rf"(?:位置|坐标|posn|position)[:：\s]*({coord_re})[\s,，/]+({coord_re})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+    first = re.sub(r"\s+", "", match.group(1))
+    second = re.sub(r"\s+", "", match.group(2))
+    lat = ""
+    lon = ""
+    for value in (first, second):
+        direction = value[-1:].upper()
+        if direction in {"N", "S"}:
+            lat = value
+        elif direction in {"E", "W"}:
+            lon = value
+    return lon, lat
+
+
+def _merge_non_empty(target: dict[str, str], source: dict[str, str]) -> None:
+    for key, value in source.items():
+        if value and not target.get(key):
+            target[key] = value
+
+
+def execute_update_chain(
+    text: str,
+    entities: MessageEntities,
+    tool_map: dict[str, Any],
+    trace: HarnessTrace,
+    understanding_result: dict[str, Any] | None = None,
+) -> str:
     raw_entities = extract_entities(text)
+    understanding = dict(understanding_result or {})
+    position_params = _clean_update_param_group(understanding.get("position_update_params"), POSITION_UPDATE_PARAM_KEYS)
+    static_params = _clean_update_param_group(understanding.get("static_update_params"), STATIC_UPDATE_PARAM_KEYS)
+    low_confidence_fields = [
+        str(item).strip()
+        for item in (understanding.get("low_confidence_fields") if isinstance(understanding.get("low_confidence_fields"), list) else [])
+        if str(item).strip()
+    ]
+    if static_params.get("ship_type") and not static_params.get("minotype"):
+        static_params["minotype"] = static_params["ship_type"]
+    elif static_params.get("minotype") and not static_params.get("ship_type"):
+        static_params["ship_type"] = static_params["minotype"]
+    elif static_params.get("ship_type") and static_params.get("minotype") and static_params["ship_type"] != static_params["minotype"]:
+        low_confidence_fields.append(
+            f"ship_type/minotype冲突：ship_type={static_params['ship_type']}, minotype={static_params['minotype']}"
+        )
+        static_params["ship_type"] = ""
+        static_params["minotype"] = ""
+
+    trace.reasoning_trace["update_params"] = {
+        "position_update_params": {k: v for k, v in position_params.items() if v},
+        "static_update_params": {k: v for k, v in static_params.items() if v},
+        "low_confidence_fields": low_confidence_fields,
+    }
     used_context_identifier = bool(
         (entities.mmsi or entities.imo or entities.ship_name)
         and not (raw_entities.mmsi or raw_entities.imo or raw_entities.ship_name)
@@ -2948,14 +3054,15 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
         identifier = entities.mmsi or entities.imo or _clean_ship_name_candidate(entities.ship_name)
         return f"为避免更新错船，请确认本次要更新的目标船舶标识。当前上下文候选为 {identifier}，请回复 MMSI/IMO/船名并补齐船位参数后我再处理。"
 
-    mmsi = entities.mmsi
-    ship_name = _clean_ship_name_candidate(entities.ship_name)
-    if not mmsi and entities.imo and "ship_search" in tool_map:
-        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": entities.imo})
+    mmsi = position_params.get("mmsi") or static_params.get("mmsi") or entities.mmsi
+    current_imo = position_params.get("imo") or static_params.get("imo") or entities.imo
+    ship_name = _clean_ship_name_candidate(position_params.get("ship_name") or static_params.get("ship_name") or entities.ship_name)
+    if not mmsi and current_imo and "ship_search" in tool_map:
+        search = _invoke_tool(tool_map, trace, "ship_search", {"keyword": current_imo})
         mmsi = _parse_unique_mmsi(search)
         if not mmsi:
             trace.fallback_reason = "update_imo_not_unique"
-            trace.check_result = {"entity_resolved": False, "imo": entities.imo}
+            trace.check_result = {"entity_resolved": False, "imo": current_imo}
             candidates = _parse_mmsi_candidates(search)
             if candidates:
                 return "根据 IMO 未能唯一确认目标船舶。请从候选 MMSI 中确认一个后再更新：" + "、".join(candidates)
@@ -2982,16 +3089,19 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
         or "呼号" in lower
         or "尺度" in lower
         or "船型" in lower
+        or any(static_params.get(key) for key in STATIC_UPDATE_PARAM_KEYS if key not in {"mmsi", "imo", "ship_name"})
         or re.search(r"(?:修改|更新|改|补充)\s*(?:船名|name|ship_name)", text, flags=re.IGNORECASE)
     )
     if static_update_requested:
         args = {"mmsi": mmsi}
+        _merge_non_empty(args, {k: v for k, v in static_params.items() if k not in {"mmsi"}})
         ship_name_match = re.search(r"(?:船名|ship_name|name)[:：\s]*([A-Za-z0-9 ._-]{2,40})", text, flags=re.IGNORECASE)
-        if ship_name_match:
+        if ship_name_match and "ship_name" not in args:
             args["ship_name"] = ship_name_match.group(1).strip()
         out = _invoke_tool(tool_map, trace, "update_ship_static_info", args)
     else:
         args = {"mmsi": mmsi}
+        _merge_non_empty(args, {k: v for k, v in position_params.items() if k not in {"mmsi", "imo"}})
         field_patterns = {
             "lon": r"(?:经度|lon|longitude)[:：\s]*(-?\d+(?:\.\d+)?)",
             "lat": r"(?:纬度|lat|latitude)[:：\s]*(-?\d+(?:\.\d+)?)",
@@ -3002,17 +3112,23 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
         }
         for key, pattern in field_patterns.items():
             match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
+            if match and key not in args:
                 args[key] = match.group(1)
+        if not args.get("lon") or not args.get("lat"):
+            pair_lon, pair_lat = _extract_position_pair(text)
+            if pair_lon and not args.get("lon"):
+                args["lon"] = pair_lon
+            if pair_lat and not args.get("lat"):
+                args["lat"] = pair_lat
         time_match = re.search(r"(?:更新时间|updatetime)[:：\s]*(20\d{2}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{1,2}:\d{1,2})?)", text, flags=re.IGNORECASE)
-        if time_match:
+        if time_match and "updatetime" not in args:
             args["updatetime"] = time_match.group(1)
         navstatus_match = re.search(
             r"(?:航行状态|状态|navstatus)[:：\s]*([^\s，,。；;]+)",
             text,
             flags=re.IGNORECASE,
         )
-        if navstatus_match:
+        if navstatus_match and "navstatus" not in args:
             args["navstatus"] = navstatus_match.group(1).strip()
         out = _invoke_tool(tool_map, trace, "upload_ship_position", args)
     trace.check_result = {"entity_resolved": True, "write_result": "成功" in out or "更新成功" in out}

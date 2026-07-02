@@ -17,13 +17,12 @@
 
 ## 1. 当前主链
 
-`customer_support` 收到知识问题后，当前由轻量全模态 skills agent 让模型自主调用 `knowledge_qa` 工具。历史 router 链仅保留为回滚与兼容测试参考，不再是当前 customer 入口。
+`customer_support` 收到知识问题后，先由需求理解 Agent 输出 `knowledge` 路由、检索关键词和站点偏好，再由 planner/knowledge 工具链受控调用 `knowledge_qa` 工具。
 
 ```mermaid
 flowchart TD
-    Q[知识问题] --> W[customer_support lightweight wrapper]
-    W --> M[standard tool-calling skills agent]
-    M --> Plan[生成 3-5 组关键词]
+    Q[知识问题] --> U[需求理解 Agent]
+    U --> Plan[生成 3-5 组关键词与检索偏好]
     Plan --> A[local_kb_search]
     A -->|FAQ 强命中| Review[证据充分性复核]
     A -->|不足| B[web_search]
@@ -43,15 +42,15 @@ flowchart TD
 约束：
 
 - tool 只做本层事情，不在内部偷偷串下一层
-- skills agent 或 `smart_search` facade 才负责编排
+- customer_support planner 或 `smart_search` facade 负责编排
 - browser 不是第一轮搜索工具；但在 `web_search` 弱命中后，可用短关键词通过 Bing 优先召回 HiFleet 官方候选页
 - 平台操作和问题反馈类问题要覆盖多个证据面，不应只用单个 query 或单条摘要收口
 
 ## 2. 模型主导检索如何影响查询
 
-当前默认使用 `doubao-seed-2-0-lite-260428`、`thinking_type=enabled` 和 `reasoning_effort=medium`。模型会根据当前 `agent_profile` prompt、当前轮多模态摘要和会话记忆选择查询词、是否先查本地知识库、是否升级 web/browser。
+当前默认使用 `doubao-seed-2-0-lite-260428`、`thinking_type=enabled` 和 `reasoning_effort=high`。需求理解 Agent 会根据当前 `agent_profile` prompt、当前轮多模态摘要和会话记忆选择查询词、是否先查本地知识库、是否升级 web/browser。
 
-旧 router 链中曾有 understanding 契约，仍可作为历史 trace 或回滚参考。知识检索最关心的语义仍是：
+知识检索最关心的语义字段是：
 
 - `rewritten_user_need`
 - `query_type`
@@ -319,7 +318,7 @@ ark_websearch_api_key=
 
 期望：
 
-- `customer_support` 下 `route_trace.route=lightweight_skills_agent`
+- `customer_support` 下 `route_trace.route=knowledge`
 - `customer_ceshi` 下可进入 knowledge 或内部测试链路
 - knowledge 检索应优先围绕平台问题本身，不误调船舶读写工具
 

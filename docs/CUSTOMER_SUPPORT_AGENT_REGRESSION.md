@@ -1,36 +1,30 @@
 # Customer Support Agent Regression
 
-本文描述当前 `customer_support` 轻量全模态 skills agent 的回归范围、测试矩阵、验收标准和线上排障重点。
+本文描述当前 `customer_support` 需求理解主导链路的回归范围、测试入口、验收标准和线上排障重点。
 
-## 1. 当前回归范围
-
-当前主链为：
+## 1. 当前主链
 
 ```text
-preprocess -> delegate standard skills agent -> finalize
+输入归一化 / 多模态感知
+-> 需求理解 Agent 深度判断 intent/route/参数组/缺失项
+-> 安全兜底与写操作保护
+-> harness 或 planner 调用受控工具
+-> 结果分析、回复修复、输出清洗
 ```
 
 回归重点：
 
-1. 前置安全拦截。
-2. 文本、语音、图片、视频当前轮多模态 direct perception。
-3. `doubao-seed-2-0-lite-260428` 默认模型与 `thinking_type=enabled`、`reasoning_effort=medium`。
-4. 模型自主调用 `knowledge_qa`、`browser_verify`、`hifleet_ship_service`、`multimodal_support`。
-5. `knowledge_qa` 按 `local_kb_search -> web_search -> web_search_agent_browser` 顺序受控升级。
-6. 平台操作/问题反馈类问题的多关键词检索和证据充分性复核。
-7. 授权知识库维护 `knowledge_admin.upsert_local_kb_entry`。
-8. HiFleet 官方社区、帮助中心、官网公开页面核验。
-9. 船舶查询、档案、PSC、轨迹、挂靠、统计、船位上传、静态信息更新。
-10. 船舶写操作的显式意图和必填字段保护。
-11. 多轮上下文与最近船舶实体记忆。
-12. 最终输出脱敏、链接抽取和 `output_assets`。
-13. `/run`、`/stream_run` 和微信旧 `content.query.prompt` 兼容。
+1. 需求理解 Agent 是否输出正确 `intent/route/task_type/tool_bundle`。
+2. 图片、语音、视频当前轮 perception 是否进入需求理解。
+3. 船位参数组 `position_update_params` 与静态参数组 `static_update_params` 是否完整记录。
+4. 固定规则是否只做安全兜底，不再覆盖正常需求理解判断。
+5. 船舶写操作是否必须通过 `execute_update_chain` 和工具硬校验。
+6. 知识链是否仍按 `local_kb_search -> web_search -> web_search_agent_browser` 受控升级。
+7. 最终输出是否经过 `sanitize_customer_output(...)`。
 
-旧 `customer_support_router.py`、旧 planner/review/harness 和旧 `_build_customer_support_agent()` 仍保留为回滚与历史测试参考，但不再是当前 customer 入口。
+`_build_lightweight_customer_support_agent()` 仅保留为历史/回滚参考；当前 `build_agent(customer_support)` 应进入 `_build_customer_support_agent()`。
 
-Profile 选择只看请求体 `agent_profile` 或请求头 `x-agent-profile`；`source_channel` 只用于日志和后台筛选，不参与运行时 Profile 判断。未传合法 Profile 时默认 `customer_support`。
-
-## 2. 当前测试入口
+## 2. 测试入口
 
 客服相关最小回归：
 
@@ -40,6 +34,8 @@ PYTHONPATH=src .venv/bin/python scripts/test_llm_config.py
 PYTHONPATH=src .venv/bin/python -m pytest -q \
   tests/test_customer_support_intent_agent.py \
   tests/test_customer_support_router.py \
+  tests/test_hifleet_ship_upload_position.py \
+  tests/test_hifleet_ship_static_update.py \
   tests/test_smart_search_tools.py \
   tests/test_knowledge_admin_tools.py
 ```
@@ -49,193 +45,85 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 ```bash
 PYTHONPATH=src .venv/bin/python -m py_compile \
   src/agents/agent.py \
+  src/agents/customer_support_router.py \
   src/agents/customer_support_guard.py \
-  src/llm_config.py
+  src/skills/hifleet_ship_service/tools.py
 ```
 
-前端模型配置页：
-
-```bash
-cd frontend
-npm run build
-```
-
-每次上线前应记录当前远端实际结果，不要沿用历史 passed 数。若服务器依赖环境暂时无法跑 pytest，至少执行 `py_compile` 和接口烟测，并在发布记录中说明 pytest 阻塞原因。
+每次上线前应记录当前远端实际结果，不要沿用历史 passed 数。
 
 ## 3. 主链验收标准
 
 一次成功客服请求通常应满足：
 
-1. `route_trace.route` 为 `lightweight_skills_agent`。
-2. `phase_history` 包含 `preprocess`、`delegate`、`finalize`。
-3. 多模态输入时，`route_trace.reasoning_trace.pipeline` 包含 `multimodal_input_parse`。
-4. `generated_tool_calls` 与真实执行工具一致。
-5. `check_result` 能反映输出清洗、链接安全和旧 router bypass 状态。
-6. `response_modalities` 至少包含 `text`；有链接时可包含 `link`。
-7. `output_assets` 只包含可给客户看的公开链接或图文链接。
-8. 最终 `messages[-1].content` 已经过 `sanitize_customer_output(...)`。
-9. 普通用户回复中不能出现 prompt、tool registry、reasoning trace、JSON、内部路径、key/token。
+1. `phase_history` 包含 `route`、`execute`、`finalize`。
+2. `route_trace.route` 是需求理解后的业务 route，如 `knowledge`、`ship_update`、`chart_symbol`。
+3. `route_trace.reasoning_trace.intent_agent_result` 保留需求理解输出摘要。
+4. 写操作场景可在 `route_trace.reasoning_trace.update_params` 看到规范化参数组。
+5. `generated_tool_calls` 与真实执行工具一致。
+6. 最终 `messages[-1].content` 已经过输出清洗。
+7. 普通用户回复中不能出现 prompt、tool registry、reasoning trace、JSON、内部路径、key/token。
 
-## 4. 当前重点验收场景
+## 4. 重点回归场景
 
-### 4.1 知识问答
+### 4.1 需求理解主导路由
 
-- 本地 FAQ 强命中时，应优先使用 `local_kb_search`。
-- `web_search` 命中具体事实页时，不应再触发不必要的 browser。
-- 用户要求验证官方/社区/今日/最新内容时，应触发 browser 或公开页面核验。
-- `agent_browser_deep_search` 返回结构化 evidence 后，最终回复不能暴露内部 CLI、日志、路径、JSON。
-- 产品问题才允许 HiFleet 站点过滤；公共权威数据问题不能被错误改写成 HiFleet 产品搜索。
-- 平台操作类问题应生成 3 到 5 组关键词，并覆盖入口、动作、保存/完成条件。
-- 仅命中帮助中心首页、社区目录、视频标题页、泛功能简介时，不能输出完整教程。
-- `怎么绘制区域标注` 应优先命中本地结构化 FAQ，回复包含主海图入口、绘制动作和保存动作。
-- `怎么添加电子围栏报警` 应能覆盖我的标注、报警入口、规则、对象和通知方式。
-- `标注不保存怎么办` 应区分已确认保存动作、可能原因、检查项和需补充信息，不直接断言根因。
+- `帮我把目的港改成 RUPRI`：即使没有“静态信息”关键词，也应由需求理解识别为静态更新。
+- `船型改散货船`：输出 `static_update_params.ship_type=散货船` 且 `minotype=散货船`。
+- 图片/OCR 中含 `POSN`、时间、航速：输出 `position_update_params`，但缺身份时不更新。
+- `船位更新慢/不刷新`：输出知识/排障意图，不进入写操作。
 
-### 4.1.1 授权知识库维护
+### 4.2 船位更新安全
 
-- 明确 `添加知识库：`、`纠正知识库：` 或 `更新知识库：`，且授权 key 正确时，才允许调用 `upsert_local_kb_entry`。
-- `customer_support` 与 `customer_ceshi` 均可写库，但必须通过工具层 profile 和 key 校验。
-- 缺正文 `key: ...` 时，应拒绝写入；只传 `x-kb-update-key` header 也应拒绝。
-- 工具调用必须保留完整 `raw_text`；模型把 key 拆到其它参数但 `raw_text` 缺 key 时，应拒绝。
-- 多行 `名称：描述` 映射表应自动拆成多条独立知识，重复条目跳过，新条目继续写入。
-- 普通“你答错了/应该是...”但没有明确写库指令时，不应写入。
-- 重复 question 或高度相似内容不应重复追加。
-- 写入后 JSONL 每行应可 `json.loads`，并且 `local_kb_search` 可命中新条目。
+- 有 MMSI + 经纬度 + 更新时间：允许调用 `upload_ship_position`。
+- 缺 MMSI/IMO/船名：不调用上传工具，提示补充身份标识。
+- 缺经度、纬度或更新时间：不调用上传工具，提示补充缺失项。
+- 当前消息只有“更新一下”且历史有 MMSI：不复用历史 MMSI。
+- 图片有经纬度和时间但无身份标识：不更新，只追问身份标识。
+- 工具未明确成功：不得宣称已更新成功。
 
-### 4.2 多轮上下文
+### 4.3 静态信息更新安全
 
-- 新问题不应被无关历史误导。
-- “上面 / 上一条 / 这艘船 / 总结”类追问应能复用相关历史。
-- 船舶追问可复用最近 MMSI、船名等实体。
-- 待确认写操作应等待用户补充，不应擅自执行。
+- 当前输入有身份标识 + 静态字段：调用 `update_ship_static_info`。
+- 只有船名：先搜索候选并要求确认 MMSI，不直接写入。
+- `ship_type/minotype` 合法且一致：工具写入 `type` 和 `minotype` 同值。
+- 船型目录外或 `ship_type/minotype` 冲突：只阻断船型字段，其他合法字段可继续更新。
 
-### 4.3 多模态预处理
+### 4.4 知识与 Browser
 
-- `这个圆圈是什么` + HiFleet 海图截图，应优先基于 `perception_summary` 判断为海图/地图页面问题。
-- `请分析这张图片` + Error 弹窗，应优先判断为平台排障问题。
-- 语音输入应先转写或摘要，再回答。
-- 视频输入应把可见界面、动作、报错摘要纳入当前轮问题。
-- 低置信截图识别不应进入长流程，应只追问一项关键补充。
+- 本地 FAQ 强命中时优先用 `local_kb_search`。
+- 平台操作类问题应覆盖入口、动作、保存/完成条件。
+- 官方社区/帮助中心核验类问题应给具体公开链接，不只返回首页。
+- 公共权威数据问题不能被错误限制到 HiFleet 站点。
 
-### 4.4 船舶读写
+### 4.5 多模态与微信旧接口
 
-- 查询船位、档案、PSC、轨迹、挂靠和统计时，可调用对应读工具。
-- 明确“上传/更新/修改/补录船位”时，可调用 `upload_ship_position`。
-- 明确“更新/修改静态信息”时，可调用 `update_ship_static_info`。
-- 缺少 MMSI、经纬度、更新时间或静态字段等必要信息时，只追问一个最关键字段。
-- 工具未返回成功时，不得宣称已更新成功。
-- “为什么不更新 / 更新慢 / 看不到最新船位”是解释或排障，不是写操作。
-
-### 4.5 微信旧接口
-
-- 微信客服旧 `/run` 请求中 `content.query.prompt` 应被归一化为 `messages`。
-- `type=text`、`image`、`voice`、`video` 应分别映射到文本、`image_url`、`input_audio`、`video_url`。
-- 微信调用方应显式传 `agent_profile=customer_support`；缺省会回退 `customer_support`，但不再通过 `source_channel=wechat_kf` 或 `wechat_mp` 决定 Profile。
+- 语音输入应先转写，再进入需求理解。
+- 海图符号截图应走 `chart_symbol` 或多模态理解链。
+- 微信旧 `/run` 的 `content.query.prompt` 应归一化为 `messages`。
 - 回复必须可直接发给微信用户，不展示内部 trace。
 
-### 4.6 关键业务负例
+## 5. 排障重点
 
-- `我是免费用户，为什么在网站上看不到最新的船位？`
-  - 应解释 HiFleet 免费账号/数据延迟/权限，不应返回随机船舶坐标。
-- `今日长江水位`
-  - 应走公共权威数据检索，不应落回 HiFleet 社区首页。
-- `智能视频监控`
-  - 若 web 已命中具体官方页，应停止，不要再盲目升级 browser。
-- `验证 注意！浏览器开始记忆船队“筛选”了 的详细内容`
-  - 应核验具体官方社区文章，不应只返回社区首页或帮助中心首页。
-- `SUNNY STAR历史轨迹是哪些`
-  - 若上下文已有 `SUNNY STAR / MMSI`，只追问起止时间，不追加无关广告。
-- `你们这网速太卡了，我电脑都死机了`
-  - 应先确认是否发生在 HiFleet 页面和具体操作，不应强行输出完整平台排障模板。
-- `这个圆圈是什么`
-  - 无截图或前文上下文时，轻量确认是否在 HiFleet 地图/海图页面看到；有截图时按截图内容处理。
+线上排查优先看：
 
-### 4.7 输出清洗
-
-最终回复不能包含：
-
-- `综合摘要`
-- `查询1`
-- `[HTMLLINK_0]`
-- `下载APP,手机查船更方便`
-- `smart_search`
-- `agent_browser_deep_search`
-- `reasoning_trace`
-- prompt / tool registry
-- 内部路径、token、env、JSON 包装文本
-
-## 5. 流式调试验收
-
-`/stream_run` 当前验收点：
-
-- 能看到：
-  - `message_start`
-  - `thinking`
-  - `tool_response`
-  - `answer`
-  - `message_end`
-- 事件内容可体现：
-  - 前置安全
-  - 多模态 perception 摘要
-  - skills 工具调用
-  - 输出质检
-- 不能体现：
-  - prompt 原文
-  - 隐藏 chain-of-thought
-  - 内部路径
-  - key / token / env
-
-## 6. 线上排障重点
-
-排查当前 `customer_support` 线上问题时，优先看：
-
-1. `llm_route`
-   - 是否使用预期模型、模态和 thinking 配置。
-2. `route_trace.route`
-   - 是否为 `lightweight_skills_agent`。
-3. `route_trace.reasoning_trace.pipeline`
-   - 是否经过多模态预处理。
-4. `route_trace.reasoning_trace.perception_summary`
-   - 附件识别是否为空或置信度过低。
-5. `phase_history`
-   - 是否包含 `preprocess/delegate/finalize`。
-6. `generated_tool_calls`
-   - 是否调用了预期工具，是否误调写工具。
-7. `response_modalities` / `output_assets`
-   - 链接是否适合客户可见。
-8. `check_result`
-   - 是否被脱敏、空答、无效链接兜底。
-9. 最终回复
-   - 是否仍夹带搜索包装文本或内部信息。
-10. `latency_hotspot.total`
-   - 是否存在异常慢请求。
+1. `llm_route`：模型、模态、thinking 配置是否符合预期。
+2. `phase_history`：是否经过 route/execute/finalize。
+3. `route_trace.route` / `task_type`：需求理解路由是否正确。
+4. `route_trace.reasoning_trace.intent_agent_result`：需求理解输出是否低置信、缺字段或含 safety flags。
+5. `route_trace.reasoning_trace.update_params`：写操作参数是否来自当前输入/附件。
+6. `generated_tool_calls`：是否误调写工具或缺少必要读工具。
+7. `check_result`：是否被脱敏、空答、无效链接或参数校验兜底。
+8. 最终回复：是否夹带搜索包装文本、工具名或内部信息。
 
 知识链额外看：
 
-11. knowledge 工具入参 query
-    - 是否被错误限制到 HiFleet 站点。
-12. `retrieval_trace`
-    - 是否记录了本地 KB、web、browser 各层证据。
-13. `t1_payload_meta` / `request_profile`
-    - 是否出现错误 `Sites` 污染或 Ark fallback 覆盖。
-14. `question_class`、`web_answerability_reason`、`risk_flags`
-    - 教程类问题是否被识别为需要更严格证据。
-15. `knowledge_admin` 工具结果
-    - 写库是否因缺 key、重复、缺标准答案被正确拒绝。
+- knowledge 工具入参 query 是否过泛或被错误限制站点。
+- `retrieval_trace` 是否记录本地 KB、web、browser 各层证据。
+- `question_class`、`web_answerability_reason`、`risk_flags` 是否识别教程类证据不足。
 
-## 7. 当前已知限制
+## 6. 当前已知限制
 
-- 知识库内容不足时，平台操作类问题会更依赖 web/browser 核验；不要用半相关摘要拼完整教程。
-- `agent-browser` 是受控官方核验证据层，不是自由浏览器 Agent。
-- `agent-browser` 当前只抓取公开网页正文，不处理登录态、Cookie、站内复杂交互。
-- 当前已取消自定义上下文压缩摘要；完整文本历史交给 agent/checkpointer 处理，历史多模态内容只做安全脱敏。
-- v1 多模态输出只返回文本和链接型图文信息，不生成语音 URL。
-- `reasoning_trace` 是审计摘要，不是隐藏思维链；不能原样展示给普通用户。
-
-## 8. 当前优化优先级
-
-1. 补 `docs/RAG` 和本地 KB 命中质量。
-2. 优化 customer profile prompt 对工具选择、写操作确认和公共权威数据检索的约束。
-3. 收紧 `query_type -> Sites` 约束，避免公共数据检索被 HiFleet 站点污染。
-4. 补官方网页抓取与索引覆盖。
-5. 扩展异地部署联调脚本和线上观测面板。
+- 知识库内容不足时，平台操作类问题会更依赖 web/browser 核验。
+- `agent-browser` 是受控公开网页证据层，不处理登录态、Cookie 或站内复杂交互。
+- 船名解析仍依赖船舶搜索候选；唯一命中也需要用户确认后才能写入。

@@ -9,10 +9,10 @@
 ```text
 /run 或 /stream_run
 -> profile=customer_support
--> preprocess 多模态感知
--> standard tool-calling skills agent
--> browser_verify / knowledge_qa / ship / multimodal tools
--> finalize + customer output guard
+-> 多模态感知
+-> 需求理解 Agent 判断 route 和检索意图
+-> planner / knowledge_qa / browser_verify 受控核验
+-> customer output guard
 ```
 
 触发 browser 的常见场景：
@@ -20,9 +20,9 @@
 - 用户要求验证官网、帮助中心、官方社区、今日/最新内容。
 - `local_kb_search` 或 `web_search` 只有弱命中、目录页、首页或候选链接。
 - 需要核验具体公开页面正文，而不是只依赖搜索摘要。
-- 模型根据 `config/profiles/customer_support.md` 约束判断需要升级核验。
+- 需求理解和 planner 根据 `config/profiles/customer_support.md` 约束判断需要升级核验。
 
-旧 `customer_support_router.py` 中的 browser fallback 只作为回滚和历史测试参考，不再是当前 customer 主入口。
+`customer_support_router.py` 中的 planner/harness 是当前受控执行层之一；历史轻量 delegate 链只作为回滚参考。
 
 ## 2. 工具边界
 
@@ -110,7 +110,7 @@ agent-browser get text body
 
 预期：
 
-- `route_trace.route=lightweight_skills_agent`。
+- `route_trace.route` 通常为 `knowledge`、`browser_verify` 或 `chart_symbol`。
 - `generated_tool_calls` 可看到 browser/knowledge 相关工具。
 - 最终回复引用具体公开页面，不只给首页。
 - 最终回复不出现 `agent-browser`、`reasoning_trace`、原始 JSON、内部路径或 key/token。

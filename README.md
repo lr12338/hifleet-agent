@@ -4,14 +4,13 @@
 
 当前不是单一客服 Bot，而是 **一个主 Agent + 多 Agent Profile** 的架构：
 
-- `customer_support`：正式客服 Agent，面向客户、微信客服、WebSDK、CRM，采用轻量全模态 skills agent，支持知识检索、公开网页核验和船舶数据读写，禁用沙盒/Python/employee workspace。
+- `customer_support`：正式客服 Agent，面向客户、微信客服、WebSDK、CRM，采用“需求理解 Agent 主导 + 受控工具执行”链路，支持知识检索、公开网页核验和船舶数据读写，禁用沙盒/Python/employee workspace。
 - `employee_assistant`：`customer_support` 的兼容别名，继续可被旧调用方使用。
 - `customer_ceshi`：测试/内部 Agent，保留知识问答、业务工具、文件检查和受控 Python 分析能力。
 
 详细架构请优先阅读：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
 客服知识检索、平台操作类收口和授权写库请看：`docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md`。
 如果是在其他服务器上部署联调，先看：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`。
-如果需要让远端代码 Agent 快速接手检查和烟测，可直接使用：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`。
 
 ## 1. 核心目录
 
@@ -148,8 +147,6 @@ curl -N -X POST http://127.0.0.1:10123/stream_run \
 
 异地部署联调：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`
 
-远端 Agent 检查提示词：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`
-
 `agent-browser` 受控兜底：`docs/agent_browser_fallback_integration.md`
 
 ## 7. 测试
@@ -170,7 +167,6 @@ npm run build
 - 主架构：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`
 - 客服知识检索与授权写库：`docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md`
 - 异地部署联调：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`
-- 远端 Agent 检查提示词：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`
 - `agent-browser` 兜底链：`docs/agent_browser_fallback_integration.md`
 - 外部 API 接入：`docs/API_MULTI_USER_INTEGRATION.md`
 - 后台使用：`docs/ADMIN_BACKEND_SYSTEM_GUIDE.md`
