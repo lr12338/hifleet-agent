@@ -8,9 +8,9 @@
 - 正确选择正式客服或测试 Profile。
 - 出现慢请求、错误、工具异常时可在后台管理系统定位。
 
-注意：当前对外默认客服 profile 是 `customer_support`，它采用需求理解 Agent 主导链路：
+注意：当前对外默认客服 profile 仍是 `customer_support`，但它已经改为轻量全模态 skills agent：
 
-- `customer_support` 负责外部客户收口、多模态预处理、需求理解、受控工具调用和客服化输出
+- `customer_support` 负责外部客户收口、多模态预处理、模型驱动工具调用和客服化输出
 - `employee_assistant` 现在只是 `customer_support` 的兼容别名
 - `customer_ceshi` 继续负责文件/沙箱类测试与内部能力验证
 
@@ -43,8 +43,8 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 模型路由：
 
 - 默认文本模型和多模态模型均为 `doubao-seed-2-0-lite-260428`。
-- 默认 `thinking_type=enabled` 且 `reasoning_effort=high`。
-- 调用方可在请求体传 `thinking=enabled|disabled` 和 `reasoning_effort=minimal|low|medium|high` 临时覆盖；旧调用传 `thinking=auto` 时服务端会归一化为 `enabled + high`。
+- 默认 `thinking_type=enabled` 且 `reasoning_effort=medium`。
+- 调用方可在请求体传 `thinking=enabled|disabled` 和 `reasoning_effort=minimal|low|medium|high` 临时覆盖；旧调用传 `thinking=auto` 时服务端会归一化为 `enabled + medium`。
 - 当 `thinking=disabled` 时，`reasoning_effort` 必须为 `minimal`，服务端会自动修正错配。
 - 请求体传 `model` 可临时覆盖本轮模型；不传时按后台配置自动选择。
 - 文本、图片、语音、视频统一走同一套 `/run` / `/stream_run` 请求结构。
@@ -67,7 +67,7 @@ Profile 解析优先级：请求体 `agent_profile` -> 请求头 `x-agent-profil
 - 平台问题：模型按提示优先使用 `local_kb_search -> web_search -> web_search_agent_browser`。
 - 平台操作/问题反馈：模型会生成 3 到 5 组关键词做多轮检索，并在证据不足时保守回答。
 - 授权知识库维护：仅在明确写库指令且正文 `key: ...` 授权通过时，才会追加结构化 FAQ。
-- 多模态问题：当前轮包含 `image_url`、`input_audio`、`video_url` 时，会先做感知/转写/摘要，再交给需求理解和工具链处理。
+- 多模态问题：当前轮包含 `image_url`、`input_audio`、`video_url` 时，会先做轻量感知/转写/摘要，再交给模型和工具链处理。
 - 船舶问题：允许读写 HiFleet ship service 工具，包括船位查询、档案、PSC、轨迹、挂靠、航次、区域/海峡统计、船位上传和静态信息更新。
 - 写操作：只有用户明确要求上传/更新/修改/补录船舶数据，并且工具真实返回成功时，才能对外宣称成功。
 - 不启用 Python、沙盒、employee workspace、任意文件读取或产物生成。
@@ -283,7 +283,7 @@ COZE_HTTP_WORKERS=2
   "text_model": "doubao-seed-2-0-lite-260428",
   "multimodal_model": "doubao-seed-2-0-lite-260428",
   "thinking_type": "enabled",
-  "reasoning_effort": "high"
+  "reasoning_effort": "medium"
 }
 ```
 

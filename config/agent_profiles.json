@@ -2,7 +2,7 @@
   "default_profile": "customer_support",
   "profiles": {
     "customer_support": {
-      "description": "External HiFleet customer support agent led by demand understanding, with controlled tool execution and ship data read/write validation.",
+      "description": "Lightweight external HiFleet customer support test agent. Uses the multimodal model and allowed skills directly, including ship data read/write tools, without employee sandbox or workspace capabilities.",
       "aliases": [
         "employee_assistant"
       ],
@@ -32,7 +32,7 @@
         "allow_browser_verify": true,
         "allow_multimodal": true,
         "allow_artifact_links": false,
-        "lightweight_skills_agent": false
+        "lightweight_skills_agent": true
       },
       "disabled_tools": []
     },

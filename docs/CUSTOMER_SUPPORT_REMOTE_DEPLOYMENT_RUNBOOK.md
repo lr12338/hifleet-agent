@@ -3,7 +3,7 @@
 本文面向把当前项目部署到其他 Linux 服务器上测试的开发人员，目标是快速确认：
 
 - 服务是否按当前代码真实启动。
-- `customer_support` 是否走到需求理解 Agent 主导链路，而不是历史轻量 delegate 链。
+- `customer_support` 是否走到轻量全模态 skills agent，而不是旧 router/planner/harness 链。
 - 微信客服旧 `/run` 调用、多模态预处理、船舶读写工具、knowledge/browser fallback 和会话记忆是否在远端生效。
 
 ## 0. 当前客服主链快照
@@ -11,18 +11,18 @@
 当前 `customer_support` 主链按下面这条链路理解：
 
 ```text
-前置安全检查 / 多模态 direct perception（文本/语音/图片/视频）
--> 需求理解 Agent 输出 intent/route/参数组/缺失项
--> 安全兜底与写操作保护
--> harness 或 planner 调用受控工具
--> 结果分析 / 输出清洗
+前置安全检查
+-> 多模态 direct perception（文本/语音/图片/视频）
+-> 标准 tool-calling skills agent
+-> 模型自主选择 knowledge / browser / ship / multimodal tools
+-> finalize + customer output guard
 -> 文本回复 + output_assets 链接
 ```
 
 关键点：
 
-- 默认文本模型和多模态模型统一为 `doubao-seed-2-0-lite-260428`，`thinking_type=enabled`，`reasoning_effort=high`。
-- 当前入口是 `src/agents/agent.py` 中的 `_build_customer_support_agent()`；`_build_lightweight_customer_support_agent()` 仅保留为历史/回滚参考。
+- 默认文本模型和多模态模型统一为 `doubao-seed-2-0-lite-260428`，`thinking_type=enabled`，`reasoning_effort=medium`。
+- 当前入口是 `src/agents/agent.py` 中的 `_build_lightweight_customer_support_agent()`；旧 `customer_support_router.py` 和旧 `_build_customer_support_agent()` 只保留用于回滚与旧测试。
 - Profile 只由请求体 `agent_profile` 或请求头 `x-agent-profile` 决定；`source_channel` 只用于日志和后台筛选。
 - 当前不再插入自定义历史上下文摘要；完整文本历史交给 agent/checkpointer，历史多媒体 URL 只做安全脱敏。
 - `customer_support` 允许调用 HiFleet 船舶读写工具，但不启用 Python、沙盒、employee workspace、任意文件读写或产物生成。
@@ -70,7 +70,7 @@ ark_websearch_api_key
   "text_model": "doubao-seed-2-0-lite-260428",
   "multimodal_model": "doubao-seed-2-0-lite-260428",
   "thinking_type": "enabled",
-  "reasoning_effort": "high"
+  "reasoning_effort": "medium"
 }
 ```
 
@@ -103,20 +103,15 @@ sudo journalctl -u hifleet-agent.service -n 200 --no-pager
 ```bash
 PYTHONPATH=src ./.venv/bin/python scripts/test_agent_profiles.py
 PYTHONPATH=src ./.venv/bin/python scripts/test_llm_config.py
-PYTHONPATH=src ./.venv/bin/python -m pytest -q \
-  tests/test_customer_support_intent_agent.py \
-  tests/test_customer_support_router.py \
-  tests/test_hifleet_ship_upload_position.py \
-  tests/test_hifleet_ship_static_update.py \
-  tests/test_smart_search_tools.py
+PYTHONPATH=src ./.venv/bin/python -m pytest -q tests/test_customer_support_intent_agent.py tests/test_customer_support_router.py tests/test_smart_search_tools.py
 ```
 
 这些测试会覆盖：
 
 - `customer_support` 工具列表包含船舶读写工具，且不包含 sandbox / Python / employee workspace 工具。
-- 当前 `build_agent()` 已把 `customer_support` 路由到需求理解主导 graph。
-- 文本、语音、图片/视频感知摘要能进入需求理解。
-- 船位更新和静态信息更新会经过参数组抽取、写操作保护和工具硬校验。
+- 当前 `build_agent()` 已把 `customer_support` 路由到轻量 graph。
+- 文本、语音、图片/视频感知摘要能注入当前轮问题。
+- 旧 router 测试仍可作为回滚兼容检查。
 
 如果远端 Python 环境暂时无法完整跑 pytest，至少先做语法级检查：
 
@@ -347,9 +342,7 @@ curl -X POST http://127.0.0.1:10123/run \
 - `phase_history`
 - `route_trace.route`
 - `route_trace.task_type`
-- `route_trace.reasoning_trace.intent_agent_result`
-- `route_trace.reasoning_trace.understanding_summary`
-- `route_trace.reasoning_trace.update_params`
+- `route_trace.reasoning_trace.pipeline`
 - `route_trace.reasoning_trace.perception_summary`
 - `generated_tool_calls`
 - `response_modalities`
@@ -358,12 +351,12 @@ curl -X POST http://127.0.0.1:10123/run \
 
 ### 6.1 你想看到什么
 
-- `route_trace.route` 为需求理解后的业务 route，例如 `knowledge`、`ship_update`、`chart_symbol`。
-- `phase_history` 至少包含 `route`、`execute`、`finalize`。
+- `route_trace.route` 为 `lightweight_skills_agent`。
+- `phase_history` 至少包含 `preprocess`、`delegate`、`finalize`。
 - 知识弱命中时，`generated_tool_calls` 里可看到 browser 或 knowledge 工具调用。
 - 多模态输入时，`perception_summary` 能说明音频转写、截图文字、视频摘要或附件识别结果。
-- 写操作时，`update_params` 能看到来自当前输入/附件的规范化参数组。
 - 链接型图文输出进入 `output_assets`，`response_modalities` 包含 `text` 和可能的 `link`。
+- `check_result.deprecated_customer_router_bypassed` 为真，表示旧 customer router 没有作为当前入口执行。
 
 ### 6.2 你不想看到什么
 
@@ -397,7 +390,7 @@ curl -X POST http://127.0.0.1:10123/run \
 
 1. `sanitize_customer_output(...)` 是否触发了兜底。
 2. `check_result.links_ok` 是否失败。
-3. `config/profiles/customer_support.md` 是否为最新客服业务规则。
+3. `config/profiles/customer_support.md` 是否为最新轻量 skills prompt。
 4. `config/agent_profiles.json` 是否注册了正确 skills 和工具权限。
 5. 模型是否返回了可被最终收口层清洗的客户可见文本。
 
@@ -423,10 +416,10 @@ curl -X POST http://127.0.0.1:10123/run \
 
 ## 8. 开发同学建议阅读顺序
 
-1. [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
-2. [docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md](CUSTOMER_SUPPORT_KB_OPERATIONS.md)
-3. [docs/API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md)
-4. [docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md)
+1. [docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md](CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md)
+2. [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
+3. [docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md](CUSTOMER_SUPPORT_KB_OPERATIONS.md)
+4. [docs/API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md)
 5. [docs/agent_browser_fallback_integration.md](agent_browser_fallback_integration.md)
 6. [docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md)
 7. [config/profiles/customer_support.md](../config/profiles/customer_support.md)

@@ -10,7 +10,7 @@
 | `employee_assistant` | 兼容别名，运行时会规范化为 `customer_support`。 |
 | `customer_ceshi` | 测试/内部 profile，保留 employee workspace、表格检查和受控 Python 能力。 |
 
-日志里判断线路时，优先看规范化后的 `agent_profile`、`route_trace.route`、`route_trace.reasoning_trace.intent_agent_result` 和工具调用序列。传入 `employee_assistant` 后，预期应落到 `customer_support` 的需求理解主导链路。
+日志里判断线路时，优先看规范化后的 `agent_profile`、`route_trace.route` 和工具调用序列。传入 `employee_assistant` 后，预期应落到 `customer_support` 的轻量客服链。
 
 ## 2. 平台操作与问题反馈检索原则
 

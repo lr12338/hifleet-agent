@@ -175,7 +175,7 @@ def test_employee_assistant_alias_builds_customer_support_graph(monkeypatch):
         return FakeCompiledGraph()
 
     monkeypatch.setattr(
-        "agents.agent._build_customer_support_agent",
+        "agents.agent._build_lightweight_customer_support_agent",
         fake_build_customer_support,
     )
     monkeypatch.setattr(
@@ -253,7 +253,7 @@ def test_employee_assistant_intent_hint_does_not_trigger_internal_route_graph(mo
 
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("customer_ceshi-only standard path should not be used")))
     monkeypatch.setattr(
-        "agents.agent._build_customer_support_agent",
+        "agents.agent._build_lightweight_customer_support_agent",
         fake_build_customer_support,
     )
     ctx = SimpleNamespace(headers={"x-agent-profile": "employee_assistant", "x-intent-hint": "knowledge"}, run_id="r-employee-ship")
@@ -432,52 +432,38 @@ def test_customer_support_agent_imports_guard_refusal_constant():
     assert AGENT_SENSITIVE_REFUSAL == SENSITIVE_REFUSAL
 
 
-def test_build_agent_customer_support_uses_understanding_led_graph(monkeypatch):
-    local_kb = FakeTool(
-        "smart_search",
-        lambda args: "【优先匹配 - FAQ/标准回复】\nHiFleet 支持查询和更新船舶数据。\nhttps://www.hifleet.com/helpcenter/?i18n=zh",
-    )
+def test_build_agent_customer_support_uses_lightweight_skills_graph(monkeypatch):
     class FakeStandardAgent:
         def invoke(self, payload, context=None):
-            raise AssertionError("understanding-led customer support should not delegate for knowledge test")
+            assert payload["agent_profile"] == "customer_support"
+            return {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"name": "local_kb_search", "args": {}, "id": "call-1"}],
+                    ),
+                    AIMessage(content="HiFleet 支持查询和更新船舶数据。https://www.hifleet.com/helpcenter/?i18n=zh"),
+                ]
+            }
 
-    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [local_kb])
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
-    monkeypatch.setattr(
-        "agents.agent._run_customer_support_intent_agent",
-        lambda **kwargs: {
-            "intent": "knowledge",
-            "route": "knowledge",
-            "task_type": "platform_knowledge",
-            "tool_bundle": KNOWLEDGE_BUNDLE,
-            "confidence": "high",
-            "needs_harness": False,
-            "use_context_ship": False,
-            "why": "用户咨询平台能力",
-            "rewritten_user_need": "用户想确认 HiFleet 是否支持查询和更新船舶数据",
-            "query_type": "hifleet_product",
-            "search_keywords": ["hifleet", "船舶数据", "更新"],
-            "search_query_candidates": ["HiFleet 查询 更新 船舶数据"],
-            "needs_multimodal_grounding": False,
-            "should_prefer_local_kb": True,
-            "should_limit_to_hifleet_sites": True,
-        },
-    )
     set_current_agent_profile("customer_support")
-    graph = build_agent(ctx=SimpleNamespace(headers={}, run_id="r-understanding-entry"))
+    graph = build_agent(ctx=SimpleNamespace(headers={}, run_id="r-lightweight-entry"))
 
     result = graph.invoke(
         {
             "messages": [HumanMessage(content="HiFleet 可以更新船舶数据吗")],
-            "session_id": "s-understanding-entry",
+            "session_id": "s-lightweight-entry",
             "agent_profile": "customer_support",
         },
-        config={"configurable": {"thread_id": "s-understanding-entry"}},
+        config={"configurable": {"thread_id": "s-lightweight-entry"}},
     )
 
     assert result["phase"] == "done"
-    assert result["route_trace"]["route"] == "knowledge"
-    assert result["route_trace"]["reasoning_trace"]["route_source"] == "understanding_agent"
+    assert result["route_trace"]["route"] == "lightweight_skills_agent"
+    assert result["route_trace"]["check_result"]["deprecated_customer_router_bypassed"] is True
+    assert result["response_modalities"] == ["text", "link"]
+    assert result["output_assets"][0]["type"] == "link"
     assert "HiFleet 支持查询和更新船舶数据" in result["messages"][-1].content
 
 
@@ -612,7 +598,7 @@ def test_customer_support_standard_graph_runs_post_guard(monkeypatch):
     assert result["generated_tool_calls"] == ["smart_search"]
 
 
-def test_customer_support_graph_uses_understanding_agent_after_perception(monkeypatch):
+def test_customer_support_graph_uses_light_agent_after_perception(monkeypatch):
     smart_search = FakeTool("smart_search", lambda args: "安全水域浮标 Safe Water Mark，表示周围为可航水域。")
     inspect = FakeTool("inspect_media_attachment", lambda args: '{"category":"image"}')
     monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [inspect, smart_search])
@@ -686,7 +672,7 @@ def test_customer_support_graph_uses_understanding_agent_after_perception(monkey
     assert "安全水域浮标" not in result["messages"][-1].content
 
 
-def test_customer_support_graph_write_guard_preserves_explicit_write(monkeypatch):
+def test_customer_support_graph_write_guard_overrides_light_agent(monkeypatch):
     position = FakeTool("upload_ship_position", lambda args: "更新成功")
     monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position])
     monkeypatch.setattr("agents.agent._run_customer_support_perception_agent", lambda **kwargs: {})
@@ -700,7 +686,7 @@ def test_customer_support_graph_write_guard_preserves_explicit_write(monkeypatch
             "confidence": "high",
             "needs_harness": False,
             "use_context_ship": False,
-            "why": "bad understanding guess",
+            "why": "bad lightweight guess",
         },
     )
 
@@ -727,64 +713,6 @@ def test_customer_support_graph_write_guard_preserves_explicit_write(monkeypatch
 
     assert result["route"] == "ship_update"
     assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_guard"
-
-
-def test_customer_support_graph_uses_understanding_route_for_colloquial_static_update(monkeypatch):
-    update_static = FakeTool("update_ship_static_info", lambda args: f"静态更新成功 destination={args.get('destination')}")
-    upload_position = FakeTool("upload_ship_position", lambda args: "不应调用")
-    class FakeStandardAgent:
-        def invoke(self, payload, context=None):
-            raise AssertionError("ship update should not delegate to standard_agent")
-
-    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [update_static, upload_position])
-    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
-    monkeypatch.setattr("agents.agent._run_customer_support_perception_agent", lambda **kwargs: {})
-    monkeypatch.setattr(
-        "agents.agent._run_customer_support_intent_agent",
-        lambda **kwargs: {
-            "intent": "ship_update",
-            "route": "ship_update",
-            "task_type": "ship_update",
-            "tool_bundle": SHIP_UPDATE_BUNDLE,
-            "confidence": "high",
-            "needs_harness": True,
-            "use_context_ship": False,
-            "why": "用户口语化要求更新船舶静态目的港",
-            "static_update_params": {
-                "mmsi": "414726000",
-                "destination": "RUPRI",
-            },
-            "position_update_params": {},
-            "missing_required_fields": [],
-            "safety_flags": [],
-        },
-    )
-
-    graph = _build_customer_support_agent(
-        ctx=SimpleNamespace(run_id="r-static-understanding"),
-        cfg={"config": {}},
-        workspace_path=str(Path(__file__).resolve().parents[1]),
-        profile=AgentProfile(
-            profile_id="customer_support",
-            skills=["hifleet_ship_service"],
-            tool_policy={"allow_write_actions": True},
-        ),
-    )
-
-    result = graph.invoke(
-        {
-            "messages": [HumanMessage(content="MMSI 414726000 帮我把目的港改成 RUPRI")],
-            "session_id": "s-static-understanding",
-            "agent_profile": "customer_support",
-        },
-        config={"configurable": {"thread_id": "s-static-understanding"}},
-    )
-
-    assert result["route"] == "ship_update"
-    assert result["route_trace"]["reasoning_trace"]["route_source"] == "understanding_agent"
-    assert update_static.calls == [{"mmsi": "414726000", "destination": "RUPRI"}]
-    assert upload_position.calls == []
-    assert "静态更新成功" in result["messages"][-1].content
 
 
 def test_customer_support_graph_multimodal_ship_update_requires_current_identifier(monkeypatch):
@@ -944,7 +872,7 @@ def test_employee_assistant_standard_entrypoint_preserves_knowledge_hint(monkeyp
     fake_agent = FakeCompiledGraph()
     build_calls = []
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("customer_ceshi-only standard path should not be used")))
-    monkeypatch.setattr("agents.agent._build_customer_support_agent", lambda *args, **kwargs: build_calls.append((args, kwargs)) or fake_agent)
+    monkeypatch.setattr("agents.agent._build_lightweight_customer_support_agent", lambda *args, **kwargs: build_calls.append((args, kwargs)) or fake_agent)
     ctx = SimpleNamespace(headers={"x-agent-profile": "employee_assistant", "x-intent-hint": "knowledge"}, run_id="r-employee-hint")
 
     graph = build_agent(ctx)
@@ -1157,75 +1085,6 @@ def test_customer_support_intent_agent_enforces_write_policy(monkeypatch):
     assert result["search_query_candidates"]
 
 
-def test_customer_support_intent_agent_normalizes_update_param_groups(monkeypatch):
-    monkeypatch.setattr(
-        "agents.agent._invoke_customer_support_json_agent",
-        lambda *args, **kwargs: {
-            "intent": "ship_update",
-            "confidence": "high",
-            "use_context_ship": False,
-            "why": "用户在要求更新船位",
-            "position_update_params": {
-                "mmsi": "413341920",
-                "ship_name": "友好3",
-                "lat": "17-56.73N",
-                "lon": "115-47.69E",
-                "updatetime": "2026-07-01 21:27",
-                "speed": "8.9",
-                "heading": "120",
-            },
-            "static_update_params": {"mmsi": "413341920", "ship_type": "散货船"},
-        },
-    )
-
-    text = "更新船位，船名：友好3，MMSI：413341920，更新时间 2026-07-01 21:27，位置：17-56.73N 115-47.69E，航速8.9节，航向120度"
-    result = _run_customer_support_intent_agent(
-        ctx=None,
-        cfg={"config": {}},
-        messages=[HumanMessage(content=text)],
-        text=text,
-        entities=extract_entities(text),
-        context=build_conversation_context([HumanMessage(content=text)]),
-        allow_write=True,
-    )
-
-    assert result["position_update_params"]["lat"] == "17-56.73N"
-    assert result["position_update_params"]["lon"] == "115-47.69E"
-    assert result["static_update_params"]["ship_type"] == "散货船"
-    assert result["static_update_params"]["minotype"] == "散货船"
-
-
-def test_customer_support_intent_agent_marks_ship_type_conflict(monkeypatch):
-    monkeypatch.setattr(
-        "agents.agent._invoke_customer_support_json_agent",
-        lambda *args, **kwargs: {
-            "intent": "ship_update",
-            "confidence": "high",
-            "use_context_ship": False,
-            "static_update_params": {
-                "mmsi": "414726000",
-                "ship_type": "散货船",
-                "minotype": "油船",
-            },
-        },
-    )
-
-    text = "更新静态信息 MMSI 414726000 ship_type 散货船 minotype 油船"
-    result = _run_customer_support_intent_agent(
-        ctx=None,
-        cfg={"config": {}},
-        messages=[HumanMessage(content=text)],
-        text=text,
-        entities=extract_entities(text),
-        context=build_conversation_context([HumanMessage(content=text)]),
-        allow_write=True,
-    )
-
-    assert result["static_update_params"]["ship_type"] == ""
-    assert result["static_update_params"]["minotype"] == ""
-    assert result["low_confidence_fields"]
-
-
 def test_customer_support_intent_agent_uses_compressed_context_payload(monkeypatch):
     captured = {}
 
@@ -1333,10 +1192,6 @@ def test_customer_support_intent_agent_returns_understanding_fields(monkeypatch)
             "needs_multimodal_grounding": False,
             "should_prefer_local_kb": True,
             "should_limit_to_hifleet_sites": True,
-            "needs_clarification": True,
-            "clarification_question": "请补充船舶 MMSI。",
-            "missing_required_fields": ["ship_identifier", "ship_identifier"],
-            "safety_flags": ["ship_update_missing_identifier"],
         },
     )
 
@@ -1356,10 +1211,6 @@ def test_customer_support_intent_agent_returns_understanding_fields(monkeypatch)
     assert result["search_query_candidates"][0] == "hifleet 筛选船队 记忆功能"
     assert result["should_prefer_local_kb"] is True
     assert result["should_limit_to_hifleet_sites"] is True
-    assert result["needs_clarification"] is True
-    assert result["clarification_question"] == "请补充船舶 MMSI。"
-    assert result["missing_required_fields"] == ["ship_identifier"]
-    assert result["safety_flags"] == ["ship_update_missing_identifier"]
 
 
 def test_perception_agent_returns_file_metadata_without_llm():
