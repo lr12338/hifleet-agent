@@ -69,6 +69,13 @@ from agents.customer_support_router import (
     validate_links,
 )
 from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
+from agents.customer_support_evidence_guard import apply_high_risk_evidence_guard
+from agents.customer_support_scenarios import (
+    DestinationEtaScenario,
+    classify_destination_eta_scenario,
+    destination_eta_safe_response,
+)
+from agents.customer_support_understanding import build_customer_understanding
 from coze_coding_utils.runtime_ctx.context import default_headers
 from llm_config import DEFAULT_MULTIMODAL_MODEL, DEFAULT_TEXT_MODEL, build_thinking_payload, load_llm_config, resolve_thinking_settings
 from skills import SkillLoader
@@ -2702,6 +2709,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     def preprocess_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
         messages = list(state.get("messages", []) or [])
         text = _latest_user_text(messages)
+        initial_understanding = build_customer_understanding(text, has_media=_has_current_multimodal_media(messages)).model_dump()
         route_trace = {
             "run_id": str(getattr(ctx, "run_id", "") or ""),
             "session_id": str(state.get("session_id", "")),
@@ -2719,6 +2727,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 ],
                 "deprecated_customer_router_bypassed": True,
                 "v1_output_modalities": ["text", "link"],
+                "understanding_result": initial_understanding,
             },
         }
         if is_sensitive_internal_request(text):
@@ -2759,6 +2768,47 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "visible_features": str(perception.get("visible_features") or ""),
             "confidence": str(perception.get("confidence") or ""),
         }
+        understanding = build_customer_understanding(
+            text,
+            entities=asdict(extract_entities(text)),
+            has_media=_has_current_multimodal_media(messages),
+        ).model_dump()
+        route_trace["reasoning_trace"]["understanding_result"] = understanding
+        destination_eta_scenario = classify_destination_eta_scenario(text)
+        if destination_eta_scenario in {
+            DestinationEtaScenario.FRONTEND_CAPABILITY_QUESTION,
+            DestinationEtaScenario.EMAIL_UPDATE_QUESTION,
+            DestinationEtaScenario.AIS_DELAY_EXPLANATION,
+        }:
+            answer = destination_eta_safe_response(destination_eta_scenario)
+            route_trace["check_result"] = {
+                "has_answer": True,
+                "scenario_guard": destination_eta_scenario.value,
+                "deprecated_customer_router_bypassed": True,
+            }
+            route_trace["answer_confidence"] = "high"
+            route_trace["evidence_guard"] = {
+                "triggered": destination_eta_scenario != DestinationEtaScenario.AIS_DELAY_EXPLANATION,
+                "blocked_claims": [],
+                "fallback_reason": "destination_eta_boundary_guard",
+            }
+            return {
+                "phase": "done",
+                "phase_history": ["preprocess", "destination_eta_guard", "done"],
+                "status": "success",
+                "task_goal": text,
+                "messages": [AIMessage(content=answer)],
+                "perception_result": perception,
+                "generated_answer": answer,
+                "delegate_answer": answer,
+                "generated_tool_calls": [],
+                "delegate_input_message_count": len(messages),
+                "output_assets": _extract_output_assets(answer),
+                "check_result": dict(route_trace.get("check_result", {}) or {}),
+                "intent_hint": "knowledge",
+                "route_trace": route_trace,
+                "response_modalities": ["text"],
+            }
         if _is_ship_position_update_request(text):
             context = build_conversation_context(messages)
             current_user_text = _latest_user_text(messages)
@@ -2917,8 +2967,15 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         sanitized = sanitize_customer_output(raw_answer)
         if not sanitized:
             sanitized = guard_fallback
-        output_assets = _extract_output_assets(sanitized)
         route_trace = dict(state.get("route_trace", {}) or {})
+        understanding_result = dict((route_trace.get("reasoning_trace") or {}).get("understanding_result") or {})
+        guard_result = apply_high_risk_evidence_guard(
+            sanitized,
+            route_trace=route_trace,
+            scenario=str(understanding_result.get("scenario") or ""),
+        )
+        sanitized = guard_result.text
+        output_assets = _extract_output_assets(sanitized)
         tool_sequence = list(state.get("generated_tool_calls", []) or route_trace.get("tool_call_sequence", []) or _extract_tool_sequence(messages))
         check_result = {
             "has_answer": bool(raw_answer),
@@ -2927,6 +2984,18 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "deprecated_customer_router_bypassed": True,
             "output_asset_count": len(output_assets),
         }
+        if guard_result.triggered:
+            check_result["post_guard_applied"] = True
+            route_trace["evidence_guard"] = {
+                "triggered": True,
+                "blocked_claims": list(guard_result.blocked_claims),
+                "fallback_reason": guard_result.fallback_reason,
+            }
+        else:
+            route_trace.setdefault(
+                "evidence_guard",
+                {"triggered": False, "blocked_claims": [], "fallback_reason": None},
+            )
         route_trace["tool_call_sequence"] = tool_sequence
         route_trace["check_result"] = check_result
         route_trace["answer_confidence"] = "medium" if tool_sequence else "high"

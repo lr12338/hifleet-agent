@@ -10,6 +10,12 @@
 preprocess -> delegate standard skills agent -> finalize
 ```
 
+其中 ship_update 是轻量 graph 的确定性特殊分支：
+
+```text
+preprocess -> multimodal perception -> write_preflight_guard -> ship_update parse/validate/execute -> finalize
+```
+
 回归重点：
 
 1. 前置安全拦截。
@@ -26,7 +32,7 @@ preprocess -> delegate standard skills agent -> finalize
 12. 最终输出脱敏、链接抽取和 `output_assets`。
 13. `/run`、`/stream_run` 和微信旧 `content.query.prompt` 兼容。
 
-旧 `customer_support_router.py`、旧 planner/review/harness 和旧 `_build_customer_support_agent()` 仍保留为回滚与历史测试参考，但不再是当前 customer 入口。
+旧 `customer_support_router.py`、旧 planner/review/harness 和旧 `_build_customer_support_agent()` 不再承载当前 customer 的通用知识主链，但 ship_update 写请求仍会在 `write_preflight_guard` 分支中进入 `customer_support_router.py` 的受控执行链。
 
 Profile 选择只看请求体 `agent_profile` 或请求头 `x-agent-profile`；`source_channel` 只用于日志和后台筛选，不参与运行时 Profile 判断。未传合法 Profile 时默认 `customer_support`。
 
@@ -76,6 +82,13 @@ npm run build
 8. 最终 `messages[-1].content` 已经过 `sanitize_customer_output(...)`。
 9. 普通用户回复中不能出现 prompt、tool registry、reasoning trace、JSON、内部路径、key/token。
 
+如果是 ship_update 写请求，验收还应满足：
+
+1. `route_trace.route` 可为 `ship_update`。
+2. `route_trace.reasoning_trace.route_source` 应为 `write_preflight_guard`。
+3. `instruction_text`、`parsed_dynamic_fields`、`field_sources`、`resolved_identifier`、`write_args`、`missing_required_fields` 应足以解释是否真正进入写工具。
+4. 缺字段拦截时 `generated_tool_calls=[]`，不得委托标准 agent 补写。
+
 ## 4. 当前重点验收场景
 
 ### 4.1 知识问答
@@ -122,9 +135,12 @@ npm run build
 - 查询船位、档案、PSC、轨迹、挂靠和统计时，可调用对应读工具。
 - 明确“上传/更新/修改/补录船位”时，可调用 `upload_ship_position`。
 - 明确“更新/修改静态信息”时，可调用 `update_ship_static_info`。
+- 用户只说“更新船位”时，只走动态更新；图片里同时出现 `呼号 / AIS船名 / 船型` 时，不能自动切到静态更新。
+- 动态更新缺 `mmsi / lon / lat / updatetime` 任一项时，必须在解析层直接返回缺字段提示，`generated_tool_calls=[]`。
 - 缺少 MMSI、经纬度、更新时间或静态字段等必要信息时，只追问一个最关键字段。
 - 工具未返回成功时，不得宣称已更新成功。
 - “为什么不更新 / 更新慢 / 看不到最新船位”是解释或排障，不是写操作。
+- `IMO` 唯一命中可补全 MMSI；`船名` 唯一命中仍需确认，不直接写入。
 
 ### 4.5 微信旧接口
 
@@ -149,6 +165,9 @@ npm run build
   - 应先确认是否发生在 HiFleet 页面和具体操作，不应强行输出完整平台排障模板。
 - `这个圆圈是什么`
   - 无截图或前文上下文时，轻量确认是否在 HiFleet 地图/海图页面看到；有截图时按截图内容处理。
+- `我司2艘船在 BAY OF BENGAL 连续1-2天没有船位跟踪，AIS 工况正常，请后台看看什么问题`
+  - 属于排障/知识咨询，不应误进 ship_update。
+  - 若截图 OCR 中出现 `更新于`、`暂未收到更新船位`、`船位报告` 等词，也不能仅凭这些词当作写请求。
 
 ### 4.7 输出清洗
 
@@ -209,6 +228,18 @@ npm run build
    - 是否仍夹带搜索包装文本或内部信息。
 10. `latency_hotspot.total`
    - 是否存在异常慢请求。
+11. `route_trace.reasoning_trace.instruction_text`
+    - 当前轮文字意图是否被 OCR 重写文本冲淡。
+12. `route_trace.reasoning_trace.parsed_dynamic_fields`
+    - 解析层到底识别到了哪些动态字段。
+13. `route_trace.reasoning_trace.field_sources`
+    - 字段来自文本还是附件。
+14. `route_trace.reasoning_trace.resolved_identifier`
+    - 本轮最终用于写入的船舶标识是什么。
+15. `route_trace.reasoning_trace.write_args`
+    - 最终准备传给工具的参数是否完整。
+16. `route_trace.reasoning_trace.missing_required_fields`
+    - 是真实缺字段，还是误路由后自然缺字段。
 
 知识链额外看：
 

@@ -22,8 +22,41 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from langchain_openai import ChatOpenAI
 
 from llm_config import build_thinking_payload
+from agents.ship_update_extractor import extract_and_normalize_ship_update, extract_and_normalize_ship_update_contract, extract_ship_update_parameters_with_agent
 
 logger = logging.getLogger(__name__)
+
+SHIP_UPDATE_CONTRACT_EXTRACTION_PROMPT = """你是 HiFleet 客服 Agent 的船舶更新参数格式化器。
+你只能根据本轮用户文本和附件识别结果，按工具契约输出 JSON，不要调用工具，不要生成客服话术。
+
+工具契约：
+1. 船位更新 upload_ship_position
+- operation_type: position_update
+- 必填字段: mmsi, lon, lat, updatetime
+- 可选字段: speed, heading, course, draft, navstatus, destination, eta, ship_name, wechatgroup
+- updatetime 必须来自用户或附件，格式化为 yyyy-MM-dd HH:mm:ss；若用户写 2026-07-04 1443，应理解为 2026-07-04 14:43:00；若只有日期没有时分，保留原文并在 invalid_fields 标记缺少具体时分。
+- navstatus 是中文航行状态，例如 在航、锚泊、系泊、停泊、机动船在航、操纵能力受限。
+
+2. 静态信息更新 update_ship_static_info
+- operation_type: static_update
+- 必填字段: mmsi，且至少一个静态字段
+- 可选字段: ship_name, imo, ship_type, minotype, length, width, dwt, flag, callsign, built_year, destination, eta, draft, wechatgroup
+- 用户仅提供 IMO/船名作为识别信息时，不要因此判断为静态更新；只有明确要求更新静态/档案字段时才使用 static_update。
+
+输出 JSON schema:
+{
+  "operation_type": "position_update|static_update|mixed_update|unknown",
+  "fields": {"mmsi":"", "lon":"", "lat":"", "updatetime":"", "navstatus":""},
+  "raw_mentions": {"updatetime":"原文片段"},
+  "confidence": {"字段名": 0.0-1.0},
+  "ambiguities": ["说明不确定点"],
+  "missing_fields": [],
+  "invalid_fields": [],
+  "unsupported_fields": [],
+  "action_allowed": false,
+  "source": "llm_contract_extractor"
+}
+只输出 JSON 对象。"""
 
 HELP_CENTER_URL = "https://www.hifleet.com/helpcenter/?i18n=zh"
 HIFLEET_CHART_ICON_GUIDE_URL = "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming"
@@ -1481,6 +1514,48 @@ def _json_object_from_text(text: str) -> dict[str, Any]:
             return value if isinstance(value, dict) else {}
         except Exception:
             return {}
+
+
+def _invoke_ship_update_contract_llm(text: str, perception: dict[str, Any] | None = None) -> dict[str, Any]:
+    api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY", "").strip()
+    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL", "").strip()
+    if not api_key or not base_url:
+        return {}
+    payload = {
+        "user_text": text,
+        "perception": {
+            key: value
+            for key, value in dict(perception or {}).items()
+            if key in {"visible_text", "summary", "visible_features", "recognized_text", "confidence"}
+        },
+    }
+    llm = ChatOpenAI(
+        model=os.getenv("HIFLEET_SHIP_UPDATE_EXTRACT_MODEL", os.getenv("HIFLEET_T1_EVAL_MODEL", "deepseek-v4-flash-260425")),
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0.0,
+        streaming=False,
+        timeout=60,
+        extra_body={"thinking": build_thinking_payload("disabled")},
+    )
+    try:
+        raw = llm.invoke(
+            [
+                {"role": "system", "content": SHIP_UPDATE_CONTRACT_EXTRACTION_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ]
+        )
+    except Exception as exc:
+        logger.warning("[ShipUpdateContractExtractor] invoke failed: %s", exc)
+        return {}
+    content = getattr(raw, "content", raw)
+    if isinstance(content, list):
+        content = "\n".join(str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content)
+    result = _json_object_from_text(str(content or ""))
+    if isinstance(result.get("fields"), dict):
+        result["source"] = "llm_contract_extractor"
+        return result
+    return {}
 
 
 def _invoke_t1_eval_llm(question: str, structured_trace: dict[str, Any], evidence_items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3216,6 +3291,22 @@ def _merge_ship_update_fields(text_fields: dict[str, str], attachment_fields: di
     return merged, field_sources
 
 
+def _merge_semantic_ship_update_fields(
+    merged_fields: dict[str, str],
+    field_sources: dict[str, str],
+    semantic_fields: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    result = dict(merged_fields)
+    sources = dict(field_sources)
+    for key, value in semantic_fields.items():
+        if key in {"mmsi", "imo", "ship_name"}:
+            continue
+        if value and not result.get(key):
+            result[key] = value
+            sources[key] = "semantic"
+    return result, sources
+
+
 def _extract_ship_update_identifier_fields(text: str) -> dict[str, str]:
     normalized = normalize_message_text(text)
     if not normalized:
@@ -3341,6 +3432,24 @@ def parse_ship_update_request(
     text_fields = _parse_ship_update_text_fields(instruction_text)
     attachment_fields = _parse_ship_update_attachment_fields(perception)
     merged_fields, field_sources = _merge_ship_update_fields(text_fields, attachment_fields)
+    fallback_contract = extract_ship_update_parameters_with_agent(instruction_text, perception)
+    contract_payload = _invoke_ship_update_contract_llm(instruction_text, perception)
+    if contract_payload:
+        contract_fields = dict(contract_payload.get("fields") or {})
+        fallback_fields = dict(fallback_contract.fields or {})
+        for key in ("mmsi", "imo", "ship_name", "updatetime", "lon", "lat"):
+            if fallback_fields.get(key):
+                contract_fields[key] = fallback_fields[key]
+        contract_payload["fields"] = contract_fields
+        raw_mentions = {**dict(contract_payload.get("raw_mentions") or {}), **dict(fallback_contract.raw_mentions or {})}
+        contract_payload["raw_mentions"] = raw_mentions
+    if contract_payload:
+        semantic_extraction, semantic_normalized = extract_and_normalize_ship_update_contract(contract_payload)
+    else:
+        semantic_extraction, semantic_normalized = extract_and_normalize_ship_update_contract(fallback_contract.model_dump())
+        semantic_extraction.source = "fallback_contract_parser"
+    semantic_fields = dict(semantic_extraction.raw_fields or {})
+    merged_fields, field_sources = _merge_semantic_ship_update_fields(merged_fields, field_sources, semantic_fields)
     text_identifiers = _extract_ship_update_identifier_fields(instruction_text)
     attachment_identifiers = _extract_ship_update_identifier_fields(
         normalize_message_text(
@@ -3356,9 +3465,25 @@ def parse_ship_update_request(
     )
     identifiers = dict(attachment_identifiers)
     identifiers.update({key: value for key, value in text_identifiers.items() if value})
+    for key in ("mmsi", "imo", "ship_name"):
+        if semantic_fields.get(key) and not identifiers.get(key):
+            identifiers[key] = semantic_fields[key]
     static_update_requested, static_fields = _static_update_requested(instruction_text)
     write_mode = "static" if static_update_requested else "dynamic"
     resolved_identifier, identifier_message, needs_confirmation, identifier_failure_reason = _resolve_ship_update_identifier(identifiers, tool_map, trace)
+    if resolved_identifier.get("mmsi") and not semantic_fields.get("mmsi"):
+        semantic_fields["mmsi"] = resolved_identifier["mmsi"]
+    enriched_instruction = "\n".join([instruction_text, " ".join(f"{k}: {v}" for k, v in semantic_fields.items())])
+    if contract_payload:
+        contract_payload = {**contract_payload, "fields": {**dict(contract_payload.get("fields") or {}), **semantic_fields}}
+        for key in ("updatetime", "lon", "lat"):
+            if fallback_contract.fields.get(key):
+                contract_payload["fields"][key] = fallback_contract.fields[key]
+        semantic_extraction, semantic_normalized = extract_and_normalize_ship_update_contract(contract_payload)
+    else:
+        fallback_contract.fields = {**dict(fallback_contract.fields or {}), **semantic_fields}
+        semantic_extraction, semantic_normalized = extract_and_normalize_ship_update_contract(fallback_contract.model_dump())
+        semantic_extraction.source = "fallback_contract_parser"
     parse_result = ShipUpdateParseResult(
         write_mode=write_mode,
         resolved_identifier=resolved_identifier,
@@ -3370,6 +3495,26 @@ def parse_ship_update_request(
         static_fields=static_fields,
         failure_reason=identifier_failure_reason,
     )
+    parse_result.parsed_dynamic_fields = dict(merged_fields)
+    trace.reasoning_trace = {
+        **dict(trace.reasoning_trace or {}),
+        "ship_update_extraction": {
+            "source": semantic_extraction.source or "llm_contract_extractor",
+            "operation_type": semantic_extraction.operation_type,
+            "raw_fields": dict(semantic_extraction.raw_fields),
+            "contract_fields": dict(semantic_extraction.fields),
+            "raw_mentions": dict(semantic_extraction.raw_mentions),
+            "normalized_fields": dict(semantic_normalized.normalized_fields),
+            "missing_required_fields": list(semantic_normalized.missing_required_fields),
+            "invalid_fields": list(semantic_extraction.invalid_fields),
+            "unsupported_fields": list(semantic_extraction.unsupported_fields),
+            "ambiguities": list(semantic_extraction.ambiguities),
+            "suspicious_fields": list(semantic_normalized.suspicious_fields),
+            "can_write": semantic_normalized.can_write,
+            "need_user_confirmation": semantic_normalized.need_user_confirmation,
+            "updatetime_suggestion": semantic_normalized.updatetime_suggestion,
+        },
+    }
     if write_mode == "static":
         if not resolved_identifier.get("mmsi"):
             parse_result.missing_required_fields = ["MMSI"]
@@ -3387,13 +3532,55 @@ def parse_ship_update_request(
         if not parse_result.failure_reason:
             parse_result.failure_reason = "update_requires_mmsi"
         return parse_result
+    if not resolved_identifier.get("mmsi"):
+        parse_result.missing_required_fields = ["MMSI"]
+        parse_result.user_message = "更新船舶信息需要明确船舶身份标识。请提供 9 位 MMSI、IMO 或唯一船名。"
+        parse_result.failure_reason = "update_requires_mmsi"
+        parse_result.parsed_dynamic_fields = dict(merged_fields)
+        return parse_result
+    normalized_fields = dict(semantic_normalized.normalized_fields or {})
+    for key in ("lon", "lat"):
+        if normalized_fields.get(key):
+            merged_fields[key] = str(normalized_fields[key])
+    if normalized_fields.get("updatetime"):
+        merged_fields["updatetime"] = str(normalized_fields["updatetime"])
     missing_required = _ship_update_missing_required_fields(resolved_identifier, merged_fields)
+    if semantic_normalized.raw_updatetime and semantic_normalized.updatetime_error:
+        missing_required = [item for item in missing_required if item != "更新时间"]
+        missing_label = "具体时分" if semantic_normalized.updatetime_error == "缺少具体时分" else "有效更新时间"
+        if missing_label not in missing_required:
+            missing_required.append(missing_label)
+        parse_result.user_message = semantic_normalized.user_confirmation_message
+        parse_result.failure_reason = "update_missing_time_of_day" if semantic_normalized.updatetime_error == "缺少具体时分" else "update_invalid_updatetime"
+        parse_result.needs_confirmation = True
+        parse_result.missing_required_fields = missing_required
+        parse_result.parsed_dynamic_fields = dict(merged_fields)
+        parse_result.format_errors = [semantic_normalized.updatetime_error]
+        return parse_result
+    if semantic_normalized.position_error:
+        parse_result.user_message = semantic_normalized.user_confirmation_message
+        parse_result.failure_reason = "update_invalid_position"
+        parse_result.needs_confirmation = True
+        parse_result.missing_required_fields = list(semantic_normalized.missing_required_fields)
+        parse_result.parsed_dynamic_fields = dict(merged_fields)
+        parse_result.format_errors = [semantic_normalized.position_error]
+        return parse_result
+    if semantic_normalized.suspicious_fields:
+        parse_result.user_message = semantic_normalized.user_confirmation_message
+        parse_result.failure_reason = "update_suspicious_fields"
+        parse_result.needs_confirmation = True
+        parse_result.missing_required_fields = list(semantic_normalized.missing_required_fields)
+        parse_result.parsed_dynamic_fields = dict(merged_fields)
+        parse_result.format_errors = list(semantic_normalized.suspicious_fields)
+        return parse_result
     parse_result.missing_required_fields = missing_required
     if missing_required:
         parse_result.user_message = "更新船位缺少必填字段：" + "、".join(missing_required) + "。请补充后我再更新；当前仅会按本轮明确提供的信息写入。"
         parse_result.failure_reason = "update_missing_required_fields"
         return parse_result
     parse_result.args = _build_dynamic_update_args(resolved_identifier, merged_fields)
+    if semantic_normalized.normalized_updatetime:
+        parse_result.args["updatetime"] = semantic_normalized.normalized_updatetime
     return parse_result
 
 
@@ -3435,19 +3622,30 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
         "write_args": dict(parse_result.args),
         "static_fields": list(parse_result.static_fields),
     }
+    ship_update_extraction = dict(trace.reasoning_trace.get("ship_update_extraction") or {})
+    if ship_update_extraction:
+        trace.check_result = {
+            **dict(trace.check_result or {}),
+            "ship_update_extraction": ship_update_extraction,
+        }
     if parse_result.user_message:
         trace.fallback_reason = parse_result.failure_reason
         trace.check_result = {
             "entity_resolved": bool(parse_result.resolved_identifier.get("mmsi")),
             "missing_required_fields": list(parse_result.missing_required_fields),
             "needs_confirmation": parse_result.needs_confirmation,
+            "ship_update_extraction": ship_update_extraction,
         }
         return parse_result.user_message
     if parse_result.write_mode == "static":
         out = _invoke_tool(tool_map, trace, "update_ship_static_info", parse_result.args)
     else:
         out = _invoke_tool(tool_map, trace, "upload_ship_position", parse_result.args)
-    trace.check_result = {"entity_resolved": True, "write_result": "成功" in out or "更新成功" in out}
+    trace.check_result = {
+        "entity_resolved": True,
+        "write_result": "成功" in out or "更新成功" in out,
+        "ship_update_extraction": ship_update_extraction,
+    }
     trace.answer_confidence = "high" if trace.check_result["write_result"] else "medium"
     return out
 

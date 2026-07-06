@@ -40,7 +40,7 @@ flowchart TD
 | `src/skills/multimodal_support/tools.py` | 附件 metadata 辅助 |
 | `src/skills/browser_verify/tools.py` | 公开网页核验、`agent_browser_deep_search` |
 
-`src/agents/customer_support_router.py` 和旧 `_build_customer_support_agent()` 仍保留用于回滚与旧测试，但当前 `build_agent()` 已不再把 `customer_support` 路由到旧 planner/harness graph。
+`src/agents/customer_support_router.py` 和旧 `_build_customer_support_agent()` 不再承担当前 `customer_support` 的通用知识主链，但 ship_update 这类确定性写请求仍会在轻量 graph 的 `write_preflight_guard` 分支中进入 `execute_update_chain(...)` 做解析、校验和执行。它们既是回滚与旧测试参考，也是当前船舶写操作的受控执行模块。
 
 Profile 解析规则：
 
@@ -54,7 +54,7 @@ Profile 解析规则：
 | --- | --- | --- |
 | 面向对象 | 外部客户、微信客服、WebSDK、CRM；兼容旧 `employee_assistant` 调用 | 内部测试、后台运营 |
 | 主目标 | 直接回复客户，并在需要时调用 allowed skills | 帮员工完成知识问答、文件检查、表格分析和产物任务 |
-| 主执行方式 | `preprocess -> delegate -> finalize` 轻量 graph | 标准 tool-calling agent，保留 employee workspace 能力 |
+| 主执行方式 | 轻量 graph；默认 `preprocess -> delegate -> finalize`，ship_update 为 `write_preflight_guard -> ship_update` 特殊分支 | 标准 tool-calling agent，保留 employee workspace 能力 |
 | 模型 | 默认 `doubao-seed-2-0-lite-260428` | 同后台配置，默认也可使用 Seed Lite |
 | 多模态 | 支持文本、图片、语音、视频当前轮理解 | 支持多模态转写/理解后进入内部流程 |
 | 船舶工具 | 允许读写 ship service 工具 | 允许读写 ship service 工具 |
@@ -88,8 +88,11 @@ flowchart TD
     Pre -->|敏感内部请求| Refuse[固定拒答]
     Pre -->|有多模态| Perception[Seed Lite direct perception]
     Perception --> Rewrite[把转写/可见文字/摘要注入当前轮文本]
+    Rewrite --> WriteGuard[write_preflight_guard]
     Pre --> Delegate[standard tool-calling skills agent]
     Rewrite --> Delegate
+    WriteGuard --> ShipUpdate[ship_update parse/validate/execute]
+    ShipUpdate --> Finalize[finalize + output guard]
     Delegate --> Tools[模型自主选择 allowed tools]
     Tools --> Answer[模型整合工具结果]
     Answer --> Finalize[finalize + output guard]
@@ -104,9 +107,29 @@ flowchart TD
 - 检测当前轮是否包含 `image_url`、`input_audio`、`video_url`。
 - 对多模态输入调用 `doubao-seed-2-0-lite-260428` 做当前轮 direct perception。
 - 如果识别到音频转写、截图文字、图像/视频摘要、疑似符号或疑似问题，则替换当前轮用户文本，让后续 tool-calling agent 基于“文字 + 感知摘要”继续处理。
+- 如果当前轮命中明确写请求，轻量 graph 会先经过 `write_preflight_guard` 判断是否应直接进入 ship_update 受控链路，而不是先委托标准 skills agent。
 - 写入 `route_trace.reasoning_trace.pipeline` 和 `perception_summary`，仅用于后台观测。
 
-### 3.2 delegate
+### 3.2 write_preflight_guard 与 ship_update 特殊分支
+
+`customer_support` 的大多数请求会进入标准 skills agent，但船舶写操作是一个例外：
+
+- 只有用户当前轮明确表达“更新 / 上传 / 修改 / 补录船位或静态信息”时，才会从轻量 graph 命中 `write_preflight_guard`。
+- 命中后进入 `src/agents/customer_support_router.py` 的 ship_update 受控执行链，而不是完全交给标准 skills agent 自主规划。
+- 这条链路当前执行方式是：
+  `preprocess -> multimodal perception -> write_preflight_guard -> ship_update parse/validate/execute -> finalize`
+
+ship_update 当前规则：
+
+- 动态/静态写模式只由当前轮指令文本决定；图片里出现 `呼号 / AIS船名 / 船型` 不会自动把“更新船位”切成静态更新。
+- 参数解析只用当前轮文本和当前轮 perception，不复用历史船舶标识。
+- 动态更新缺 `mmsi / lon / lat / updatetime` 任一项时，直接在解析层返回缺字段提示，不调用写工具。
+- 当前轮仅提供 `IMO` 或 `船名` 时，最多触发一次 `ship_search`：
+  - `IMO` 唯一命中可直接补全 MMSI。
+  - `船名` 唯一命中仍要求用户确认 MMSI，避免写错船。
+- `execute_update_chain(...)` 当前是薄执行器，真正的字段抽取、缺字段提示和工具入参组装都来自单次解析结果对象。
+
+### 3.3 delegate
 
 `delegate` 调用 `_build_standard_agent(...)` 构造的标准 tool-calling agent。
 
@@ -127,7 +150,7 @@ flowchart TD
 - 船舶读写：`ship_search`、`get_ship_position`、`get_ship_archive`、`get_ship_trajectory`、`upload_ship_position`、`update_ship_static_info` 等
 - 多模态辅助：`inspect_media_attachment`
 
-### 3.3 finalize
+### 3.4 finalize
 
 `finalize` 做客户可见输出收口：
 
@@ -211,6 +234,12 @@ flowchart TD
 - 静态信息写操作至少需要 MMSI 和一个静态字段，例如船名、IMO、船型、尺寸、船旗、呼号、建造年份、目的港、ETA 或吃水。
 - 缺字段时只追问一个最关键字段。
 - 工具没有明确成功时，不能对外宣称已更新成功。
+
+当前 ship_update 的解析与风控补充：
+
+- 动态写入的必填最小集合是 `mmsi / lon / lat / updatetime`，而不是“任意动态字段即可写”。
+- `route_trace.reasoning_trace` 中当前会记录 `instruction_text`、`parsed_dynamic_fields`、`field_sources`、`resolved_identifier`、`write_args`、`missing_required_fields`，便于解释为何没有调用工具。
+- 若 OCR 文本里出现 `更新于`、`暂未收到更新船位`、`船位报告` 等词，而用户真实意图是在咨询异常原因，当前仍存在误触发 ship_update 的风险；排查时不要只看 `route=ship_update`，还要结合 `instruction_text` 与 `missing_required_fields` 判断是否误路由。
 
 ## 7. 知识检索与授权写库
 
@@ -326,4 +355,4 @@ flowchart TD
 - 改知识检索工具：改 `src/skills/knowledge_qa/tools.py` 及 runtime 文件。
 - 改授权写库：改 `src/skills/knowledge_admin/tools.py`。
 - 改船舶读写：改 `src/skills/hifleet_ship_service/tools.py`。
-- 旧 `customer_support_router.py` 暂时只作为回滚和旧测试参考，不再是当前 customer 主链入口。
+- 旧 `customer_support_router.py` 不再承载当前 customer 的通用知识主链，但仍承载 ship_update 的确定性写请求解析与执行。

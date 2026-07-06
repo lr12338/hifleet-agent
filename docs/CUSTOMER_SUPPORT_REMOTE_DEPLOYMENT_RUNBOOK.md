@@ -3,7 +3,7 @@
 本文面向把当前项目部署到其他 Linux 服务器上测试的开发人员，目标是快速确认：
 
 - 服务是否按当前代码真实启动。
-- `customer_support` 是否走到轻量全模态 skills agent，而不是旧 router/planner/harness 链。
+- `customer_support` 是否走到轻量全模态 skills agent，并在 ship_update 场景下正确进入 `write_preflight_guard` 特殊分支，而不是误用旧主链。
 - 微信客服旧 `/run` 调用、多模态预处理、船舶读写工具、knowledge/browser fallback 和会话记忆是否在远端生效。
 
 ## 0. 当前客服主链快照
@@ -13,6 +13,8 @@
 ```text
 前置安全检查
 -> 多模态 direct perception（文本/语音/图片/视频）
+-> 明确写请求时进入 write_preflight_guard
+-> ship_update parse/validate/execute（仅 ship_update）
 -> 标准 tool-calling skills agent
 -> 模型自主选择 knowledge / browser / ship / multimodal tools
 -> finalize + customer output guard
@@ -22,11 +24,12 @@
 关键点：
 
 - 默认文本模型和多模态模型统一为 `doubao-seed-2-0-lite-260428`，`thinking_type=enabled`，`reasoning_effort=medium`。
-- 当前入口是 `src/agents/agent.py` 中的 `_build_lightweight_customer_support_agent()`；旧 `customer_support_router.py` 和旧 `_build_customer_support_agent()` 只保留用于回滚与旧测试。
+- 当前入口是 `src/agents/agent.py` 中的 `_build_lightweight_customer_support_agent()`；但 ship_update 写请求仍会从 `write_preflight_guard` 进入 `src/agents/customer_support_router.py` 的受控执行链。
 - Profile 只由请求体 `agent_profile` 或请求头 `x-agent-profile` 决定；`source_channel` 只用于日志和后台筛选。
 - 当前不再插入自定义历史上下文摘要；完整文本历史交给 agent/checkpointer，历史多媒体 URL 只做安全脱敏。
 - `customer_support` 允许调用 HiFleet 船舶读写工具，但不启用 Python、沙盒、employee workspace、任意文件读写或产物生成。
 - `agent_browser_deep_search` 只用于公开网页核验；最终客户回复不得暴露工具名、JSON、prompt、路径、日志或 key/token。
+- ship_update 当前解析只使用当前轮文本和当前轮 perception，不复用历史船舶标识。
 
 ## 1. 先确认版本
 
@@ -111,7 +114,7 @@ PYTHONPATH=src ./.venv/bin/python -m pytest -q tests/test_customer_support_inten
 - `customer_support` 工具列表包含船舶读写工具，且不包含 sandbox / Python / employee workspace 工具。
 - 当前 `build_agent()` 已把 `customer_support` 路由到轻量 graph。
 - 文本、语音、图片/视频感知摘要能注入当前轮问题。
-- 旧 router 测试仍可作为回滚兼容检查。
+- ship_update 的解析、缺字段拦截和误路由保护仍通过 `tests/test_customer_support_router.py` / `tests/test_customer_support_intent_agent.py` 做兼容回归。
 
 如果远端 Python 环境暂时无法完整跑 pytest，至少先做语法级检查：
 
@@ -330,9 +333,30 @@ curl -X POST http://127.0.0.1:10123/run \
 预期：
 
 - 用户明确要求更新时才调用 `upload_ship_position` 或相应写工具。
+- 用户只说“更新船位”时只走动态更新，不因图片里出现 `呼号 / AIS船名 / 船型` 自动切到静态更新。
 - 缺字段时只追问一个最关键字段。
+- 动态更新缺 `mmsi / lon / lat / updatetime` 任一项时，应直接返回缺字段提示，`generated_tool_calls=[]`。
 - 工具未返回成功时，不得宣称已更新成功。
 - 成功时回复可说明“已按接口返回结果处理”，并保留必要风险提示。
+
+### 5.7 测 ship_update 误路由保护
+
+```bash
+curl -X POST http://127.0.0.1:10123/run \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "我司2艘船在 BAY OF BENGAL 连续1-2天没有船位跟踪，AIS 工况正常，请帮后台看看什么问题"}],
+    "session_id": "remote-smoke-ship-troubleshooting-001",
+    "user_id": "remote-dev",
+    "source_channel": "websdk",
+    "agent_profile": "customer_support"
+  }'
+```
+
+预期：
+
+- 这类“为什么没船位 / 连续 1-2 天不更新 / 后台帮看什么问题”属于排障或知识咨询，不应误进 ship_update。
+- 如果截图 OCR 中同时出现 `更新于`、`暂未收到更新船位`、`船位报告` 等词，仍要结合用户当前轮文字意图判断，不应直接当作写请求。
 
 ## 6. 远端重点观察字段
 
@@ -348,6 +372,12 @@ curl -X POST http://127.0.0.1:10123/run \
 - `response_modalities`
 - `output_assets`
 - `check_result`
+- `route_trace.reasoning_trace.instruction_text`
+- `route_trace.reasoning_trace.parsed_dynamic_fields`
+- `route_trace.reasoning_trace.field_sources`
+- `route_trace.reasoning_trace.resolved_identifier`
+- `route_trace.reasoning_trace.write_args`
+- `route_trace.reasoning_trace.missing_required_fields`
 
 ### 6.1 你想看到什么
 
@@ -356,7 +386,8 @@ curl -X POST http://127.0.0.1:10123/run \
 - 知识弱命中时，`generated_tool_calls` 里可看到 browser 或 knowledge 工具调用。
 - 多模态输入时，`perception_summary` 能说明音频转写、截图文字、视频摘要或附件识别结果。
 - 链接型图文输出进入 `output_assets`，`response_modalities` 包含 `text` 和可能的 `link`。
-- `check_result.deprecated_customer_router_bypassed` 为真，表示旧 customer router 没有作为当前入口执行。
+- `check_result.deprecated_customer_router_bypassed` 为真，表示旧 planner/review/harness customer router 没有作为当前知识主链执行；若是 ship_update，仍可能进入 `customer_support_router.py` 的受控写链路。
+- 如果是 ship_update 写请求，允许看到 `route_trace.route=ship_update` 且 `route_source=write_preflight_guard`；此时应继续结合 `instruction_text`、`parsed_dynamic_fields`、`write_args` 判断是正常写链路还是误路由。
 
 ### 6.2 你不想看到什么
 
@@ -364,6 +395,7 @@ curl -X POST http://127.0.0.1:10123/run \
 - 最终回复里出现内部路径、命令、`.env`、`token`、`key`。
 - 未明确写操作时调用船舶写工具。
 - 工具失败时回复“已更新成功”。
+- 用户是在咨询船位异常原因，但仅因 OCR 中出现 `更新于 / 暂未收到更新船位` 就误进 ship_update。
 
 ## 7. 常见远端问题
 
@@ -410,6 +442,15 @@ cd /home/ecs-user/coze_ai
 4. `config/agent_profiles.json` 是否注册了正确 skills 和工具权限。
 5. 模型是否返回了可被最终收口层清洗的客户可见文本。
 
+### 7.3.1 日志里 route=ship_update，但用户其实在报异常
+
+优先排查：
+
+1. `route_trace.reasoning_trace.instruction_text` 里是否混入大量 OCR “更新”字样，掩盖了用户真实排障意图。
+2. `parsed_dynamic_fields` 是否只有 `destination / eta / draft / speed / navstatus` 这类非必填字段，而 `write_args` 为空。
+3. `missing_required_fields` 是否为 `经度 / 纬度 / 更新时间`，说明解析层已识别为“像写请求，但当前轮字段不够”。
+4. `perception_summary.visible_text` 中是否出现 `更新于`、`暂未收到更新船位`、`船位报告` 等词；若有，要结合用户当前轮文字重新判断是否本应走知识/排障链路。
+
 ### 7.4 截图/语音/视频问题没有纳入当前轮
 
 优先排查：
@@ -432,13 +473,13 @@ cd /home/ecs-user/coze_ai
 
 ## 8. 开发同学建议阅读顺序
 
-1. [docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md](CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md)
-2. [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
-3. [docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md](CUSTOMER_SUPPORT_KB_OPERATIONS.md)
-4. [docs/API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md)
-5. [docs/agent_browser_fallback_integration.md](agent_browser_fallback_integration.md)
-6. [docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md)
+1. [docs/AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md)
+2. [docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md](CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md)
+3. [docs/CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md)
+4. [docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md](CUSTOMER_SUPPORT_KB_OPERATIONS.md)
+5. [docs/API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md)
+6. [docs/agent_browser_fallback_integration.md](agent_browser_fallback_integration.md)
 7. [config/profiles/customer_support.md](../config/profiles/customer_support.md)
 8. [src/agents/agent.py](../src/agents/agent.py)
 9. [src/agents/customer_support_guard.py](../src/agents/customer_support_guard.py)
-10. [src/skills/browser_verify/tools.py](../src/skills/browser_verify/tools.py)
+10. [src/agents/customer_support_router.py](../src/agents/customer_support_router.py)
