@@ -715,6 +715,58 @@ def test_customer_support_graph_write_guard_overrides_light_agent(monkeypatch):
     assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_guard"
 
 
+def test_customer_ceshi_profile_uses_lightweight_guarded_graph(monkeypatch):
+    built = {}
+
+    class FakeGraph:
+        pass
+
+    monkeypatch.setattr("agents.agent._build_lightweight_customer_support_agent", lambda *args, **kwargs: built.setdefault("graph", FakeGraph()))
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("customer_ceshi must not use standard agent")))
+    set_current_agent_profile("customer_ceshi")
+
+    try:
+        graph = build_agent(ctx=SimpleNamespace(run_id="r-customer-ceshi"))
+    finally:
+        set_current_agent_profile("customer_support")
+
+    assert graph is built["graph"]
+
+
+def test_lightweight_ship_update_has_readable_trace_summary(monkeypatch):
+    position = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position])
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None, config=None):
+            raise AssertionError("ship update preflight guard should not delegate")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-readable-trace"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_ceshi", skills=["hifleet_ship_service"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="请更新船位 MMSI 730285526 经度 121°41.23′ E 纬度 39°00.41′ N 更新时间 2026-07-04 1443")],
+            "session_id": "s-readable-trace",
+            "agent_profile": "customer_ceshi",
+        },
+        config={"configurable": {"thread_id": "s-readable-trace"}},
+    )
+
+    summary = result["route_trace"]["readable_trace"]["agent_process_summary"]
+    assert "用户输入：" in summary
+    assert "字段提取：" in summary
+    assert "工具调用：upload_ship_position" in summary
+    assert "Guard状态：" in summary
+    assert "prompt" not in summary.lower()
+    assert "/home/" not in summary
+
+
 def test_customer_support_graph_multimodal_ship_update_requires_current_identifier(monkeypatch):
     position = FakeTool("upload_ship_position", lambda args: "不应调用")
     monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [position])

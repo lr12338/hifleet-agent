@@ -59,6 +59,7 @@ def normalize_coord(value: str, *, expected_axis: str) -> tuple[float | None, bo
         .replace("”", '"')
         .strip()
     )
+    compact = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "°", compact)
     compact = re.sub(r"\s+", " ", compact)
     direction_match = re.search(r"([NSEWnsew东西南北])", compact)
     direction = direction_match.group(1).upper() if direction_match else ""

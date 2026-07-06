@@ -69,7 +69,7 @@ class ShipPositionUpdateExtraction(BaseModel):
     notes: str | None = None
 
 
-COORD_VALUE = r"(?:(?:[NSEWnsew东南西北](?![A-Za-z])\s*)?\d{1,3}(?:\.\d+)?(?:\s*[°度]\s*\d{1,2}(?:\.\d+)?\s*(?:[′'分])?)?(?:\s*[NSEWnsew东南西北](?![A-Za-z]))?)"
+COORD_VALUE = r"(?:(?:[NSEWnsew东南西北](?![A-Za-z])\s*)?\d{1,3}(?:\.\d+)?(?:(?:\s*[°度-]\s*|\s+)\d{1,2}(?:\.\d+)?\s*(?:[′'分])?)?(?:\s*[NSEWnsew东南西北](?![A-Za-z]))?)"
 TIME_VALUE = r"(?:2?20\d{2}[-/年]\d{1,2}[-/月]\d{1,2}(?:日)?(?:[ T]\d{1,2}(?:(?::|：)?\d{2})(?:(?::|：)\d{1,2})?)?)"
 
 
@@ -136,6 +136,9 @@ def extract_ship_update_parameters_with_agent(text: str, perception: dict[str, A
         fields["lon"] = pair_lon
     if pair_lat:
         fields["lat"] = pair_lat
+    compact_pair = _extract_directional_coordinate_pair(source)
+    if compact_pair[0] or compact_pair[1]:
+        fields["lon"], fields["lat"] = compact_pair
     fields["speed"] = _last_match(r"(?:航速|速度|speed|sog|SOG|对地/水航速|对地航速)[:：\s]*(\d+(?:\.\d+)?)", source)
     heading, course = _extract_heading_course(source)
     fields["heading"] = heading or _last_match(r"(?:船首向|船艏向|航首向|heading|hdg|HDG)[:：\s]*(\d+(?:\.\d+)?)", source)
@@ -190,6 +193,16 @@ def _extract_heading_course(text: str) -> tuple[str, str]:
     if not match:
         return "", ""
     return _clean(match.group(1)), _clean(match.group(2))
+
+
+def _extract_directional_coordinate_pair(text: str) -> tuple[str, str]:
+    coord = r"\d{1,3}(?:[°度-]\s*|\s+)\d{1,2}(?:\.\d+)?\s*(?:[′'分])?\s*[NSEWnsew东南西北]"
+    matches = [_clean(item.group(0)) for item in re.finditer(coord, text or "", flags=re.IGNORECASE)]
+    if len(matches) < 2:
+        return "", ""
+    lon = next((item for item in matches if re.search(r"[EWew东西]", item)), "")
+    lat = next((item for item in matches if re.search(r"[NSns南北]", item)), "")
+    return lon, lat
 
 
 def _extract_navstatus(text: str) -> str:

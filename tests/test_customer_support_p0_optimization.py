@@ -136,6 +136,31 @@ def test_ship_update_extractor_handles_decimal_with_direction_aliases():
     assert extraction.can_write is True
 
 
+def test_ship_update_extractor_handles_hyphen_dmm_pair():
+    extraction, normalized = extract_and_normalize_ship_update(
+        "更新船位 MMSI:375066971 位置：25-15.61n 056-29.1e 更新时间：2026-07-03 1010 (UTC+8)"
+    )
+
+    assert extraction.mmsi == "375066971"
+    assert extraction.raw_updatetime == "2026-07-03 1010"
+    assert extraction.normalized_updatetime == "2026-07-03 10:10:00"
+    assert normalized.latitude_decimal == 25.260167
+    assert normalized.longitude_decimal == 56.485
+    assert extraction.can_write is True
+
+
+def test_ship_update_extractor_handles_quoted_dmm_pair():
+    extraction, normalized = extract_and_normalize_ship_update(
+        "请更新船位 MMSI:730285526 POSN 02°27.805'N 119°34.947'E 更新时间 2026-07-03 1010 (UTC+8)"
+    )
+
+    assert extraction.mmsi == "730285526"
+    assert normalized.latitude_decimal == 2.463417
+    assert normalized.longitude_decimal == 119.58245
+    assert extraction.normalized_updatetime == "2026-07-03 10:10:00"
+    assert extraction.can_write is True
+
+
 def test_lightweight_ship_update_invalid_time_precise_feedback(monkeypatch):
     position = FakeTool("upload_ship_position", lambda args: "不应调用")
     graph = _graph(monkeypatch, tools=[position])

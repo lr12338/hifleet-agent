@@ -843,6 +843,40 @@ def test_update_chain_executes_with_minimum_position_fields():
     assert "更新成功" in output
 
 
+def test_update_chain_tool_error_does_not_wrap_success():
+    upload = FakeTool("upload_ship_position", lambda args: "更新成功标记不可用：接口失败 timeout")
+    text = "请更新船位 MMSI 730285526 经度 121°41.23′ E 纬度 39°00.41′ N 更新时间 2026-07-04 1443"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"upload_ship_position": upload}, trace)
+
+    assert upload.calls
+    assert "暂未成功提交" in output
+    assert "更新成功" not in output
+    assert trace.check_result["write_result"] is False
+    assert trace.check_result["write_result_status"]["status"] == "error"
+
+
+def test_update_chain_static_destination_eta_backend_request():
+    static_update = FakeTool("update_ship_static_info", lambda args: "静态信息更新成功！")
+    text = "更新目的港，mmsi：375066971，ZHENHAI / 2026-07-05 11:30 (UTC)"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"update_ship_static_info": static_update}, trace)
+
+    assert "静态信息更新成功" in output
+    assert static_update.calls == [
+        {
+            "mmsi": "375066971",
+            "destination": "ZHENHAI",
+            "eta": "2026-07-05 11:30:00",
+        }
+    ]
+    assert trace.reasoning_trace["write_mode"] == "static"
+
+
 def test_update_chain_ship_name_unique_match_requires_confirmation():
     search = FakeTool("ship_search", lambda args: "YU MING\nMMSI: 414726000 | IMO: 9613886")
     upload = FakeTool("upload_ship_position", lambda args: f"更新成功 MMSI={args['mmsi']}")

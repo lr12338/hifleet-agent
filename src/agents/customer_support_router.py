@@ -1722,6 +1722,48 @@ def _invoke_tool(tool_map: dict[str, Any], trace: HarnessTrace, name: str, args:
     return str(result)
 
 
+def classify_write_tool_result(output: Any) -> dict[str, Any]:
+    text = normalize_message_text(str(output or ""))
+    lowered = text.lower()
+    if not text:
+        return {"status": "empty", "success": False, "reason": "empty_tool_result"}
+    error_markers = (
+        "失败",
+        "错误",
+        "无法",
+        "未提供",
+        "缺少",
+        "不能",
+        "未能",
+        "timeout",
+        "timed out",
+        "error",
+        "exception",
+        "bad_input",
+        "failed",
+    )
+    uncertain_markers = ("未知", "不确定", "结果:", "unknown", "partial", "uncertain")
+    if any(marker in lowered or marker in text for marker in error_markers):
+        return {"status": "error", "success": False, "reason": "tool_reported_error"}
+    if any(marker in lowered or marker in text for marker in uncertain_markers):
+        return {"status": "uncertain", "success": False, "reason": "tool_result_uncertain"}
+    if any(marker in text for marker in ("更新成功", "上传成功", "船位更新成功", "静态信息更新成功")):
+        return {"status": "ok", "success": True, "reason": "explicit_success_text"}
+    if "success" in lowered and not any(marker in lowered for marker in ("false", "no success", "unsuccess")):
+        return {"status": "ok", "success": True, "reason": "explicit_success_text"}
+    return {"status": "uncertain", "success": False, "reason": "missing_explicit_success"}
+
+
+def _write_failure_closure(write_mode: str, result_status: dict[str, Any]) -> str:
+    target = "静态信息更新" if write_mode == "static" else "船位更新"
+    status = str(result_status.get("status") or "uncertain")
+    if status == "empty":
+        return f"本次{target}暂未成功提交：工具没有返回明确结果。请稍后重试，或联系人工客服处理。"
+    if status == "uncertain":
+        return f"本次{target}暂未确认成功，系统没有返回明确成功状态。请稍后重试，或联系人工客服核实处理。"
+    return f"本次{target}暂未成功提交。请检查字段后稍后重试，或联系人工客服处理。"
+
+
 def _format_local_kb_payload(payload: dict[str, Any]) -> str:
     if not payload.get("can_answer"):
         return "未检索到足够可信的信息：本地知识库仅命中补充参考，不能直接回答当前问题。"
@@ -3068,8 +3110,8 @@ SHIP_UPDATE_STATIC_INSTRUCTION_PATTERNS = {
     "draft": r"(?:修改|更新|改|补充)\s*(?:设计吃水|静态吃水|draft|draught)",
 }
 SHIP_UPDATE_DYNAMIC_FIELD_PATTERNS = {
-    "lon": r"(?:经度|lon|longitude)[:：\s]*([^\s，,；;]+)",
-    "lat": r"(?:纬度|lat|latitude)[:：\s]*([^\s，,；;]+)",
+    "lon": r"(?:经度|lon|longitude)[:：\s]*(\d{1,3}(?:\.\d+)?(?:(?:\s*[°度-]\s*|\s+)\d{1,2}(?:\.\d+)?\s*(?:[′'分])?)?\s*[EWew东西]?)",
+    "lat": r"(?:纬度|lat|latitude)[:：\s]*(\d{1,3}(?:\.\d+)?(?:(?:\s*[°度-]\s*|\s+)\d{1,2}(?:\.\d+)?\s*(?:[′'分])?)?\s*[NSns南北]?)",
     "speed": r"(?:航速|speed)[:：\s]*(\d+(?:\.\d+)?)",
     "heading": r"(?:航首向|船首向|heading)[:：\s]*(\d+(?:\.\d+)?)",
     "course": r"(?:航迹向|course)[:：\s]*(\d+(?:\.\d+)?)",
@@ -3173,19 +3215,26 @@ def _looks_like_coordinate_value(value: str) -> bool:
         return False
     if re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
         return True
-    return bool(re.fullmatch(r"\d{1,3}°\s*\d+(?:\.\d+)?[′']?\s*[EWNSewns]", normalized))
+    return bool(re.fullmatch(r"\d{1,3}(?:°|-)\s*\d+(?:\.\d+)?[′']?\s*[EWNSewns]", normalized))
 
 
 def _extract_position_pair_from_text(text: str) -> tuple[str, str]:
     normalized = normalize_message_text(text)
+    coord = r"[0-9]{1,3}(?:°|-)\s*\d+(?:\.\d+)?[′']?\s*[NSEWnsew]"
     match = re.search(
-        r"(?:位置|posn|position)[:：\s]*([0-9]{1,3}°\s*\d+(?:\.\d+)?[′']?\s*[NSns])\s+([0-9]{1,3}°\s*\d+(?:\.\d+)?[′']?\s*[EWew])",
+        rf"(?:位置|posn|position)[:：\s]*({coord})\s+({coord})",
         normalized,
         flags=re.IGNORECASE,
     )
     if not match:
         return "", ""
-    return _clean_update_value(match.group(2)), _clean_update_value(match.group(1))
+    first = _clean_update_value(match.group(1))
+    second = _clean_update_value(match.group(2))
+    if re.search(r"[NSns]", first) and re.search(r"[EWew]", second):
+        return second, first
+    if re.search(r"[EWew]", first) and re.search(r"[NSns]", second):
+        return first, second
+    return "", ""
 
 
 def _extract_heading_course_from_text(text: str) -> tuple[str, str]:
@@ -3219,6 +3268,12 @@ def _extract_destination_eta_from_text(text: str) -> tuple[str, str]:
         normalized,
         flags=re.IGNORECASE,
     )
+    if not match:
+        match = re.search(
+            r"(?:更新|修改|补充).{0,12}(?:目的港|destination|ETA|eta|预抵).{0,40}?(?:mmsi[:：\s]*\d{9}[，,\s]*)?([A-Za-z0-9/_-]{2,40})\s*/\s*(20\d{2}-\d{1,2}-\d{1,2}(?:\s+\d{1,2}:\d{1,2}(?::\d{1,2})?)?)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
     if not match:
         return "", ""
     return _clean_update_value(match.group(1)), _normalize_update_time_value(match.group(2))
@@ -3587,6 +3642,11 @@ def parse_ship_update_request(
 def _extract_static_update_args(instruction_text: str, *, mmsi: str) -> dict[str, str]:
     args = {"mmsi": mmsi}
     parsed = _extract_field_by_patterns(instruction_text, SHIP_UPDATE_STATIC_VALUE_PATTERNS, normalize_time=True)
+    destination, eta = _extract_destination_eta_from_text(instruction_text)
+    if destination and not parsed.get("destination"):
+        parsed["destination"] = destination
+    if eta and not parsed.get("eta"):
+        parsed["eta"] = eta
     if "draft" in parsed:
         parsed["draft"] = parsed["draft"]
     for key in SHIP_UPDATE_STATIC_FIELD_ORDER:
@@ -3641,12 +3701,17 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
         out = _invoke_tool(tool_map, trace, "update_ship_static_info", parse_result.args)
     else:
         out = _invoke_tool(tool_map, trace, "upload_ship_position", parse_result.args)
+    result_status = classify_write_tool_result(out)
     trace.check_result = {
         "entity_resolved": True,
-        "write_result": "成功" in out or "更新成功" in out,
+        "write_result": bool(result_status["success"]),
+        "write_result_status": result_status,
         "ship_update_extraction": ship_update_extraction,
     }
-    trace.answer_confidence = "high" if trace.check_result["write_result"] else "medium"
+    trace.answer_confidence = "high" if trace.check_result["write_result"] else "low"
+    if not result_status["success"]:
+        trace.fallback_reason = str(result_status["reason"])
+        return _write_failure_closure(parse_result.write_mode, result_status)
     return out
 
 

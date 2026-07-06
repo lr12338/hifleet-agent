@@ -64,6 +64,7 @@ from agents.customer_support_router import (
     format_verified_chart_symbol_answer,
     latest_user_text as latest_customer_user_text,
     make_trace,
+    normalize_message_text,
     resolve_entities_with_context,
     should_use_ship_context,
     validate_links,
@@ -944,6 +945,68 @@ def _repair_customer_support_answer(
         if not any(marker in lowered for marker in ("ai摘要", "[query", "smart_search", "回答指导", "内部分析")):
             return cleaned
     return _build_customer_support_followup_question(route, missing_slot, review_result)
+
+
+def _redact_trace_text(value: Any, limit: int = 180) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*[^,\s]+", r"\1: [redacted]", text)
+    text = re.sub(r"/(?:home|var|tmp|etc)/[^\s，,。；;]+", "[path]", text)
+    text = normalize_message_text(text)
+    return text[:limit]
+
+
+def build_agent_process_summary(
+    *,
+    user_text: str,
+    route_trace: dict[str, Any],
+    final_answer: str,
+    phase_history: list[str] | None = None,
+) -> str:
+    trace = dict(route_trace or {})
+    reasoning = dict(trace.get("reasoning_trace") or {})
+    understanding = dict(reasoning.get("understanding_result") or {})
+    extraction = dict(reasoning.get("ship_update_extraction") or trace.get("check_result", {}).get("ship_update_extraction") or {})
+    check = dict(trace.get("check_result") or {})
+    guard = dict(trace.get("evidence_guard") or {})
+    fields = extraction.get("normalized_fields") if isinstance(extraction.get("normalized_fields"), dict) else extraction.get("raw_fields")
+    field_summary = fields if isinstance(fields, dict) else {}
+    safe_fields = {
+        key: field_summary.get(key)
+        for key in ("mmsi", "imo", "ship_name", "lon", "lat", "updatetime", "destination", "eta", "navstatus")
+        if field_summary.get(key) not in (None, "")
+    }
+    validation_bits: list[str] = []
+    missing = extraction.get("missing_required_fields") or reasoning.get("missing_required_fields") or check.get("missing_required_fields")
+    if missing:
+        validation_bits.append("缺少/待确认：" + "、".join(str(item) for item in list(missing)[:8]))
+    invalid = extraction.get("invalid_fields") or reasoning.get("format_errors")
+    if invalid:
+        validation_bits.append("格式异常：" + "、".join(str(item) for item in list(invalid)[:6]))
+    if extraction:
+        validation_bits.append("写入放行：" + ("是" if extraction.get("can_write") else "否"))
+    if check.get("write_result_status"):
+        status = dict(check.get("write_result_status") or {})
+        validation_bits.append(f"工具结果：{status.get('status', 'unknown')}")
+    elif "write_result" in check:
+        validation_bits.append("工具结果：" + ("成功" if check.get("write_result") else "未成功/不确定"))
+    guard_bits = []
+    if guard:
+        guard_bits.append("evidence_guard=" + ("触发" if guard.get("triggered") else "未触发"))
+    if check.get("scenario_guard"):
+        guard_bits.append("scenario_guard=" + str(check.get("scenario_guard")))
+    lines = [
+        "用户输入：" + _redact_trace_text(user_text),
+        "意图判断：" + _redact_trace_text(understanding.get("intent") or trace.get("route") or "unknown")
+        + f" / route={_redact_trace_text(trace.get('route') or '')}",
+        "字段提取：" + (_redact_trace_text(json.dumps(safe_fields, ensure_ascii=False)) if safe_fields else "无结构化字段"),
+        "工具调用：" + ("、".join(str(item) for item in list(trace.get("tool_call_sequence") or [])[:8]) or "无"),
+        "校验结果：" + ("；".join(validation_bits) if validation_bits else _redact_trace_text(check or "无")),
+        "Guard状态：" + ("；".join(guard_bits) if guard_bits else "未触发"),
+        "最终策略：" + _redact_trace_text(final_answer, limit=220),
+    ]
+    if phase_history:
+        lines.insert(1, "处理阶段：" + " > ".join(str(item) for item in phase_history[-8:]))
+    return "\n".join(lines)
 
 
 def _customer_support_route_for_intent(intent: str, allow_write: bool) -> RouteDecision:
@@ -2590,6 +2653,14 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             route_trace["latency_hotspot"] = dict(route_trace.get("latency_hotspot", {}))
             route_trace["latency_hotspot"]["total"] = max(0, int(time.time() * 1000) - started_at_ms)
         final_answer = sanitize_customer_output(str(state.get("generated_answer", "") or _extract_final_answer(list(state.get("messages", []) or []))))
+        route_trace["readable_trace"] = {
+            "agent_process_summary": build_agent_process_summary(
+                user_text=str(state.get("task_goal") or latest_customer_user_text(list(state.get("messages", []) or []))),
+                route_trace=route_trace,
+                final_answer=final_answer,
+                phase_history=list(state.get("phase_history", []) or []),
+            )
+        }
         logger.info(
             "[CustomerSupportTrace] run_id=%s session_id=%s route=%s task_type=%s sequence=%s check=%s latency=%s",
             route_trace.get("run_id", ""),
@@ -2999,6 +3070,14 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         route_trace["tool_call_sequence"] = tool_sequence
         route_trace["check_result"] = check_result
         route_trace["answer_confidence"] = "medium" if tool_sequence else "high"
+        route_trace["readable_trace"] = {
+            "agent_process_summary": build_agent_process_summary(
+                user_text=str(state.get("task_goal") or latest_customer_user_text(messages)),
+                route_trace=route_trace,
+                final_answer=sanitized,
+                phase_history=list(state.get("phase_history", []) or []),
+            )
+        }
         return {
             "phase": "done",
             "status": "success",
@@ -3042,8 +3121,8 @@ def build_agent(ctx=None, intent: str = ""):
     intent_hint = _resolve_intent_hint(ctx, explicit_intent=intent)
     profile = _resolve_agent_profile(ctx)
     if profile.profile_id == "customer_ceshi":
-        agent = _build_standard_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
-        logger.info("[MainAgent] Employee standard tool-calling agent built successfully")
+        agent = _build_lightweight_customer_support_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+        logger.info("[MainAgent] Customer ceshi guarded customer-support graph built successfully")
         return agent
     if profile.profile_id == "customer_support":
         agent = _build_lightweight_customer_support_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
