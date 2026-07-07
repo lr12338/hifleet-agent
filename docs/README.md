@@ -8,7 +8,7 @@
 
 | 目标 | 文档 |
 | --- | --- |
-| 理解当前 Agent 架构、`customer_support` 轻量 graph、ship_update preflight 特殊分支、knowledge/browser/ship 工具边界 | [AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md) |
+| 理解当前 Agent 架构、`customer_support` 轻量 graph、`CustomerUnderstanding -> ship_update harness` 特殊分支、knowledge/browser/ship 工具边界 | [AGENT_TECHNICAL_DOCUMENTATION.md](AGENT_TECHNICAL_DOCUMENTATION.md) |
 | 异地服务器部署联调、远端回归、ship_update 日志观察字段与误路由排障 | [CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md](CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md) |
 | 查看客服主链回归矩阵、ship_update 验收标准、负例场景与环境阻塞说明 | [CUSTOMER_SUPPORT_AGENT_REGRESSION.md](CUSTOMER_SUPPORT_AGENT_REGRESSION.md) |
 
@@ -17,6 +17,7 @@
 | 目标 | 文档 |
 | --- | --- |
 | 接入 `/run`、`/stream_run`，处理多用户会话、微信旧接口和 Profile 选择 | [API_MULTI_USER_INTEGRATION.md](API_MULTI_USER_INTEGRATION.md) |
+| 理解 `customer_ceshi` 当前链路、`CustomerUnderstanding`、pending、目的港/ETA 风险边界和 readable trace | [CUSTOMER_CESHI_ARCHITECTURE.md](CUSTOMER_CESHI_ARCHITECTURE.md) |
 | 理解客服知识检索、平台操作类证据收口、授权写库和运维回归 | [CUSTOMER_SUPPORT_KB_OPERATIONS.md](CUSTOMER_SUPPORT_KB_OPERATIONS.md) |
 | 深入理解 `knowledge_qa` 单 skill / 三工具 / `smart_search` 兼容层 | [KNOWLEDGE_BASE_GUIDE.md](KNOWLEDGE_BASE_GUIDE.md) |
 | 管理台使用、日志查询、调试入口 | [ADMIN_BACKEND_SYSTEM_GUIDE.md](ADMIN_BACKEND_SYSTEM_GUIDE.md) |
@@ -37,9 +38,9 @@ flowchart LR
     Client[渠道/调用方] --> API[src/main.py]
     API --> Profile[profile 解析]
     Profile --> Graph[统一 phase graph]
-    Graph --> CS[customer_support<br/>preprocess -> delegate skills agent -> finalize]
-    Graph --> ShipWrite[ship_update<br/>write_preflight_guard -> parse/validate/execute]
-    Graph --> Ceshi[customer_ceshi<br/>route -> ship/knowledge/delegate or plan -> act -> check -> loop/finalize]
+    Graph --> CS[customer_support / customer_ceshi<br/>preprocess -> delegate skills agent -> finalize]
+    CS --> ShipGate[CustomerUnderstanding<br/>pending/intent/OCR -> ship_update gate]
+    ShipGate --> ShipWrite[ship_update harness<br/>parse/normalize/validate/execute]
     API --> Obs[observability]
 ```
 
@@ -55,11 +56,12 @@ flowchart LR
 - 授权知识库维护：`knowledge_admin.upsert_local_kb_entry`
 - 完整会话上下文交给 agent/checkpointer 处理，历史多媒体内容仅做安全脱敏
 - 多模态输入标准化与 direct perception
-- `customer_ceshi` 保留内部文件/沙盒/产物能力，供测试和内部运营使用
+- `customer_ceshi` 使用同一轻量客服 graph，并通过 `CustomerUnderstanding` 结构化 contract、pending、shared ship update harness 和 readable trace 验证高风险写入链路
 
 ## 文档维护规则
 
 - 架构变化先更新 `AGENT_TECHNICAL_DOCUMENTATION.md`。
+- `customer_ceshi` 专属链路、`CustomerUnderstanding` 写入识别、pending、目的港/ETA 风险边界和 readable trace 变化，更新 `CUSTOMER_CESHI_ARCHITECTURE.md`。
 - `customer_support` 的主链、多模态预处理、ship_update 特殊分支、工具边界、上下文策略变化，只在 `AGENT_TECHNICAL_DOCUMENTATION.md` 维护。
 - 客服知识检索、平台操作类收口、授权写库变化，先更新 `CUSTOMER_SUPPORT_KB_OPERATIONS.md`；底层三工具协议变化再同步 `KNOWLEDGE_BASE_GUIDE.md` 和 `src/skills/knowledge_qa/SKILL.md`。
 - `browser` 受控兜底策略变化，再同步更新 `agent_browser_fallback_integration.md`。

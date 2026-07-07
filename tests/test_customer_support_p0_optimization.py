@@ -40,7 +40,7 @@ def _graph(monkeypatch, *, tools=None, final_answer=""):
 
 
 def test_destination_eta_frontend_capability_guard_blocks_fake_tutorial(monkeypatch):
-    graph = _graph(monkeypatch, final_answer="不应走到 delegate")
+    graph = _graph(monkeypatch, final_answer="可以在网页端船舶详情页点击编辑按钮修改目的港和 ETA，提交后立即生效。")
     result = graph.invoke(
         {
             "messages": [HumanMessage(content="怎么在 HiFleet 平台手动更新船舶目的港和 ETA？")],
@@ -54,11 +54,12 @@ def test_destination_eta_frontend_capability_guard_blocks_fake_tutorial(monkeypa
     assert "立即生效" not in answer
     assert "自助编辑船舶目的港/ETA" in answer
     assert result["generated_tool_calls"] == []
-    assert result["route_trace"]["reasoning_trace"]["understanding_result"]["frontend_capability_question"] is True
+    assert result["route_trace"]["ship_update_gate"]["should_run_harness"] is False
+    assert result["route_trace"]["evidence_guard"]["triggered"] is True
 
 
 def test_reports_email_eta_guard_blocks_auto_parse_claim(monkeypatch):
-    graph = _graph(monkeypatch, final_answer="不应走到 delegate")
+    graph = _graph(monkeypatch, final_answer="可以发邮件到 reports@hifleet.com，系统会自动解析更新 ETA。")
     result = graph.invoke(
         {
             "messages": [HumanMessage(content="能不能发邮件到 reports@hifleet.com 更新 ETA？")],
@@ -72,6 +73,7 @@ def test_reports_email_eta_guard_blocks_auto_parse_claim(monkeypatch):
     assert "文本邮件自动更新目的港/ETA" in answer
     assert "MMSI" in answer
     assert result["generated_tool_calls"] == []
+    assert result["route_trace"]["evidence_guard"]["triggered"] is True
 
 
 def test_final_answer_evidence_guard_rewrites_unsupported_claim():
@@ -83,6 +85,13 @@ def test_final_answer_evidence_guard_rewrites_unsupported_claim():
     assert "编辑按钮" not in result.text
     assert "立即生效" not in result.text
     assert "没有查到 HiFleet 前台" in result.text
+
+
+def test_final_answer_evidence_guard_allows_negated_safe_statement():
+    text = "目前没有查到普通用户可在前台自助编辑目的港/ETA 的明确入口。"
+    result = apply_high_risk_evidence_guard(text, route_trace={})
+    assert result.triggered is False
+    assert result.text == text
 
 
 def test_ship_update_extractor_handles_spaced_dmm_and_suspicious_time():

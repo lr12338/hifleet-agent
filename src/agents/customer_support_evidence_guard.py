@@ -30,6 +30,17 @@ HIGH_RISK_CLAIM_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+NEGATED_SAFE_CLAIM_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(没有|未|暂无|不|不能|无法|不应|不得).{0,24}(自助|自行|网页端|前台|详情页|编辑按钮).{0,30}(目的港|ETA|eta|静态信息)", re.I),
+    re.compile(r"(没有|未|暂无|不|不能|无法|不应|不得).{0,24}(自动解析|自动更新|即可更新|可以更新).{0,30}(目的港|ETA|eta|预抵)", re.I),
+    re.compile(r"(没有|未|暂无|不|不能|无法|不应|不得).{0,24}(立即|马上|实时).{0,12}生效", re.I),
+)
+
+
+def _is_negated_safe_statement(value: str) -> bool:
+    return any(pattern.search(value) for pattern in NEGATED_SAFE_CLAIM_PATTERNS)
+
+
 def _has_verified_evidence(route_trace: dict[str, Any]) -> bool:
     if bool(route_trace.get("verified_evidence")):
         return True
@@ -57,6 +68,8 @@ def apply_high_risk_evidence_guard(
     blocked = [label for label, pattern in HIGH_RISK_CLAIM_PATTERNS if pattern.search(value)]
     if not blocked:
         return EvidenceGuardResult(text=value)
+    if _is_negated_safe_statement(value):
+        return EvidenceGuardResult(text=value)
     if _has_verified_evidence(trace):
         return EvidenceGuardResult(text=value)
 
@@ -75,4 +88,3 @@ def apply_high_risk_evidence_guard(
         blocked_claims=blocked,
         fallback_reason="unsupported_high_risk_platform_claim",
     )
-

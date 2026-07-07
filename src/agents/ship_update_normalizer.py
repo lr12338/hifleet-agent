@@ -9,6 +9,41 @@ from typing import Any
 from agents.ship_update_contract import normalize_nav_status
 
 
+OPTIONAL_VOYAGE_FIELDS = {"destination", "eta"}
+_OPTIONAL_VOYAGE_PLACEHOLDERS = {
+    "",
+    "-",
+    "--",
+    "---",
+    "/",
+    "//",
+    "—",
+    "–",
+    "n/a",
+    "na",
+    "null",
+    "none",
+    "unknown",
+    "未知",
+    "无",
+    "未提供",
+    "目的港",
+    "eta",
+    "目的港/eta",
+    "目的港 / eta",
+    "destination",
+    "dest",
+    "destination/eta",
+    "destination / eta",
+    "/eta",
+    "eta/",
+    "--/--",
+    "-- / --",
+    "-/-",
+    "- / -",
+}
+
+
 @dataclass
 class NormalizedShipUpdate:
     mmsi: str = ""
@@ -147,8 +182,40 @@ def _to_float(value: str) -> float | None:
         return None
 
 
+def is_empty_optional_voyage_value(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return True
+    lowered = raw.lower()
+    normalized = re.sub(r"\s+", " ", lowered).strip(" ，,。；;:")
+    compact = re.sub(r"[\s:：]+", "", normalized)
+    slash_compact = compact.replace("\\", "/")
+
+    def is_placeholder(candidate: str) -> bool:
+        return candidate in _OPTIONAL_VOYAGE_PLACEHOLDERS or bool(re.fullmatch(r"[-_/—–\s]+", candidate))
+
+    if is_placeholder(normalized) or is_placeholder(slash_compact):
+        return True
+    for label in ("目的港/eta", "目的港eta", "destination/eta", "destinationeta", "目的港", "destination", "dest", "eta"):
+        for candidate in (normalized, slash_compact):
+            if not candidate.startswith(label):
+                continue
+            remainder = candidate[len(label) :].strip(" :：-/")
+            if not remainder or is_placeholder(remainder):
+                return True
+    return False
+
+
+def clean_optional_voyage_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(fields or {})
+    for key in OPTIONAL_VOYAGE_FIELDS:
+        if key in cleaned and is_empty_optional_voyage_value(cleaned.get(key)):
+            cleaned.pop(key, None)
+    return cleaned
+
+
 def normalize_ship_update_fields(raw_fields: dict[str, str]) -> NormalizedShipUpdate:
-    fields = {key: str(value).strip() for key, value in dict(raw_fields or {}).items() if str(value or "").strip()}
+    fields = clean_optional_voyage_fields({key: str(value).strip() for key, value in dict(raw_fields or {}).items() if str(value or "").strip()})
     result = NormalizedShipUpdate(raw_fields=fields)
     result.mmsi = fields.get("mmsi", "")
     result.imo = fields.get("imo", "")

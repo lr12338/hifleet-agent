@@ -16,6 +16,7 @@ from agents.customer_support_router import (
     answer_conversation_memory,
     build_conversation_context,
     build_customer_support_plan,
+    build_text_from_pending_update,
     classify_message,
     classify_multimodal_message,
     execute_complex_ship_chain,
@@ -936,6 +937,91 @@ def test_parse_ship_update_request_current_log_shape_includes_all_dynamic_args()
     assert result.field_sources["updatetime"] == "attachment"
 
 
+def test_parse_ship_update_request_structured_heading_course_wins_over_semantic_course_conflict(monkeypatch):
+    def fake_contract_llm(text, perception):
+        return {
+            "operation_type": "position_update",
+            "fields": {
+                "mmsi": "477167800",
+                "lon": "103°59.606' E",
+                "lat": "01°10.044' N",
+                "updatetime": "2026-07-06 17:44:00",
+                "heading": "090",
+                "course": "090",
+            },
+            "raw_mentions": {"course": "090"},
+            "position_update_fields": {
+                "mmsi": "477167800",
+                "lon": "103°59.606' E",
+                "lat": "01°10.044' N",
+                "updatetime": "2026-07-06 17:44:00",
+                "heading": "090",
+                "course": "090",
+            },
+            "conflict_fields": ["course"],
+            "action_recommendation": "execute_position_update",
+            "source": "llm_contract_extractor",
+        }
+
+    monkeypatch.setattr("agents.customer_support_router._invoke_ship_update_contract_llm", fake_contract_llm)
+    entities = extract_entities("更新船位")
+    trace = make_trace(classify_message("更新船位", entities), entities)
+    perception = {
+        "attachment_type": "image",
+        "visible_text": (
+            "MMSI:477167800、AIS船名:SITC HAIPHONG、目的港/ETA: IDBAT / 2026-07-06 04:00 (UTC)、"
+            "位置:01°10.044' N 103°59.606' E、船艏/航迹向: 090° / 219°、"
+            "对地/水航速: 0 kn / --、当前吃水: 8.1 m、更新时间:2026-07-06 17:44 (UTC+8)"
+        ),
+        "confidence": "high",
+    }
+
+    result = parse_ship_update_request(
+        "用户补充：更新船位",
+        entities,
+        {},
+        trace,
+        perception=perception,
+    )
+
+    assert result.user_message == ""
+    assert result.conflict_fields == []
+    assert result.pending_update_state == {}
+    assert result.args["heading"] == "090"
+    assert result.args["course"] == "219"
+    extraction = trace.reasoning_trace["ship_update_extraction"]
+    assert extraction["conflict_fields"] == []
+    assert extraction["structured_conflicts_resolved"] == ["course"]
+
+
+def test_parse_ship_update_request_drops_placeholder_destination_eta():
+    entities = extract_entities("更新船位")
+    trace = make_trace(classify_message("更新船位", entities), entities)
+    perception = {
+        "attachment_type": "image",
+        "visible_text": (
+            "AIS船名:MINZHANGYU05666、机动船在航、目的港/ETA: -- / --、"
+            "位置:23°56.809' N 117°43.797' E、航向:091°、对地/水航速:1.2 kn/--、"
+            "更新时间:2026-07-06 15:04 (UTC+8)"
+        ),
+        "confidence": "high",
+    }
+
+    result = parse_ship_update_request(
+        "用户补充：更新船位 MMSI:412510631",
+        extract_entities("更新船位 MMSI:412510631"),
+        {},
+        trace,
+        perception=perception,
+    )
+
+    assert result.missing_required_fields == []
+    assert "destination" not in result.parsed_dynamic_fields
+    assert "eta" not in result.parsed_dynamic_fields
+    assert "destination" not in result.args
+    assert "eta" not in result.args
+
+
 def test_update_chain_ship_name_multiple_matches_asks_for_mmsi():
     search = FakeTool("ship_search", lambda args: "A MMSI: 111111111\nB MMSI: 222222222")
     upload = FakeTool("upload_ship_position", lambda args: "不应调用")
@@ -1214,6 +1300,37 @@ def test_parse_ship_update_request_write_args_cover_all_write_enabled_dynamic_fi
     for field_name in ("lon", "lat", "updatetime", "speed", "heading", "course", "draft", "navstatus", "destination", "eta"):
         assert result.args[field_name] == result.parsed_dynamic_fields[field_name]
     assert result.args["updatetime"] == "2026-07-02 12:43:00"
+
+
+def test_pending_text_rebuild_drops_legacy_placeholder_destination_eta():
+    upload = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
+    pending = {
+        "operation_type": "position_update",
+        "ship_identity": {"mmsi": "", "imo": "", "name": ""},
+        "extracted_fields": {
+            "lon": "117°43.797' E",
+            "lat": "23°56.809' N",
+            "speed": "1.2",
+            "course": "91.0",
+            "navstatus": "机动船在航",
+            "updatetime": "2026-07-06 15:04:00",
+            "destination": "/ETA",
+            "eta": "--",
+        },
+    }
+    text = build_text_from_pending_update(pending, "412510631")
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"upload_ship_position": upload}, trace)
+
+    assert "成功" in output
+    assert "destination" not in text
+    assert "eta" not in text
+    assert "destination" not in upload.calls[0]
+    assert "eta" not in upload.calls[0]
+    assert "destination" not in trace.reasoning_trace["write_args"]
+    assert "eta" not in trace.reasoning_trace["write_args"]
 
 
 def test_context_memory_summary_does_not_route_to_search():

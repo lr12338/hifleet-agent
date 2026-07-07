@@ -22,38 +22,54 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from langchain_openai import ChatOpenAI
 
 from llm_config import build_thinking_payload
-from agents.ship_update_extractor import extract_and_normalize_ship_update, extract_and_normalize_ship_update_contract, extract_ship_update_parameters_with_agent
+from agents.ship_update_extractor import extract_and_normalize_ship_update, extract_and_normalize_ship_update_contract, extract_ship_update_parameters_with_agent, normalize_contract_payload
+from agents.ship_update_normalizer import clean_optional_voyage_fields
 
 logger = logging.getLogger(__name__)
 
-SHIP_UPDATE_CONTRACT_EXTRACTION_PROMPT = """你是 HiFleet 客服 Agent 的船舶更新参数格式化器。
-你只能根据本轮用户文本和附件识别结果，按工具契约输出 JSON，不要调用工具，不要生成客服话术。
+SHIP_UPDATE_CONTRACT_EXTRACTION_PROMPT = """你是 HiFleet 客服 Agent 的参数格式化器。
+你只负责把用户输入和附件识别结果格式化为 JSON。不得调用工具，不得生成客服回复，不得编造字段。
+没有提供的字段不要填。字段不确定时写入 invalid_fields 或 conflict_fields，不要强行补齐。
+operation_type 和 action_recommendation 只是候选判断，不是写入许可；最终是否执行写工具必须由 shared harness 校验字段、目标船和工具结果。
+字段来源只能是当前轮用户文本、当前轮附件识别结果或当前 active pending。不得从历史其他船舶的成功回复、历史截图或历史 MMSI 中补写经纬度、ETA、吃水、状态或更新时间。
+如果目的港/ETA 显示为 --、-、-- / --、空白、N/A、未知，或只识别到“目的港/ETA”“/ETA”“ETA”等标签残片，表示未提供该字段，destination 和 eta 都必须保持为空。
 
-工具契约：
-1. 船位更新 upload_ship_position
-- operation_type: position_update
-- 必填字段: mmsi, lon, lat, updatetime
-- 可选字段: speed, heading, course, draft, navstatus, destination, eta, ship_name, wechatgroup
-- updatetime 必须来自用户或附件，格式化为 yyyy-MM-dd HH:mm:ss；若用户写 2026-07-04 1443，应理解为 2026-07-04 14:43:00；若只有日期没有时分，保留原文并在 invalid_fields 标记缺少具体时分。
-- navstatus 是中文航行状态，例如 在航、锚泊、系泊、停泊、机动船在航、操纵能力受限。
+operation_type 只能是：
+none | ship_query | position_update | static_update | mixed_update | ambiguous_update | frontend_capability_question | data_delay_troubleshooting
 
-2. 静态信息更新 update_ship_static_info
-- operation_type: static_update
-- 必填字段: mmsi，且至少一个静态字段
-- 可选字段: ship_name, imo, ship_type, minotype, length, width, dwt, flag, callsign, built_year, destination, eta, draft, wechatgroup
-- 用户仅提供 IMO/船名作为识别信息时，不要因此判断为静态更新；只有明确要求更新静态/档案字段时才使用 static_update。
+action_recommendation 只能是：
+execute_position_update | execute_static_update | ask_user | search_ship | answer_as_knowledge | block_high_risk_claim | none
 
-输出 JSON schema:
+分类规则：
+- 用户只说“请协助更新”时，operation_type=ambiguous_update。
+- 用户问“怎么在平台手动更新目的港/ETA”时，operation_type=frontend_capability_question。
+- 用户问能否通过邮件或前台按钮自助更新目的港/ETA 时，operation_type=frontend_capability_question。
+- 用户问目的港/ETA 为什么旧、慢、未刷新时，operation_type=data_delay_troubleshooting。
+- 用户反馈船位跟踪异常、AIS 正常但平台不更新、要求后台排查时，operation_type=data_delay_troubleshooting。
+- 用户明确说“更新目的港/ETA”并提供 MMSI 和字段时，operation_type=static_update。
+- 用户明确说“更新船位/位置”并提供船位字段时，operation_type=position_update。
+- 用户同时要求船位和静态信息更新时，operation_type=mixed_update，不建议直接执行。
+
+船位信息更新字段：
+name(必选，通常传 MMSI), mmsi, lon(必选，经度十进制度), lat(必选，纬度十进制度),
+updatetime(必选，yyyy-MM-dd HH:mm:ss), speed, heading, course, draught, destination, eta, status。
+status 只能使用中文航行状态，例如 在航、失控、帆船在航、搁浅、操纵能力受限、机动船在航、系泊、锚泊、停泊、未知、未定义、正在捕鱼作业、限于吃水、高速船留用、地效翼船留用、待定义。
+
+静态信息更新字段：
+mmsi(必选), name, imonumber, callsign, type, minotype, width, length, dwt, buildyear, destination, eta, draught。
+
+输出 JSON schema：
 {
-  "operation_type": "position_update|static_update|mixed_update|unknown",
-  "fields": {"mmsi":"", "lon":"", "lat":"", "updatetime":"", "navstatus":""},
-  "raw_mentions": {"updatetime":"原文片段"},
-  "confidence": {"字段名": 0.0-1.0},
-  "ambiguities": ["说明不确定点"],
-  "missing_fields": [],
+  "operation_type": "position_update",
+  "user_intent_summary": "一句话概括用户意图",
+  "ship_identity": {"mmsi": "", "name": "", "identity_status": "resolved|unresolved|ambiguous", "candidate_mmsi": []},
+  "position_update_fields": {"name": "", "mmsi": "", "lon": 122.0, "lat": 31.0, "updatetime": "2025-03-31 09:52:13", "speed": 7.1, "heading": 135.0, "course": 254.1, "draught": 4.2, "destination": "", "eta": "", "status": "机动船在航"},
+  "static_update_fields": {"mmsi": "", "name": "", "imonumber": "", "callsign": "", "type": "", "minotype": "", "width": "", "length": "", "dwt": "", "buildyear": "", "destination": "", "eta": "", "draught": ""},
+  "missing_required_fields": [],
   "invalid_fields": [],
-  "unsupported_fields": [],
-  "action_allowed": false,
+  "conflict_fields": [],
+  "action_recommendation": "ask_user",
+  "next_question": null,
   "source": "llm_contract_extractor"
 }
 只输出 JSON 对象。"""
@@ -262,6 +278,98 @@ class ShipUpdateParseResult:
     attachment_fields: dict[str, str] = field(default_factory=dict)
     static_fields: list[str] = field(default_factory=list)
     failure_reason: str = ""
+    pending_update_state: dict[str, Any] = field(default_factory=dict)
+    conflict_fields: list[str] = field(default_factory=list)
+    pending_used: bool = False
+
+
+PENDING_UPDATE_STATUSES = {
+    "awaiting_operation_type",
+    "awaiting_required_fields",
+    "awaiting_ship_identity",
+    "awaiting_mmsi_confirmation",
+    "awaiting_field_confirmation",
+    "ready_to_execute",
+    "executed_success",
+    "executed_failed",
+    "cancelled",
+    "expired",
+}
+
+
+def default_pending_update_state() -> dict[str, Any]:
+    return {
+        "active": False,
+        "operation_type": "",
+        "status": "",
+        "source_turn_id": "",
+        "expires_after_turns": 5,
+        "turns_elapsed": 0,
+        "ship_identity": {"mmsi": "", "imo": "", "name": "", "candidate_mmsi": []},
+        "extracted_fields": {},
+        "missing_required_fields": [],
+        "invalid_fields": [],
+        "conflict_fields": [],
+        "last_question_to_user": "",
+        "confirmation_required": False,
+        "can_resume": False,
+    }
+
+
+def is_active_pending_update_state(value: dict[str, Any] | None) -> bool:
+    pending = dict(value or {})
+    return bool(pending.get("active") and pending.get("can_resume") and pending.get("status") not in {"executed_success", "cancelled", "expired"})
+
+
+def _pending_status_for_missing(missing: list[str], *, needs_confirmation: bool = False, conflicts: list[str] | None = None) -> str:
+    if conflicts:
+        return "awaiting_field_confirmation"
+    if needs_confirmation:
+        return "awaiting_field_confirmation"
+    lowered = {str(item).lower() for item in missing}
+    if "mmsi" in lowered or "船舶标识" in lowered:
+        return "awaiting_ship_identity"
+    if missing:
+        return "awaiting_required_fields"
+    return "ready_to_execute"
+
+
+def build_pending_update_state(
+    *,
+    operation_type: str,
+    status: str,
+    source_turn_id: str,
+    ship_identity: dict[str, Any] | None = None,
+    extracted_fields: dict[str, Any] | None = None,
+    missing_required_fields: list[str] | None = None,
+    invalid_fields: list[str] | None = None,
+    conflict_fields: list[str] | None = None,
+    last_question_to_user: str = "",
+    confirmation_required: bool = False,
+    turns_elapsed: int = 0,
+) -> dict[str, Any]:
+    pending = default_pending_update_state()
+    pending.update(
+        {
+            "active": status not in {"executed_success", "cancelled", "expired"},
+            "operation_type": operation_type,
+            "status": status if status in PENDING_UPDATE_STATUSES else "awaiting_required_fields",
+            "source_turn_id": source_turn_id,
+            "turns_elapsed": turns_elapsed,
+            "ship_identity": {
+                **pending["ship_identity"],
+                **dict(ship_identity or {}),
+            },
+            "extracted_fields": clean_optional_voyage_fields(dict(extracted_fields or {})),
+            "missing_required_fields": list(missing_required_fields or []),
+            "invalid_fields": list(invalid_fields or []),
+            "conflict_fields": list(conflict_fields or []),
+            "last_question_to_user": last_question_to_user,
+            "confirmation_required": confirmation_required,
+            "can_resume": status not in {"executed_success", "cancelled", "expired"},
+        }
+    )
+    return pending
 
 
 def extract_attachments(messages: list[AnyMessage]) -> list[Attachment]:
@@ -1552,9 +1660,9 @@ def _invoke_ship_update_contract_llm(text: str, perception: dict[str, Any] | Non
     if isinstance(content, list):
         content = "\n".join(str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content)
     result = _json_object_from_text(str(content or ""))
-    if isinstance(result.get("fields"), dict):
+    if any(isinstance(result.get(key), dict) for key in ("fields", "position_update_fields", "static_update_fields")):
         result["source"] = "llm_contract_extractor"
-        return result
+        return normalize_contract_payload(result)
     return {}
 
 
@@ -3152,6 +3260,13 @@ SHIP_UPDATE_STATIC_VALUE_PATTERNS = {
     "draft": r"(?:设计吃水|静态吃水|draft|draught)[:：\s]*(\d+(?:\.\d+)?)",
     "wechatgroup": r"(?:微信群|群组|wechatgroup)[:：\s]*([A-Za-z0-9@_-]{4,60})",
 }
+STATIC_UPDATE_FIELD_ALIASES = {
+    "name": "ship_name",
+    "imonumber": "imo",
+    "type": "ship_type",
+    "buildyear": "built_year",
+    "draught": "draft",
+}
 
 
 def _extract_instruction_text_for_ship_update(text: str) -> str:
@@ -3184,12 +3299,15 @@ def _normalize_update_time_value(value: str) -> str:
     cleaned = re.sub(r"\([^)]*\)", "", value or "").strip()
     cleaned = re.sub(r"（[^）]*）", "", cleaned).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
-    match = re.search(r"(20\d{2}-\d{1,2}-\d{1,2})(?:\s+(\d{1,2}:\d{1,2})(?::(\d{1,2}))?)?", cleaned)
+    match = re.search(r"(20\d{2}-\d{1,2}-\d{1,2})(?:\s+(\d{1,2}(?::\d{1,2}|[0-9]{2})(?::(\d{1,2}))?)?)?", cleaned)
     if not match:
         return _clean_update_value(cleaned)
     date_part = match.group(1)
     hm_part = match.group(2) or "00:00"
     sec_part = match.group(3) or "00"
+    if re.fullmatch(r"\d{3,4}", hm_part):
+        padded = hm_part.zfill(4)
+        hm_part = f"{padded[:2]}:{padded[2:]}"
     return f"{date_part} {hm_part}:{sec_part}" if len(hm_part.split(":")) == 2 else f"{date_part} {hm_part}"
 
 
@@ -3206,7 +3324,7 @@ def _extract_field_by_patterns(text: str, patterns: dict[str, str], *, normalize
         if normalize_time and key in {"updatetime", "eta"}:
             value = _normalize_update_time_value(value)
         parsed[key] = value
-    return parsed
+    return clean_optional_voyage_fields(parsed)
 
 
 def _looks_like_coordinate_value(value: str) -> bool:
@@ -3323,7 +3441,7 @@ def _parse_ship_update_attachment_fields(perception: dict[str, Any] | None) -> d
     navstatus = _extract_navstatus_from_text(source_text)
     if navstatus:
         fields["navstatus"] = navstatus
-    fields = {key: value for key, value in fields.items() if value}
+    fields = clean_optional_voyage_fields({key: value for key, value in fields.items() if value})
     return fields
 
 
@@ -3333,17 +3451,107 @@ def _parse_ship_update_text_fields(text: str) -> dict[str, str]:
         fields.pop("lon", None)
     if "lat" in fields and not _looks_like_coordinate_value(fields["lat"]):
         fields.pop("lat", None)
-    return fields
+    return clean_optional_voyage_fields(fields)
 
 
 def _merge_ship_update_fields(text_fields: dict[str, str], attachment_fields: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
-    merged = dict(attachment_fields)
+    merged = clean_optional_voyage_fields(dict(attachment_fields))
     field_sources = {key: "attachment" for key in attachment_fields}
     for key, value in text_fields.items():
         if value:
             merged[key] = value
             field_sources[key] = "text"
+    merged = clean_optional_voyage_fields(merged)
+    field_sources = {key: value for key, value in field_sources.items() if key in merged}
     return merged, field_sources
+
+
+def _detect_field_conflicts(*field_sets: dict[str, str]) -> list[str]:
+    seen: dict[str, str] = {}
+    conflicts: list[str] = []
+    for fields in field_sets:
+        for key, raw_value in dict(fields or {}).items():
+            value = _clean_update_value(str(raw_value or "")).lower()
+            if not value:
+                continue
+            if key in seen and seen[key] != value and key not in conflicts:
+                conflicts.append(key)
+            else:
+                seen[key] = value
+    return conflicts
+
+
+def _structured_heading_course_from_sources(instruction_text: str, perception: dict[str, Any] | None) -> tuple[str, str]:
+    payload = dict(perception or {})
+    source_text = normalize_message_text(
+        "\n".join(
+            part
+            for part in [
+                str(payload.get("visible_text") or ""),
+                str(payload.get("summary") or ""),
+                str(payload.get("visible_features") or ""),
+                str(instruction_text or ""),
+            ]
+            if str(part or "").strip()
+        )
+    )
+    return _extract_heading_course_from_text(source_text)
+
+
+def _same_update_value(left: Any, right: Any) -> bool:
+    left_value = _clean_update_value(str(left or "")).lower()
+    right_value = _clean_update_value(str(right or "")).lower()
+    if left_value == right_value:
+        return True
+    try:
+        return abs(float(left_value) - float(right_value)) < 0.0001
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_structured_heading_course_precedence(
+    fields: dict[str, str],
+    field_sources: dict[str, str],
+    instruction_text: str,
+    perception: dict[str, Any] | None,
+) -> tuple[dict[str, str], dict[str, str], bool]:
+    heading, course = _structured_heading_course_from_sources(instruction_text, perception)
+    if not heading and not course:
+        return fields, field_sources, False
+    result = dict(fields)
+    sources = dict(field_sources)
+    changed = False
+    if heading and not _same_update_value(result.get("heading"), heading):
+        result["heading"] = heading
+        sources["heading"] = "structured_heading_course"
+        changed = True
+    if course and not _same_update_value(result.get("course"), course):
+        result["course"] = course
+        sources["course"] = "structured_heading_course"
+        changed = True
+    return result, sources, changed
+
+
+def _filter_conflicts_with_structured_heading_course(
+    conflicts: list[str],
+    fields: dict[str, str],
+    instruction_text: str,
+    perception: dict[str, Any] | None,
+) -> tuple[list[str], list[str]]:
+    heading, course = _structured_heading_course_from_sources(instruction_text, perception)
+    if not heading and not course:
+        return sorted(set(conflicts)), []
+    resolved: list[str] = []
+    result: list[str] = []
+    for field in conflicts:
+        if field == "heading" and heading and _same_update_value(fields.get("heading"), heading):
+            resolved.append(field)
+            continue
+        if field == "course" and course and _same_update_value(fields.get("course"), course):
+            resolved.append(field)
+            continue
+        result.append(field)
+    return sorted(set(result)), sorted(set(resolved))
 
 
 def _merge_semantic_ship_update_fields(
@@ -3356,9 +3564,13 @@ def _merge_semantic_ship_update_fields(
     for key, value in semantic_fields.items():
         if key in {"mmsi", "imo", "ship_name"}:
             continue
+        if key in {"destination", "eta"} and key not in clean_optional_voyage_fields({key: value}):
+            continue
         if value and not result.get(key):
             result[key] = value
             sources[key] = "semantic"
+    result = clean_optional_voyage_fields(result)
+    sources = {key: value for key, value in sources.items() if key in result}
     return result, sources
 
 
@@ -3387,6 +3599,54 @@ def _extract_ship_update_identifier_fields(text: str) -> dict[str, str]:
     return identifiers
 
 
+def _is_ambiguous_update_request(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return False
+    bare_patterns = (
+        r"^(请)?(协助|帮忙|帮我)?(更新|修改|补录)$",
+        r"^(请)?(协助|帮忙|帮我)?处理更新$",
+        r"^update\s*$",
+    )
+    return any(re.fullmatch(pattern, normalized, flags=re.IGNORECASE) for pattern in bare_patterns)
+
+
+def _is_draft_update_ambiguous(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if not re.search(r"(吃水|draft|draught).{0,8}(改为|更新为|修改为|[:：])", normalized, flags=re.IGNORECASE):
+        return False
+    return not any(marker in normalized for marker in ("船位", "当前位置", "当前吃水", "静态", "静态信息", "档案", "设计吃水"))
+
+
+def _is_mixed_update_request(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    has_position = any(marker in normalized for marker in ("船位", "位置", "经度", "纬度", "更新时间"))
+    has_static = any(marker in normalized for marker in ("目的港", "ETA", "eta", "预抵", "静态", "档案", "呼号", "船型"))
+    has_static = has_static and bool(re.search(r"(更新|修改|补录|改).{0,12}(目的港|ETA|eta|预抵|静态|档案|呼号|船型)", normalized))
+    has_write = any(marker in normalized.lower() for marker in ("更新", "修改", "补录", "update"))
+    return has_write and has_position and has_static
+
+
+def _is_valid_english_ship_name(value: str) -> bool:
+    raw = str(value or "").strip()
+    return bool(raw and re.fullmatch(r"[A-Za-z0-9 ._-]{2,60}", raw))
+
+
+def _validate_static_update_args(args: dict[str, str]) -> tuple[list[str], list[str]]:
+    missing: list[str] = []
+    invalid: list[str] = []
+    if not str(args.get("mmsi", "")).strip():
+        missing.append("MMSI")
+    update_fields = [key for key, value in args.items() if key != "mmsi" and str(value or "").strip()]
+    if not update_fields:
+        missing.append("静态更新字段")
+    if args.get("ship_name") and not _is_valid_english_ship_name(args["ship_name"]):
+        invalid.append("name")
+    if args.get("built_year") and not re.fullmatch(r"20\d{2}|19\d{2}", str(args["built_year"])):
+        invalid.append("buildyear")
+    return missing, invalid
+
+
 def _ship_update_missing_required_fields(identifier: dict[str, str], fields: dict[str, str]) -> list[str]:
     required_values = {
         "mmsi": identifier.get("mmsi", ""),
@@ -3403,11 +3663,14 @@ def _ship_update_missing_required_fields(identifier: dict[str, str], fields: dic
 
 def _build_dynamic_update_args(identifier: dict[str, str], fields: dict[str, str]) -> dict[str, str]:
     args = {"mmsi": identifier["mmsi"]}
+    fields = clean_optional_voyage_fields(dict(fields or {}))
     for spec in SHIP_UPDATE_DYNAMIC_FIELD_SPECS:
         if not spec.write:
             continue
         value = _clean_update_value(fields.get(spec.name, ""))
         if value:
+            if spec.name in {"heading", "course"} and re.fullmatch(r"\d+\.0", value):
+                value = value[:-2]
             args[spec.name] = value
     return args
 
@@ -3484,15 +3747,63 @@ def parse_ship_update_request(
 ) -> ShipUpdateParseResult:
     _ = entities  # Compatibility placeholder; parsing intentionally uses current-turn raw text + perception only.
     instruction_text = _extract_instruction_text_for_ship_update(text)
+    source_turn_id = trace.run_id or str(uuid.uuid4())
+    if _is_ambiguous_update_request(instruction_text):
+        pending = build_pending_update_state(
+            operation_type="ambiguous_update",
+            status="awaiting_operation_type",
+            source_turn_id=source_turn_id,
+            missing_required_fields=["operation_type"],
+            last_question_to_user="请确认是更新船位，还是更新船舶静态信息？",
+            confirmation_required=True,
+        )
+        trace.reasoning_trace = {
+            **dict(trace.reasoning_trace or {}),
+            "ship_update_extraction": {
+                "source": "deterministic_preflight",
+                "operation_type": "ambiguous_update",
+                "raw_fields": {},
+                "contract_fields": {},
+                "raw_mentions": {},
+                "normalized_fields": {},
+                "missing_required_fields": ["operation_type"],
+                "invalid_fields": [],
+                "conflict_fields": [],
+                "unsupported_fields": [],
+                "ambiguities": ["用户未说明更新类型"],
+                "suspicious_fields": [],
+                "can_write": False,
+                "need_user_confirmation": True,
+                "action_recommendation": "ask_user",
+            },
+            "pending_update_state": pending,
+        }
+        return ShipUpdateParseResult(
+            write_mode="ambiguous",
+            instruction_text=instruction_text,
+            user_message=pending["last_question_to_user"],
+            needs_confirmation=True,
+            missing_required_fields=["operation_type"],
+            failure_reason="update_ambiguous_operation_type",
+            pending_update_state=pending,
+        )
+
     text_fields = _parse_ship_update_text_fields(instruction_text)
     attachment_fields = _parse_ship_update_attachment_fields(perception)
     merged_fields, field_sources = _merge_ship_update_fields(text_fields, attachment_fields)
+    field_conflicts = _detect_field_conflicts(text_fields, attachment_fields)
+    merged_fields, field_sources, structured_heading_course_used = _apply_structured_heading_course_precedence(
+        merged_fields,
+        field_sources,
+        instruction_text,
+        perception,
+    )
     fallback_contract = extract_ship_update_parameters_with_agent(instruction_text, perception)
     contract_payload = _invoke_ship_update_contract_llm(instruction_text, perception)
     if contract_payload:
         contract_fields = dict(contract_payload.get("fields") or {})
         fallback_fields = dict(fallback_contract.fields or {})
-        for key in ("mmsi", "imo", "ship_name", "updatetime", "lon", "lat"):
+        for key in ("mmsi", "imo", "ship_name", "updatetime", "lon", "lat", "heading", "course"):
             if fallback_fields.get(key):
                 contract_fields[key] = fallback_fields[key]
         contract_payload["fields"] = contract_fields
@@ -3504,7 +3815,21 @@ def parse_ship_update_request(
         semantic_extraction, semantic_normalized = extract_and_normalize_ship_update_contract(fallback_contract.model_dump())
         semantic_extraction.source = "fallback_contract_parser"
     semantic_fields = dict(semantic_extraction.raw_fields or {})
+    field_conflicts = sorted(set(field_conflicts + list(semantic_extraction.conflict_fields or [])))
     merged_fields, field_sources = _merge_semantic_ship_update_fields(merged_fields, field_sources, semantic_fields)
+    merged_fields, field_sources, structured_heading_course_changed = _apply_structured_heading_course_precedence(
+        merged_fields,
+        field_sources,
+        instruction_text,
+        perception,
+    )
+    structured_heading_course_used = structured_heading_course_used or structured_heading_course_changed
+    field_conflicts, structured_conflicts_resolved = _filter_conflicts_with_structured_heading_course(
+        field_conflicts,
+        merged_fields,
+        instruction_text,
+        perception,
+    )
     text_identifiers = _extract_ship_update_identifier_fields(instruction_text)
     attachment_identifiers = _extract_ship_update_identifier_fields(
         normalize_message_text(
@@ -3518,12 +3843,71 @@ def parse_ship_update_request(
             )
         )
     )
+    field_conflicts = sorted(set(field_conflicts + _detect_field_conflicts(text_identifiers, attachment_identifiers)))
     identifiers = dict(attachment_identifiers)
     identifiers.update({key: value for key, value in text_identifiers.items() if value})
     for key in ("mmsi", "imo", "ship_name"):
         if semantic_fields.get(key) and not identifiers.get(key):
             identifiers[key] = semantic_fields[key]
     static_update_requested, static_fields = _static_update_requested(instruction_text)
+    contract_operation_type = semantic_extraction.operation_type or ""
+    if _is_mixed_update_request(instruction_text) or contract_operation_type == "mixed_update":
+        pending = build_pending_update_state(
+            operation_type="mixed_update",
+            status="awaiting_operation_type",
+            source_turn_id=source_turn_id,
+            ship_identity={**identifiers},
+            extracted_fields={**merged_fields},
+            conflict_fields=["operation_type"],
+            last_question_to_user="您同时提到了船位和静态信息更新。请确认先更新哪一项，我再继续处理。",
+            confirmation_required=True,
+        )
+        trace.reasoning_trace = {
+            **dict(trace.reasoning_trace or {}),
+            "pending_update_state": pending,
+        }
+        return ShipUpdateParseResult(
+            write_mode="mixed",
+            resolved_identifier=identifiers,
+            field_sources=field_sources,
+            instruction_text=instruction_text,
+            parsed_dynamic_fields=dict(merged_fields),
+            static_fields=static_fields,
+            user_message=pending["last_question_to_user"],
+            needs_confirmation=True,
+            conflict_fields=["operation_type"],
+            failure_reason="update_mixed_requires_confirmation",
+            pending_update_state=pending,
+        )
+    if _is_draft_update_ambiguous(instruction_text):
+        pending = build_pending_update_state(
+            operation_type="ambiguous_update",
+            status="awaiting_operation_type",
+            source_turn_id=source_turn_id,
+            ship_identity={**identifiers},
+            extracted_fields={**merged_fields},
+            conflict_fields=["draft"],
+            last_question_to_user="请确认是更新当前船位里的吃水，还是更新船舶静态信息里的吃水？",
+            confirmation_required=True,
+        )
+        trace.reasoning_trace = {
+            **dict(trace.reasoning_trace or {}),
+            "pending_update_state": pending,
+        }
+        return ShipUpdateParseResult(
+            write_mode="ambiguous",
+            resolved_identifier=identifiers,
+            field_sources=field_sources,
+            instruction_text=instruction_text,
+            parsed_dynamic_fields=dict(merged_fields),
+            user_message=pending["last_question_to_user"],
+            needs_confirmation=True,
+            conflict_fields=["draft"],
+            failure_reason="update_draft_ambiguous",
+            pending_update_state=pending,
+        )
+    if contract_operation_type == "static_update":
+        static_update_requested = True
     write_mode = "static" if static_update_requested else "dynamic"
     resolved_identifier, identifier_message, needs_confirmation, identifier_failure_reason = _resolve_ship_update_identifier(identifiers, tool_map, trace)
     if resolved_identifier.get("mmsi") and not semantic_fields.get("mmsi"):
@@ -3531,7 +3915,7 @@ def parse_ship_update_request(
     enriched_instruction = "\n".join([instruction_text, " ".join(f"{k}: {v}" for k, v in semantic_fields.items())])
     if contract_payload:
         contract_payload = {**contract_payload, "fields": {**dict(contract_payload.get("fields") or {}), **semantic_fields}}
-        for key in ("updatetime", "lon", "lat"):
+        for key in ("updatetime", "lon", "lat", "heading", "course"):
             if fallback_contract.fields.get(key):
                 contract_payload["fields"][key] = fallback_contract.fields[key]
         semantic_extraction, semantic_normalized = extract_and_normalize_ship_update_contract(contract_payload)
@@ -3558,40 +3942,134 @@ def parse_ship_update_request(
             "operation_type": semantic_extraction.operation_type,
             "raw_fields": dict(semantic_extraction.raw_fields),
             "contract_fields": dict(semantic_extraction.fields),
+            "ship_identity": dict(getattr(semantic_extraction, "ship_identity", {}) or {}),
+            "position_update_fields": dict(getattr(semantic_extraction, "position_update_fields", {}) or {}),
+            "static_update_fields": dict(getattr(semantic_extraction, "static_update_fields", {}) or {}),
             "raw_mentions": dict(semantic_extraction.raw_mentions),
             "normalized_fields": dict(semantic_normalized.normalized_fields),
             "missing_required_fields": list(semantic_normalized.missing_required_fields),
             "invalid_fields": list(semantic_extraction.invalid_fields),
+            "conflict_fields": list(field_conflicts),
+            "structured_heading_course_used": bool(structured_heading_course_used),
+            "structured_conflicts_resolved": list(structured_conflicts_resolved),
             "unsupported_fields": list(semantic_extraction.unsupported_fields),
             "ambiguities": list(semantic_extraction.ambiguities),
             "suspicious_fields": list(semantic_normalized.suspicious_fields),
             "can_write": semantic_normalized.can_write,
             "need_user_confirmation": semantic_normalized.need_user_confirmation,
             "updatetime_suggestion": semantic_normalized.updatetime_suggestion,
+            "action_recommendation": semantic_extraction.action_recommendation,
+            "next_question": semantic_extraction.next_question,
         },
     }
+    if field_conflicts:
+        pending = build_pending_update_state(
+            operation_type="static_update" if write_mode == "static" else "position_update",
+            status="awaiting_field_confirmation",
+            source_turn_id=source_turn_id,
+            ship_identity=dict(resolved_identifier or identifiers),
+            extracted_fields={**merged_fields},
+            conflict_fields=field_conflicts,
+            last_question_to_user="识别到字段冲突：" + "、".join(field_conflicts) + "。请确认以哪一个值为准后我再继续更新。",
+            confirmation_required=True,
+        )
+        parse_result = ShipUpdateParseResult(
+            write_mode=write_mode,
+            resolved_identifier=resolved_identifier,
+            field_sources=field_sources,
+            instruction_text=instruction_text,
+            parsed_dynamic_fields=dict(merged_fields),
+            static_fields=static_fields,
+            user_message=pending["last_question_to_user"],
+            needs_confirmation=True,
+            conflict_fields=field_conflicts,
+            failure_reason="update_conflicting_fields",
+            pending_update_state=pending,
+        )
+        trace.reasoning_trace["pending_update_state"] = pending
+        return parse_result
     if write_mode == "static":
         if not resolved_identifier.get("mmsi"):
+            pending = build_pending_update_state(
+                operation_type="static_update",
+                status="awaiting_ship_identity",
+                source_turn_id=source_turn_id,
+                ship_identity=dict(resolved_identifier),
+                extracted_fields=_extract_static_update_args(instruction_text, mmsi="", semantic_fields=dict(semantic_extraction.static_update_fields or {})),
+                missing_required_fields=["mmsi"],
+                last_question_to_user=identifier_message or "更新船舶信息需要明确船舶身份标识。请提供 9 位 MMSI、IMO 或唯一船名。",
+                confirmation_required=needs_confirmation,
+            )
             parse_result.missing_required_fields = ["MMSI"]
-            parse_result.user_message = identifier_message or "更新船舶信息需要明确船舶身份标识。请提供 9 位 MMSI、IMO 或唯一船名。"
+            parse_result.user_message = pending["last_question_to_user"]
             parse_result.needs_confirmation = needs_confirmation
+            parse_result.pending_update_state = pending
             if not parse_result.failure_reason:
                 parse_result.failure_reason = "update_requires_mmsi"
+            trace.reasoning_trace["pending_update_state"] = pending
             return parse_result
         parse_result.parsed_static_fields = _extract_field_by_patterns(instruction_text, SHIP_UPDATE_STATIC_VALUE_PATTERNS, normalize_time=True)
-        parse_result.args = _extract_static_update_args(instruction_text, mmsi=resolved_identifier["mmsi"])
+        parse_result.args = _extract_static_update_args(
+            instruction_text,
+            mmsi=resolved_identifier["mmsi"],
+            semantic_fields=dict(semantic_extraction.static_update_fields or {}),
+        )
+        static_missing, static_invalid = _validate_static_update_args(parse_result.args)
+        if static_missing or static_invalid:
+            pending = build_pending_update_state(
+                operation_type="static_update",
+                status=_pending_status_for_missing(static_missing, needs_confirmation=bool(static_invalid)),
+                source_turn_id=source_turn_id,
+                ship_identity=dict(resolved_identifier),
+                extracted_fields=dict(parse_result.args),
+                missing_required_fields=static_missing,
+                invalid_fields=static_invalid,
+                last_question_to_user=("静态信息更新缺少或需确认字段：" + "、".join(static_missing + static_invalid) + "。请补充后我再更新。"),
+                confirmation_required=bool(static_invalid),
+            )
+            parse_result.missing_required_fields = static_missing
+            parse_result.format_errors = static_invalid
+            parse_result.user_message = pending["last_question_to_user"]
+            parse_result.needs_confirmation = bool(static_invalid)
+            parse_result.failure_reason = "static_update_invalid_or_missing_fields"
+            parse_result.pending_update_state = pending
+            trace.reasoning_trace["pending_update_state"] = pending
+            return parse_result
         return parse_result
     if identifier_message:
+        pending = build_pending_update_state(
+            operation_type="position_update",
+            status="awaiting_mmsi_confirmation" if resolved_identifier.get("mmsi") else "awaiting_ship_identity",
+            source_turn_id=source_turn_id,
+            ship_identity=dict(resolved_identifier),
+            extracted_fields=dict(merged_fields),
+            missing_required_fields=["mmsi"] if not resolved_identifier.get("mmsi") else [],
+            last_question_to_user=identifier_message,
+            confirmation_required=needs_confirmation,
+        )
         parse_result.user_message = identifier_message
         parse_result.needs_confirmation = needs_confirmation
+        parse_result.pending_update_state = pending
         if not parse_result.failure_reason:
             parse_result.failure_reason = "update_requires_mmsi"
+        trace.reasoning_trace["pending_update_state"] = pending
         return parse_result
     if not resolved_identifier.get("mmsi"):
+        pending = build_pending_update_state(
+            operation_type="position_update",
+            status="awaiting_ship_identity",
+            source_turn_id=source_turn_id,
+            ship_identity=dict(resolved_identifier),
+            extracted_fields=dict(merged_fields),
+            missing_required_fields=["mmsi"],
+            last_question_to_user="更新船舶信息需要明确船舶身份标识。请提供 9 位 MMSI、IMO 或唯一船名。",
+        )
         parse_result.missing_required_fields = ["MMSI"]
-        parse_result.user_message = "更新船舶信息需要明确船舶身份标识。请提供 9 位 MMSI、IMO 或唯一船名。"
+        parse_result.user_message = pending["last_question_to_user"]
         parse_result.failure_reason = "update_requires_mmsi"
         parse_result.parsed_dynamic_fields = dict(merged_fields)
+        parse_result.pending_update_state = pending
+        trace.reasoning_trace["pending_update_state"] = pending
         return parse_result
     normalized_fields = dict(semantic_normalized.normalized_fields or {})
     for key in ("lon", "lat"):
@@ -3611,6 +4089,19 @@ def parse_ship_update_request(
         parse_result.missing_required_fields = missing_required
         parse_result.parsed_dynamic_fields = dict(merged_fields)
         parse_result.format_errors = [semantic_normalized.updatetime_error]
+        pending = build_pending_update_state(
+            operation_type="position_update",
+            status="awaiting_field_confirmation",
+            source_turn_id=source_turn_id,
+            ship_identity=dict(resolved_identifier),
+            extracted_fields=dict(merged_fields),
+            missing_required_fields=missing_required,
+            invalid_fields=[semantic_normalized.updatetime_error],
+            last_question_to_user=parse_result.user_message,
+            confirmation_required=True,
+        )
+        parse_result.pending_update_state = pending
+        trace.reasoning_trace["pending_update_state"] = pending
         return parse_result
     if semantic_normalized.position_error:
         parse_result.user_message = semantic_normalized.user_confirmation_message
@@ -3619,6 +4110,19 @@ def parse_ship_update_request(
         parse_result.missing_required_fields = list(semantic_normalized.missing_required_fields)
         parse_result.parsed_dynamic_fields = dict(merged_fields)
         parse_result.format_errors = [semantic_normalized.position_error]
+        pending = build_pending_update_state(
+            operation_type="position_update",
+            status="awaiting_field_confirmation",
+            source_turn_id=source_turn_id,
+            ship_identity=dict(resolved_identifier),
+            extracted_fields=dict(merged_fields),
+            missing_required_fields=list(semantic_normalized.missing_required_fields),
+            invalid_fields=[semantic_normalized.position_error],
+            last_question_to_user=parse_result.user_message,
+            confirmation_required=True,
+        )
+        parse_result.pending_update_state = pending
+        trace.reasoning_trace["pending_update_state"] = pending
         return parse_result
     if semantic_normalized.suspicious_fields:
         parse_result.user_message = semantic_normalized.user_confirmation_message
@@ -3627,11 +4131,35 @@ def parse_ship_update_request(
         parse_result.missing_required_fields = list(semantic_normalized.missing_required_fields)
         parse_result.parsed_dynamic_fields = dict(merged_fields)
         parse_result.format_errors = list(semantic_normalized.suspicious_fields)
+        pending = build_pending_update_state(
+            operation_type="position_update",
+            status="awaiting_field_confirmation",
+            source_turn_id=source_turn_id,
+            ship_identity=dict(resolved_identifier),
+            extracted_fields=dict(merged_fields),
+            missing_required_fields=list(semantic_normalized.missing_required_fields),
+            invalid_fields=list(semantic_normalized.suspicious_fields),
+            last_question_to_user=parse_result.user_message,
+            confirmation_required=True,
+        )
+        parse_result.pending_update_state = pending
+        trace.reasoning_trace["pending_update_state"] = pending
         return parse_result
     parse_result.missing_required_fields = missing_required
     if missing_required:
         parse_result.user_message = "更新船位缺少必填字段：" + "、".join(missing_required) + "。请补充后我再更新；当前仅会按本轮明确提供的信息写入。"
         parse_result.failure_reason = "update_missing_required_fields"
+        pending = build_pending_update_state(
+            operation_type="position_update",
+            status=_pending_status_for_missing(missing_required),
+            source_turn_id=source_turn_id,
+            ship_identity=dict(resolved_identifier),
+            extracted_fields=dict(merged_fields),
+            missing_required_fields=list(missing_required),
+            last_question_to_user=parse_result.user_message,
+        )
+        parse_result.pending_update_state = pending
+        trace.reasoning_trace["pending_update_state"] = pending
         return parse_result
     parse_result.args = _build_dynamic_update_args(resolved_identifier, merged_fields)
     if semantic_normalized.normalized_updatetime:
@@ -3639,16 +4167,31 @@ def parse_ship_update_request(
     return parse_result
 
 
-def _extract_static_update_args(instruction_text: str, *, mmsi: str) -> dict[str, str]:
+def _normalize_static_update_field_key(key: str) -> str:
+    return STATIC_UPDATE_FIELD_ALIASES.get(str(key), str(key))
+
+
+def _extract_static_update_args(instruction_text: str, *, mmsi: str, semantic_fields: dict[str, Any] | None = None) -> dict[str, str]:
     args = {"mmsi": mmsi}
     parsed = _extract_field_by_patterns(instruction_text, SHIP_UPDATE_STATIC_VALUE_PATTERNS, normalize_time=True)
+    if "destination" in parsed and parsed.get("ship_name") == parsed.get("destination"):
+        parsed.pop("ship_name", None)
+    for key, value in dict(semantic_fields or {}).items():
+        mapped = _normalize_static_update_field_key(key)
+        if mapped in {"destination", "eta"} and mapped not in clean_optional_voyage_fields({mapped: value}):
+            continue
+        if mapped in SHIP_UPDATE_STATIC_FIELD_ORDER and str(value or "").strip() and not parsed.get(mapped):
+            parsed[mapped] = _clean_update_value(str(value))
     destination, eta = _extract_destination_eta_from_text(instruction_text)
     if destination and not parsed.get("destination"):
         parsed["destination"] = destination
     if eta and not parsed.get("eta"):
         parsed["eta"] = eta
+    if parsed.get("eta"):
+        parsed["eta"] = _normalize_update_time_value(parsed["eta"])
     if "draft" in parsed:
         parsed["draft"] = parsed["draft"]
+    parsed = clean_optional_voyage_fields(parsed)
     for key in SHIP_UPDATE_STATIC_FIELD_ORDER:
         value = parsed.get(key, "")
         if value:
@@ -3669,6 +4212,7 @@ def _static_update_requested(instruction_text: str) -> tuple[bool, list[str]]:
 
 def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace, perception: dict[str, Any] | None = None) -> str:
     parse_result = parse_ship_update_request(text, entities, tool_map, trace, perception=perception)
+    pending_from_parse = dict(parse_result.pending_update_state or trace.reasoning_trace.get("pending_update_state") or {})
     trace.reasoning_trace = {
         **dict(trace.reasoning_trace or {}),
         "instruction_text": parse_result.instruction_text,
@@ -3681,6 +4225,9 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
         "resolved_identifier": dict(parse_result.resolved_identifier),
         "write_args": dict(parse_result.args),
         "static_fields": list(parse_result.static_fields),
+        "pending_update_state": pending_from_parse,
+        "conflict_fields": list(parse_result.conflict_fields),
+        "pending_used": parse_result.pending_used,
     }
     ship_update_extraction = dict(trace.reasoning_trace.get("ship_update_extraction") or {})
     if ship_update_extraction:
@@ -3695,6 +4242,10 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
             "missing_required_fields": list(parse_result.missing_required_fields),
             "needs_confirmation": parse_result.needs_confirmation,
             "ship_update_extraction": ship_update_extraction,
+            "conflict_fields": list(parse_result.conflict_fields),
+            "pending_update_state": pending_from_parse,
+            "write_result": False,
+            "allowed_success_claim": False,
         }
         return parse_result.user_message
     if parse_result.write_mode == "static":
@@ -3707,12 +4258,44 @@ def execute_update_chain(text: str, entities: MessageEntities, tool_map: dict[st
         "write_result": bool(result_status["success"]),
         "write_result_status": result_status,
         "ship_update_extraction": ship_update_extraction,
+        "pending_update_state": pending_from_parse,
+        "allowed_success_claim": bool(result_status["success"]),
     }
     trace.answer_confidence = "high" if trace.check_result["write_result"] else "low"
     if not result_status["success"]:
+        failed_pending = dict(pending_from_parse or default_pending_update_state())
+        failed_pending.update({"active": True, "status": "executed_failed", "can_resume": True})
+        trace.reasoning_trace["pending_update_state"] = failed_pending
+        trace.check_result["pending_update_state"] = failed_pending
         trace.fallback_reason = str(result_status["reason"])
         return _write_failure_closure(parse_result.write_mode, result_status)
+    success_pending = dict(pending_from_parse or default_pending_update_state())
+    success_pending.update({"active": False, "status": "executed_success", "can_resume": False, "missing_required_fields": []})
+    trace.reasoning_trace["pending_update_state"] = success_pending
+    trace.check_result["pending_update_state"] = success_pending
     return out
+
+
+def build_text_from_pending_update(pending: dict[str, Any], user_text: str) -> str:
+    pending = dict(pending or {})
+    operation = str(pending.get("operation_type") or "position_update")
+    ship_identity = dict(pending.get("ship_identity") or {})
+    extracted_fields = clean_optional_voyage_fields(dict(pending.get("extracted_fields") or {}))
+    current_id = extract_entities(user_text).mmsi
+    if current_id:
+        ship_identity["mmsi"] = current_id
+    prefix = "更新船舶静态信息" if operation == "static_update" else "更新船位"
+    parts = [prefix]
+    for key in ("mmsi", "imo", "name"):
+        value = ship_identity.get(key)
+        if value:
+            label = "船名" if key == "name" else key.upper()
+            parts.append(f"{label}: {value}")
+    for key, value in extracted_fields.items():
+        if value in (None, ""):
+            continue
+        parts.append(f"{key}: {value}")
+    return " ".join(parts)
 
 
 def execute_complex_ship_chain(text: str, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace, max_loops: int = 2) -> str:

@@ -38,7 +38,7 @@ flowchart TD
 本轮没有重写完整 graph，而是在现有 `preprocess -> delegate -> finalize` 轻量链路中增加：
 
 - 结构化理解结果写入 `route_trace.reasoning_trace.understanding_result`。
-- 目的港 / ETA 前台功能、邮箱用途、AIS 延迟解释场景的前置安全分流。
+- 目的港 / ETA 前台功能、邮箱用途、AIS 延迟解释场景在 `CustomerUnderstanding` 中标记为非写入。
 - 最终回复后的规则版 high-risk claim guard。
 - 船位写入字段的语义抽取 + 确定性归一化校验。
 
@@ -46,12 +46,12 @@ flowchart TD
 
 | 模块 | 职责 |
 | --- | --- |
-| `customer_support_understanding.py` | 统一理解用户意图，输出 `CustomerUnderstanding` |
+| `customer_support_understanding.py` | 统一理解用户意图，输出 `CustomerUnderstanding`，包括 `operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason` 和候选字段 |
 | `customer_support_scenarios.py` | 目的港 / ETA 等高风险场景分流 |
 | `customer_support_evidence_guard.py` | 拦截无证据平台功能声明 |
 | `ship_update_extractor.py` | 结构化抽取船舶写入字段，默认确定性实现，预留 LLM schema 接口 |
 | `ship_update_normalizer.py` | 坐标、时间、数值字段归一化和校验 |
-| `write_preflight_guard` | 由 `execute_update_chain` 决定是否允许调用写入工具 |
+| `write_preflight_guard` | 只在 `CustomerUnderstanding` 判定为写入候选或 active pending 恢复时进入 harness；最终是否调用写入工具由 `execute_update_chain` 校验 |
 
 ## 4. 典型场景链路
 
@@ -65,7 +65,7 @@ flowchart TD
 
 ### 用户请求客服后台代更新
 
-用户明确说“帮我把 MMSI xxx 目的港改成 Shanghai”时，理解为后台代操作请求。P0 先保证不误说前台入口；后续 P1 可把静态信息更新也纳入同样的字段抽取与二次确认链。
+用户明确说“帮我把 MMSI xxx 目的港改成 Shanghai”时，理解为后台代操作请求，进入静态信息更新 harness 校验。前台能力咨询仍走知识/证据链，不调用后台写工具。
 
 ### 格式不统一的船位更新
 
@@ -93,9 +93,8 @@ P0 测试覆盖：
 ## 6. 后续优化方向
 
 - 增加 LLM JSON schema extractor，并与当前确定性 extractor 交叉校验。
-- 将静态信息更新，尤其目的港 / ETA 后台代更新，纳入同一 preflight。
+- 继续增强 LLM JSON schema extractor 与 deterministic parser 的一致性校验，减少 OCR 和语义抽取冲突。
 - 建设 claim-level evidence judge，对每条平台功能声明输出 `supported / unsupported / missing_evidence`。
 - 标准化工具返回结构，减少最终回复阶段对原始文本的依赖。
 - 固化 `route_trace` 字段版本，方便后台排障和回归测试。
 - 建设产品功能边界知识表，由产品、客服、开发共同维护。
-

@@ -12,18 +12,34 @@ import re
 from pydantic import BaseModel, Field
 
 from agents.ship_update_contract import NAV_STATUS_ALIASES, NAV_STATUS_VALUES, POSITION_UPDATE_CONTRACT, STATIC_UPDATE_CONTRACT
-from agents.ship_update_normalizer import NormalizedShipUpdate, normalize_ship_update_fields
+from agents.ship_update_normalizer import NormalizedShipUpdate, clean_optional_voyage_fields, normalize_ship_update_fields
 
 
 class ContractShipUpdateExtraction(BaseModel):
-    operation_type: Literal["position_update", "static_update", "mixed_update", "unknown"] = "unknown"
+    operation_type: Literal[
+        "none",
+        "ship_query",
+        "position_update",
+        "static_update",
+        "mixed_update",
+        "ambiguous_update",
+        "frontend_capability_question",
+        "data_delay_troubleshooting",
+        "unknown",
+    ] = "unknown"
     fields: dict[str, Any] = Field(default_factory=dict)
+    ship_identity: dict[str, Any] = Field(default_factory=dict)
+    position_update_fields: dict[str, Any] = Field(default_factory=dict)
+    static_update_fields: dict[str, Any] = Field(default_factory=dict)
     raw_mentions: dict[str, Any] = Field(default_factory=dict)
     confidence: dict[str, float] = Field(default_factory=dict)
     ambiguities: list[str] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
     invalid_fields: list[str] = Field(default_factory=list)
+    conflict_fields: list[str] = Field(default_factory=list)
     unsupported_fields: list[str] = Field(default_factory=list)
+    action_recommendation: str = "none"
+    next_question: str | None = None
     action_allowed: bool = False
     source: str = "fallback_contract_parser"
 
@@ -61,10 +77,16 @@ class ShipPositionUpdateExtraction(BaseModel):
     raw_fields: dict[str, str] = Field(default_factory=dict)
     operation_type: str | None = None
     fields: dict[str, Any] = Field(default_factory=dict)
+    ship_identity: dict[str, Any] = Field(default_factory=dict)
+    position_update_fields: dict[str, Any] = Field(default_factory=dict)
+    static_update_fields: dict[str, Any] = Field(default_factory=dict)
     raw_mentions: dict[str, Any] = Field(default_factory=dict)
     ambiguities: list[str] = Field(default_factory=list)
     invalid_fields: list[str] = Field(default_factory=list)
+    conflict_fields: list[str] = Field(default_factory=list)
     unsupported_fields: list[str] = Field(default_factory=list)
+    action_recommendation: str | None = None
+    next_question: str | None = None
     source: str = "fallback_contract_parser"
     notes: str | None = None
 
@@ -151,7 +173,7 @@ def extract_ship_update_parameters_with_agent(text: str, perception: dict[str, A
     if dest_eta:
         fields["destination"] = _clean(dest_eta.group(1))
         fields["eta"] = _clean(dest_eta.group(2))
-    fields = _stringify_fields({key: value for key, value in fields.items() if value})
+    fields = clean_optional_voyage_fields(_stringify_fields({key: value for key, value in fields.items() if value}))
     raw_mentions.update(fields)
     operation_type = _infer_operation_type(source, fields)
     normalized = normalize_ship_update_fields(fields)
@@ -224,9 +246,21 @@ def _extract_navstatus(text: str) -> str:
 
 def _infer_operation_type(text: str, fields: dict[str, str]) -> str:
     lowered = str(text or "").lower()
+    if re.search(r"(为什么|为何|怎么|如何|怎样).{0,30}(船位|ais|目的港|eta|更新|刷新).{0,30}(慢|延迟|不更新|不刷新|旧|没变)", text, flags=re.IGNORECASE) or re.search(
+        r"(船位|ais|目的港|eta).{0,18}(慢|延迟|不更新|不刷新|旧|没变|异常|正常但)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "data_delay_troubleshooting"
+    if re.search(
+        r"(怎么|如何|怎样|能不能|是否|可以).{0,30}(平台|前台|按钮|入口|手动|邮件|邮箱|mail).{0,30}(更新|修改|编辑).{0,30}(目的港|eta|船位)?",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "frontend_capability_question"
     static_markers = ("静态信息", "静态", "档案")
     static_update_markers = (
-        r"(?:更新|修改|改|补充)\s*(?:船型|船长|船宽|载重吨|呼号|船旗|建造年份)",
+        r"(?:更新|修改|改|补充)\s*(?:船型|船长|船宽|载重吨|呼号|船旗|建造年份|目的港|ETA|eta|预抵)",
         r"(?:ship_type|length|width|dwt|callsign|flag|built_year)\s*[:：]",
     )
     position_markers = ("船位", "位置", "经度", "纬度", "航速", "航首向", "船首向", "船艏向", "航迹向", "航行状态")
@@ -244,7 +278,7 @@ def _infer_operation_type(text: str, fields: dict[str, str]) -> str:
     if has_position:
         return "position_update"
     if "update" in lowered or "更新" in text or "修改" in text:
-        return "unknown"
+        return "ambiguous_update"
     return "unknown"
 
 
@@ -291,10 +325,16 @@ def build_ship_update_extraction(raw_fields: dict[str, str], normalized: Normali
         raw_fields=dict(raw_fields),
         operation_type=contract.operation_type,
         fields=dict(contract.fields),
+        ship_identity=dict(contract.ship_identity),
+        position_update_fields=dict(contract.position_update_fields),
+        static_update_fields=dict(contract.static_update_fields),
         raw_mentions=dict(contract.raw_mentions),
         ambiguities=list(contract.ambiguities),
         invalid_fields=list(contract.invalid_fields),
+        conflict_fields=list(contract.conflict_fields),
         unsupported_fields=list(contract.unsupported_fields),
+        action_recommendation=contract.action_recommendation,
+        next_question=contract.next_question,
         source=contract.source,
         notes=normalized.notes or None,
     )
@@ -306,19 +346,80 @@ def extract_and_normalize_ship_update(text: str, perception: dict[str, Any] | No
 
 
 def extract_and_normalize_ship_update_contract(contract_payload: dict[str, Any]) -> tuple[ShipPositionUpdateExtraction, NormalizedShipUpdate]:
-    contract = ContractShipUpdateExtraction.model_validate(contract_payload or {})
+    normalized_payload = normalize_contract_payload(contract_payload or {})
+    contract = ContractShipUpdateExtraction.model_validate(normalized_payload)
     contract.fields = _stringify_fields(contract.fields)
     contract.raw_mentions = _stringify_fields(contract.raw_mentions)
     normalized = normalize_ship_update_fields(contract.fields)
     extraction = build_ship_update_extraction(contract.fields, normalized)
     extraction.operation_type = contract.operation_type
     extraction.fields = dict(contract.fields)
+    extraction.ship_identity = dict(contract.ship_identity)
+    extraction.position_update_fields = dict(contract.position_update_fields)
+    extraction.static_update_fields = dict(contract.static_update_fields)
     extraction.raw_mentions = dict(contract.raw_mentions)
     extraction.ambiguities = list(contract.ambiguities)
     extraction.invalid_fields = list(contract.invalid_fields)
+    extraction.conflict_fields = list(contract.conflict_fields)
     extraction.unsupported_fields = list(contract.unsupported_fields)
+    extraction.action_recommendation = contract.action_recommendation
+    extraction.next_question = contract.next_question
     extraction.source = contract.source
     return extraction, normalized
+
+
+def normalize_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    fields = dict(data.get("fields") or {})
+    ship_identity = dict(data.get("ship_identity") or {})
+    position_fields = dict(data.get("position_update_fields") or {})
+    static_fields = dict(data.get("static_update_fields") or {})
+    operation_type = str(data.get("operation_type") or "unknown")
+
+    alias_map = {
+        "name": "ship_name",
+        "imonumber": "imo",
+        "buildyear": "built_year",
+        "draught": "draft",
+        "status": "navstatus",
+    }
+
+    def merge(source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            mapped = alias_map.get(str(key), str(key))
+            if mapped in {"destination", "eta"} and clean_optional_voyage_fields({mapped: value}).get(mapped) is None:
+                continue
+            if value not in (None, "") and not fields.get(mapped):
+                fields[mapped] = value
+
+    merge(ship_identity)
+    if operation_type == "static_update":
+        merge(static_fields)
+    elif operation_type == "position_update":
+        merge(position_fields)
+    else:
+        merge(position_fields)
+        merge(static_fields)
+    if ship_identity.get("mmsi") and not fields.get("mmsi"):
+        fields["mmsi"] = ship_identity["mmsi"]
+
+    missing = list(data.get("missing_fields") or data.get("missing_required_fields") or [])
+    fields = clean_optional_voyage_fields(fields)
+    position_fields = clean_optional_voyage_fields(position_fields)
+    static_fields = clean_optional_voyage_fields(static_fields)
+    raw_mentions = clean_optional_voyage_fields(dict(data.get("raw_mentions") or {}))
+    data["fields"] = fields
+    data["ship_identity"] = ship_identity
+    data["position_update_fields"] = position_fields
+    data["static_update_fields"] = static_fields
+    data["raw_mentions"] = raw_mentions
+    data["missing_fields"] = [str(item) for item in missing]
+    data["invalid_fields"] = [str(item) for item in list(data.get("invalid_fields") or [])]
+    data["conflict_fields"] = [str(item) for item in list(data.get("conflict_fields") or [])]
+    data["unsupported_fields"] = [str(item) for item in list(data.get("unsupported_fields") or [])]
+    data["action_recommendation"] = str(data.get("action_recommendation") or "none")
+    data["source"] = str(data.get("source") or "llm_contract_extractor")
+    return data
 
 
 def _stringify_fields(fields: dict[str, Any]) -> dict[str, str]:

@@ -62,6 +62,8 @@ from agents.customer_support_router import (
     extract_entities,
     format_unverified_chart_symbol_answer,
     format_verified_chart_symbol_answer,
+    build_text_from_pending_update,
+    is_active_pending_update_state,
     latest_user_text as latest_customer_user_text,
     make_trace,
     normalize_message_text,
@@ -71,11 +73,6 @@ from agents.customer_support_router import (
 )
 from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
 from agents.customer_support_evidence_guard import apply_high_risk_evidence_guard
-from agents.customer_support_scenarios import (
-    DestinationEtaScenario,
-    classify_destination_eta_scenario,
-    destination_eta_safe_response,
-)
 from agents.customer_support_understanding import build_customer_understanding
 from coze_coding_utils.runtime_ctx.context import default_headers
 from llm_config import DEFAULT_MULTIMODAL_MODEL, DEFAULT_TEXT_MODEL, build_thinking_payload, load_llm_config, resolve_thinking_settings
@@ -136,6 +133,12 @@ query_type 只允许：
 - 对“上面/这艘船/上一条/总结”等强依赖上下文的问题，优先结合上下文理解，不要忽略会话历史。
 - 如果当前问题是船舶追问，但本轮没写船名/MMSI/IMO，只要上下文里已有明确船舶，可以标记 use_context_ship=true。
 - 明确要求修改/上传/更新船舶数据时才标记 ship_update；只是在问平台显示或更新慢时不要标记 ship_update。
+- 船舶写入只输出候选意图和候选字段，不代表允许写入；最终是否执行只能由 shared ship_update harness 校验。
+- 更新船位、上传船位、补录船位、更新目的港/ETA、更新静态信息属于 ship_update 候选；为什么更新慢、船位跟踪异常、怎么手动更新目的港 ETA、能不能邮件更新 ETA 属于非写入知识/排障。
+- ship_update 候选必须填 operation_type：position_update/static_update/mixed_update/ambiguous_update。非写入目的港/ETA 能力咨询填 frontend_capability_question；数据延迟或跟踪异常填 data_delay_troubleshooting。
+- `船艏/航迹向: A / B` 表示 heading=A、course=B，不要把两个值当作同一字段冲突。
+- `目的港/ETA: -- / --`、空白、--、-、N/A、未知、目的港/ETA、/ETA、ETA 都表示未提供，不能填入 destination 或 eta。
+- pending_action 只能是 resume/hold/cancel/pause/none：确认 pending、补 MMSI、按上述参数更新时 resume；取消时 cancel；用户转为原因/平台能力咨询时 pause。
 - 避免过度分类，拿不准时优先 knowledge。
 - 如果问题是公共权威数据查询，例如今日长江水位、指数、运价、政策、法规更新，不要强行加 HiFleet，不要建议限制到 HiFleet 官方站点。
 - 如果问题是 HiFleet 平台功能、产品介绍、权限、配置、教程、帮助、常见故障，关键词必须保留具体功能词，不要泛化成“产品功能 使用说明”。
@@ -182,7 +185,7 @@ Few-shot:
 - 不要补充任何 JSON 之外的文本
 
 JSON 格式:
-{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true}
+{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true,"operation_type":"none|ship_query|position_update|static_update|mixed_update|ambiguous_update|frontend_capability_question|data_delay_troubleshooting","ship_update_candidate":false,"pending_action":"resume|hold|cancel|pause|none","non_write_reason":"none|frontend_capability_question|data_delay_troubleshooting","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{},"ship_update_confidence":"high|medium|low"}
 """
 
 
@@ -1009,6 +1012,148 @@ def build_agent_process_summary(
     return "\n".join(lines)
 
 
+def _safe_trace_dict(value: Any) -> dict[str, Any]:
+    return dict(value or {}) if isinstance(value, dict) else {}
+
+
+def build_structured_readable_trace(
+    *,
+    user_text: str,
+    route_trace: dict[str, Any],
+    final_answer: str,
+    phase_history: list[str] | None = None,
+    source_channel: str = "",
+    has_attachment: bool = False,
+    attachment_type: str = "",
+    pending_before: dict[str, Any] | None = None,
+    pending_after: dict[str, Any] | None = None,
+    pending_used: bool = False,
+) -> dict[str, Any]:
+    trace = _safe_trace_dict(route_trace)
+    reasoning = _safe_trace_dict(trace.get("reasoning_trace"))
+    check = _safe_trace_dict(trace.get("check_result"))
+    understanding = _safe_trace_dict(reasoning.get("understanding_result"))
+    extraction = _safe_trace_dict(reasoning.get("ship_update_extraction") or check.get("ship_update_extraction"))
+    pending_before = _safe_trace_dict(pending_before)
+    pending_after = _safe_trace_dict(pending_after or reasoning.get("pending_update_state") or check.get("pending_update_state"))
+    write_status = _safe_trace_dict(check.get("write_result_status"))
+    guard = _safe_trace_dict(trace.get("evidence_guard"))
+    normalized_fields = _safe_trace_dict(extraction.get("normalized_fields"))
+    raw_fields = _safe_trace_dict(extraction.get("raw_fields"))
+    field_sources = _safe_trace_dict(reasoning.get("field_sources"))
+    write_mode = str(reasoning.get("write_mode") or "")
+    tools_called = [str(item) for item in list(trace.get("tool_call_sequence") or [])]
+    allowed_success = bool(check.get("allowed_success_claim") or check.get("write_result"))
+    summary = (
+        "用户输入：" + _redact_trace_text(user_text, limit=120)
+        + "\n字段提取：" + _redact_trace_text(json.dumps(_safe_trace_dict(extraction.get("normalized_fields") or extraction.get("raw_fields")), ensure_ascii=False), limit=180)
+        + "\n工具调用：" + ("、".join([str(item) for item in list(trace.get("tool_call_sequence") or [])]) or "无")
+        + "\nGuard状态：" + ("触发" if _safe_trace_dict(trace.get("evidence_guard")).get("triggered") else "未触发")
+        + "\nagent思考摘要：用户本轮输入为「"
+        + _redact_trace_text(user_text, limit=120)
+        + "」。agent 判断请求类型为 "
+        + _redact_trace_text(extraction.get("operation_type") or understanding.get("intent") or trace.get("route") or "unknown", limit=60)
+        + "。Harness 基于结构化候选参数校验字段、目标船舶和工具结果；"
+        + ("工具返回明确成功，因此允许成功话术。" if allowed_success else "未满足成功条件时不会输出成功话术。")
+    )
+    readable = {
+        "input_summary": {
+            "latest_user_text": _redact_trace_text(user_text, limit=220),
+            "has_attachment": bool(has_attachment),
+            "attachment_type": _redact_trace_text(attachment_type, limit=40),
+            "source_channel": _redact_trace_text(source_channel, limit=60),
+            "is_followup": bool(pending_before),
+            "history_used": bool(reasoning.get("context_used")),
+            "pending_used": bool(pending_used),
+        },
+        "understanding_summary": {
+            "intent": _redact_trace_text(understanding.get("intent") or trace.get("route") or "", limit=80),
+            "operation_type": _redact_trace_text(extraction.get("operation_type") or pending_after.get("operation_type") or "", limit=80),
+            "user_goal": _redact_trace_text(understanding.get("user_goal") or user_text, limit=180),
+            "confidence": _redact_trace_text(trace.get("answer_confidence") or "", limit=40),
+            "is_write_action": bool(trace.get("route") == "ship_update" or extraction),
+            "is_frontend_capability_question": bool(understanding.get("frontend_capability_question") or check.get("scenario_guard") == "frontend_capability_question"),
+            "is_data_delay_troubleshooting": bool(understanding.get("ship_data_issue") or check.get("scenario_guard") == "ais_delay_explanation"),
+        },
+        "extracted_fields": {
+            "ship_identity": _safe_trace_dict(extraction.get("ship_identity") or reasoning.get("resolved_identifier") or pending_after.get("ship_identity")),
+            "position_update_fields": _safe_trace_dict(extraction.get("position_update_fields") or normalized_fields or raw_fields),
+            "static_update_fields": _safe_trace_dict(extraction.get("static_update_fields") or reasoning.get("parsed_static_fields")),
+            "field_sources": field_sources,
+            "missing_required_fields": list(extraction.get("missing_required_fields") or reasoning.get("missing_required_fields") or check.get("missing_required_fields") or []),
+            "invalid_fields": list(extraction.get("invalid_fields") or reasoning.get("format_errors") or []),
+            "conflict_fields": list(extraction.get("conflict_fields") or reasoning.get("conflict_fields") or check.get("conflict_fields") or []),
+        },
+        "pending_update_summary": {
+            "had_pending_before": bool(pending_before),
+            "pending_used": bool(pending_used),
+            "pending_status_before": _redact_trace_text(pending_before.get("status") or "", limit=60),
+            "pending_status_after": _redact_trace_text(pending_after.get("status") or "", limit=60),
+            "pending_cleared": bool(pending_before and not pending_after.get("active")),
+            "clear_reason": _redact_trace_text(reasoning.get("pending_clear_reason") or "", limit=80),
+        },
+        "decision_summary": {
+            "decision": _redact_trace_text(trace.get("route") or "", limit=80),
+            "why": _redact_trace_text(trace.get("fallback_reason") or reasoning.get("route_source") or "", limit=160),
+            "not_chosen": list(reasoning.get("not_chosen") or []),
+        },
+        "write_action_summary": {
+            "is_write_action": bool(trace.get("route") == "ship_update" or extraction),
+            "write_type": "static_update" if write_mode == "static" else "position_update" if write_mode == "dynamic" else _redact_trace_text(write_mode, limit=60),
+            "preflight_status": "passed" if reasoning.get("write_args") and not check.get("missing_required_fields") else "blocked" if extraction or pending_after else "",
+            "action_allowed": bool(reasoning.get("write_args") and not check.get("missing_required_fields")),
+            "confirmation_required": bool(check.get("needs_confirmation") or pending_after.get("confirmation_required")),
+            "executed_tool": next((item for item in tools_called if item in {"upload_ship_position", "update_ship_static_info"}), ""),
+            "execution_status": _redact_trace_text(write_status.get("status") or ("ok" if check.get("write_result") else "not_executed"), limit=40),
+            "allowed_success_claim": allowed_success,
+        },
+        "tool_result_summary": {
+            "tools_called": tools_called,
+            "write_tool_status": _redact_trace_text(write_status.get("status") or "", limit=60),
+            "write_tool_success": bool(check.get("write_result")),
+            "failure_reason": _redact_trace_text(trace.get("fallback_reason") or write_status.get("reason") or "", limit=120),
+        },
+        "evidence_summary": {
+            "needs_evidence": bool(understanding.get("evidence_required")),
+            "tools_used": [item for item in tools_called if item in {"local_kb_search", "web_search", "web_search_agent_browser", "verify_public_page"}],
+            "evidence_quality": _redact_trace_text(trace.get("answer_confidence") or "", limit=40),
+            "evidence_gap": _redact_trace_text(trace.get("fallback_reason") if understanding.get("evidence_required") else "", limit=120),
+            "answer_policy": "guarded" if guard.get("triggered") else "normal",
+        },
+        "risk_guard_summary": {
+            "risk_level": _redact_trace_text(understanding.get("risk_level") or "", limit=40),
+            "risk_scenario": _redact_trace_text(understanding.get("scenario") or check.get("scenario_guard") or "", limit=80),
+            "guard_triggered": bool(guard.get("triggered") or check.get("scenario_guard")),
+            "blocked_claims": list(guard.get("blocked_claims") or []),
+            "fallback_reason": _redact_trace_text(guard.get("fallback_reason") or "", limit=120),
+        },
+        "final_response_summary": {
+            "response_type": "followup" if pending_after.get("active") else "answer",
+            "customer_visible_success_claim": allowed_success,
+            "needs_user_followup": bool(pending_after.get("active") or check.get("needs_confirmation")),
+            "followup_field": _redact_trace_text(",".join(list(pending_after.get("missing_required_fields") or [])[:3]), limit=80),
+        },
+        "agent_process_summary": summary,
+    }
+    return _sanitize_readable_trace(readable)
+
+
+def _sanitize_readable_trace(value: Any) -> Any:
+    banned = ("token", "api_key", "secret", "password", ".env", "/home/", "/tmp/")
+    if isinstance(value, dict):
+        return {str(k): _sanitize_readable_trace(v) for k, v in value.items() if not any(item in str(k).lower() for item in banned)}
+    if isinstance(value, list):
+        return [_sanitize_readable_trace(item) for item in value]
+    if isinstance(value, str):
+        sanitized = value
+        for item in banned:
+            sanitized = sanitized.replace(item, "[redacted]")
+        sanitized = re.sub(r"(?i)(api[_-]?key|token|secret|password)", "[redacted]", sanitized)
+        sanitized = sanitized.replace("/home/", "[path]/").replace("/tmp/", "[path]/")
+        return sanitized
+    return value
+
+
 def _customer_support_route_for_intent(intent: str, allow_write: bool) -> RouteDecision:
     normalized = (intent or "knowledge").strip().lower()
     if normalized == "conversation":
@@ -1496,6 +1641,74 @@ def _is_ship_position_update_request(text: str) -> bool:
     return has_write and has_position
 
 
+def _is_ship_update_confirmation_text(text: str) -> bool:
+    normalized = normalize_message_text(text)
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in ("取消", "不用", "不要", "先不", "别")):
+        return False
+    compact = re.sub(r"\s+", "", normalized, flags=re.UNICODE).lower()
+    exact_markers = {
+        "确认",
+        "确认更新",
+        "确认执行",
+        "确认提交",
+        "确定",
+        "是的",
+        "对",
+        "可以",
+        "继续",
+        "继续更新",
+        "好的",
+        "好",
+        "ok",
+        "yes",
+    }
+    if compact in exact_markers:
+        return True
+    return bool(re.fullmatch(r"(请)?确认(更新|执行|提交)?(该)?(mmsi)?", compact, flags=re.IGNORECASE))
+
+
+def _is_ship_tracking_issue_request(text: str) -> bool:
+    value = normalize_message_text(text)
+    lowered = value.lower()
+    tracking_markers = (
+        "没有船位跟踪",
+        "无船位跟踪",
+        "船位跟踪",
+        "暂未收到更新船位",
+        "没有收到更新船位",
+        "连续",
+        "1-2天",
+        "1-2 天",
+        "不刷新",
+        "不显示",
+        "没更新",
+        "未更新",
+        "后台看看",
+        "后台看",
+        "什么问题",
+    )
+    issue_markers = ("为什么", "什么问题", "后台", "排查", "看看", "指导", "正常", "周边其他船")
+    has_tracking = any(marker in value for marker in tracking_markers) or "no position" in lowered or "tracking" in lowered
+    has_issue = any(marker in value for marker in issue_markers)
+    return has_tracking and has_issue
+
+
+def _is_non_write_update_capability_question(text: str) -> bool:
+    value = normalize_message_text(text)
+    lowered = value.lower()
+    question_markers = ("怎么", "如何", "能不能", "是否", "可以", "入口", "按钮", "操作流程", "怎么操作", "?")
+    capability_markers = ("reports@hifleet.com", "邮件", "发邮件", "邮箱", "平台手动", "网页端", "前台", "自助", "自行")
+    update_field_markers = ("目的港", "ETA", "eta", "预抵", "静态信息")
+    has_capability_marker = "reports@hifleet.com" in lowered or any(marker in value for marker in capability_markers if marker != "reports@hifleet.com")
+    return (
+        any(marker in value for marker in question_markers)
+        and has_capability_marker
+        and any(marker in value for marker in update_field_markers)
+    )
+
+
 def _objective_multimodal_text(perception: dict[str, Any], user_text: str = "") -> str:
     parts: list[str] = []
     recognized = str(perception.get("recognized_text") or "").strip()
@@ -1651,6 +1864,8 @@ class LightweightCustomerSupportState(TypedDict, total=False):
     output_assets: list[dict[str, Any]]
     route_trace: dict[str, Any]
     check_result: dict[str, Any]
+    pending_update_state: dict[str, Any]
+    _pending_before: dict[str, Any]
     delegate_input_message_count: int
     delegate_answer: str
 
@@ -2057,7 +2272,8 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
         context = build_conversation_context(messages)
         raw_entities = extract_entities(question)
         preliminary_decision = classify_message(question, raw_entities, context)
-        is_ship_update_write = preliminary_decision.route == "ship_update" or _is_ship_position_update_request(question)
+        understanding = build_customer_understanding(question, entities=asdict(raw_entities), perception=perception).model_dump()
+        is_ship_update_write = preliminary_decision.route == "ship_update" or bool(understanding.get("ship_update_candidate"))
         entities = raw_entities if is_ship_update_write else resolve_entities_with_context(
             raw_entities,
             context,
@@ -2653,14 +2869,15 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             route_trace["latency_hotspot"] = dict(route_trace.get("latency_hotspot", {}))
             route_trace["latency_hotspot"]["total"] = max(0, int(time.time() * 1000) - started_at_ms)
         final_answer = sanitize_customer_output(str(state.get("generated_answer", "") or _extract_final_answer(list(state.get("messages", []) or []))))
-        route_trace["readable_trace"] = {
-            "agent_process_summary": build_agent_process_summary(
-                user_text=str(state.get("task_goal") or latest_customer_user_text(list(state.get("messages", []) or []))),
-                route_trace=route_trace,
-                final_answer=final_answer,
-                phase_history=list(state.get("phase_history", []) or []),
-            )
-        }
+        route_trace["readable_trace"] = build_structured_readable_trace(
+            user_text=str(state.get("task_goal") or latest_customer_user_text(list(state.get("messages", []) or []))),
+            route_trace=route_trace,
+            final_answer=final_answer,
+            phase_history=list(state.get("phase_history", []) or []),
+            source_channel=str(state.get("source_channel", "")),
+            has_attachment=bool(state.get("attachments")),
+            pending_after=dict(state.get("pending_update_state", {}) or route_trace.get("pending_update_state", {}) or {}),
+        )
         logger.info(
             "[CustomerSupportTrace] run_id=%s session_id=%s route=%s task_type=%s sequence=%s check=%s latency=%s",
             route_trace.get("run_id", ""),
@@ -2780,7 +2997,6 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     def preprocess_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
         messages = list(state.get("messages", []) or [])
         text = _latest_user_text(messages)
-        initial_understanding = build_customer_understanding(text, has_media=_has_current_multimodal_media(messages)).model_dump()
         route_trace = {
             "run_id": str(getattr(ctx, "run_id", "") or ""),
             "session_id": str(state.get("session_id", "")),
@@ -2798,7 +3014,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 ],
                 "deprecated_customer_router_bypassed": True,
                 "v1_output_modalities": ["text", "link"],
-                "understanding_result": initial_understanding,
+                "understanding_result": {},
             },
         }
         if is_sensitive_internal_request(text):
@@ -2839,48 +3055,96 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "visible_features": str(perception.get("visible_features") or ""),
             "confidence": str(perception.get("confidence") or ""),
         }
+        pending_before = dict(state.get("pending_update_state", {}) or {})
+        pending_after = dict(pending_before)
+        pending_used = False
         understanding = build_customer_understanding(
             text,
             entities=asdict(extract_entities(text)),
             has_media=_has_current_multimodal_media(messages),
+            perception=perception,
+            pending_update_state=pending_after,
         ).model_dump()
         route_trace["reasoning_trace"]["understanding_result"] = understanding
-        destination_eta_scenario = classify_destination_eta_scenario(text)
-        if destination_eta_scenario in {
-            DestinationEtaScenario.FRONTEND_CAPABILITY_QUESTION,
-            DestinationEtaScenario.EMAIL_UPDATE_QUESTION,
-            DestinationEtaScenario.AIS_DELAY_EXPLANATION,
-        }:
-            answer = destination_eta_safe_response(destination_eta_scenario)
-            route_trace["check_result"] = {
-                "has_answer": True,
-                "scenario_guard": destination_eta_scenario.value,
-                "deprecated_customer_router_bypassed": True,
-            }
-            route_trace["answer_confidence"] = "high"
-            route_trace["evidence_guard"] = {
-                "triggered": destination_eta_scenario != DestinationEtaScenario.AIS_DELAY_EXPLANATION,
-                "blocked_claims": [],
-                "fallback_reason": "destination_eta_boundary_guard",
-            }
-            return {
-                "phase": "done",
-                "phase_history": ["preprocess", "destination_eta_guard", "done"],
-                "status": "success",
-                "task_goal": text,
-                "messages": [AIMessage(content=answer)],
-                "perception_result": perception,
-                "generated_answer": answer,
-                "delegate_answer": answer,
-                "generated_tool_calls": [],
-                "delegate_input_message_count": len(messages),
-                "output_assets": _extract_output_assets(answer),
-                "check_result": dict(route_trace.get("check_result", {}) or {}),
-                "intent_hint": "knowledge",
-                "route_trace": route_trace,
-                "response_modalities": ["text"],
-            }
-        if _is_ship_position_update_request(text):
+        if pending_after:
+            pending_after["turns_elapsed"] = int(pending_after.get("turns_elapsed") or 0) + 1
+            if int(pending_after.get("turns_elapsed") or 0) > int(pending_after.get("expires_after_turns") or 5):
+                pending_after.update({"active": False, "status": "expired", "can_resume": False})
+                route_trace["reasoning_trace"]["pending_clear_reason"] = "expired"
+            if any(marker in text for marker in ("取消更新", "不用更新", "取消", "先不更新")):
+                pending_after.update({"active": False, "status": "cancelled", "can_resume": False})
+                route_trace["reasoning_trace"]["pending_clear_reason"] = "cancelled_by_user"
+        if pending_before and not is_active_pending_update_state(pending_after):
+            pending_before = dict(pending_before)
+        elif is_active_pending_update_state(pending_after):
+            current_entities = extract_entities(text)
+            mmsi_only = bool(current_entities.mmsi and normalize_message_text(text) == current_entities.mmsi)
+            pending_action = str(understanding.get("pending_action") or "none")
+            if pending_action == "pause":
+                pending_after.update({"active": False, "status": "cancelled", "can_resume": False})
+                route_trace["reasoning_trace"]["pending_clear_reason"] = "topic_switched"
+            elif pending_action == "cancel":
+                pending_after.update({"active": False, "status": "cancelled", "can_resume": False})
+                route_trace["reasoning_trace"]["pending_clear_reason"] = "cancelled_by_user"
+            elif mmsi_only and pending_after.get("status") in {"awaiting_ship_identity", "awaiting_required_fields"}:
+                pending_used = True
+                text = build_text_from_pending_update(pending_after, text)
+                messages = _messages_with_text_replacement(messages, text)
+                route_trace["reasoning_trace"]["pending_resume_reason"] = "mmsi_followup"
+            elif pending_after.get("status") == "awaiting_mmsi_confirmation" and pending_action == "resume" and bool((pending_after.get("ship_identity") or {}).get("mmsi")):
+                pending_used = True
+                text = build_text_from_pending_update(pending_after, text)
+                messages = _messages_with_text_replacement(messages, text)
+                route_trace["reasoning_trace"]["pending_resume_reason"] = "active_pending_confirmation"
+            elif pending_after.get("status") == "awaiting_field_confirmation" and pending_action == "resume":
+                pending_used = True
+                text = build_text_from_pending_update(pending_after, text)
+                messages = _messages_with_text_replacement(messages, text)
+                route_trace["reasoning_trace"]["pending_resume_reason"] = "active_pending_field_confirmation"
+        route_trace["pending_used"] = pending_used
+        route_trace["pending_update_state"] = pending_after
+        route_trace["reasoning_trace"]["pending_update_state_before"] = pending_before
+        route_trace["reasoning_trace"]["pending_update_state"] = pending_after
+        if pending_used:
+            understanding = build_customer_understanding(
+                text,
+                entities=asdict(extract_entities(text)),
+                has_media=_has_current_multimodal_media(messages),
+                perception=perception,
+                pending_update_state=pending_after,
+            ).model_dump()
+            route_trace["reasoning_trace"]["understanding_result"] = understanding
+        is_ship_tracking_issue = _is_ship_tracking_issue_request(text)
+        is_non_write_capability_question = _is_non_write_update_capability_question(text)
+        route_trace["reasoning_trace"]["ship_tracking_issue"] = is_ship_tracking_issue
+        route_trace["reasoning_trace"]["non_write_update_capability_question"] = is_non_write_capability_question
+        operation_type = str(understanding.get("operation_type") or "none")
+        non_write_reason = str(understanding.get("non_write_reason") or "none")
+        pending_action = str(understanding.get("pending_action") or "none")
+        ship_update_gate = {
+            "should_run_harness": False,
+            "reason": "",
+            "pending_used": bool(pending_used),
+            "operation_type": operation_type,
+            "pending_action": pending_action,
+            "non_write_reason": non_write_reason,
+            "agent_source": "customer_understanding",
+        }
+        if pending_used:
+            ship_update_gate.update(
+                {
+                    "should_run_harness": True,
+                    "reason": str(route_trace["reasoning_trace"].get("pending_resume_reason") or "active_pending_update"),
+                }
+            )
+        elif bool(understanding.get("ship_update_candidate")) and non_write_reason == "none":
+            ship_update_gate.update({"should_run_harness": True, "reason": "agent_ship_update"})
+        elif bool(understanding.get("ship_write_request")) and non_write_reason == "none":
+            ship_update_gate.update({"should_run_harness": True, "reason": "agent_ship_update"})
+        route_trace["ship_update_gate"] = dict(ship_update_gate)
+        route_trace["reasoning_trace"]["ship_update_gate"] = dict(ship_update_gate)
+        should_run_write_preflight = bool(ship_update_gate["should_run_harness"])
+        if should_run_write_preflight:
             context = build_conversation_context(messages)
             current_user_text = _latest_user_text(messages)
             raw_entities = extract_entities(current_user_text)
@@ -2900,10 +3164,18 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             preflight_perception_summary = dict(route_trace["reasoning_trace"].get("perception_summary", {}) or {})
             route_trace.update(trace_dict)
             route_trace["route"] = "ship_update"
+            new_pending = dict((trace_dict.get("reasoning_trace") or {}).get("pending_update_state") or (trace_dict.get("check_result") or {}).get("pending_update_state") or {})
+            if new_pending:
+                pending_after = new_pending
+            route_trace["pending_update_state"] = pending_after
+            route_trace["pending_used"] = pending_used
             route_trace["reasoning_trace"] = {
                 **dict(trace_dict.get("reasoning_trace", {}) or {}),
                 "route_source": "write_preflight_guard",
+                "ship_update_gate": dict(ship_update_gate),
                 "perception_summary": preflight_perception_summary,
+                "pending_update_state_before": pending_before,
+                "pending_update_state": pending_after,
             }
             return {
                 "phase": "done",
@@ -2918,6 +3190,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "delegate_input_message_count": len(messages),
                 "output_assets": _extract_output_assets(answer),
                 "check_result": dict(trace_dict.get("check_result", {}) or {}),
+                "pending_update_state": pending_after,
+                "_pending_before": pending_before,
                 "intent_hint": "ship_update",
                 "route_trace": route_trace,
                 "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
@@ -2944,6 +3218,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "delegate_input_message_count": len(messages),
                 "output_assets": _extract_output_assets(answer),
                 "check_result": dict(route_trace.get("check_result", {}) or {}),
+                "pending_update_state": pending_after,
+                "_pending_before": pending_before,
                 "intent_hint": "knowledge",
                 "route_trace": route_trace,
                 "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
@@ -2963,6 +3239,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "check_result": {},
             "intent_hint": classify_intent_fast(text, has_media=_has_current_multimodal_media(messages)),
             "route_trace": route_trace,
+            "pending_update_state": pending_after,
+            "_pending_before": pending_before,
             "response_modalities": ["text", "link"],
         }
 
@@ -3007,6 +3285,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "generated_tool_calls": [],
                 "perception_result": dict(state.get("perception_result", {}) or {}),
                 "route_trace": route_trace,
+                "pending_update_state": dict(state.get("pending_update_state", {}) or {}),
+                "_pending_before": dict(state.get("_pending_before", {}) or {}),
                 "response_modalities": ["text"],
             }
         messages = list(delegated.get("messages", []) or [])
@@ -3028,6 +3308,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         delegated["generated_tool_calls"] = tool_sequence
         delegated["perception_result"] = dict(state.get("perception_result", {}) or {})
         delegated["route_trace"] = route_trace
+        delegated["pending_update_state"] = dict(state.get("pending_update_state", {}) or {})
+        delegated["_pending_before"] = dict(state.get("_pending_before", {}) or {})
         delegated["response_modalities"] = list(state.get("response_modalities", ["text", "link"]))
         return delegated
 
@@ -3047,8 +3329,14 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         )
         sanitized = guard_result.text
         output_assets = _extract_output_assets(sanitized)
-        tool_sequence = list(state.get("generated_tool_calls", []) or route_trace.get("tool_call_sequence", []) or _extract_tool_sequence(messages))
+        if "generated_tool_calls" in state:
+            tool_sequence = list(state.get("generated_tool_calls") or [])
+        elif "tool_call_sequence" in route_trace:
+            tool_sequence = list(route_trace.get("tool_call_sequence") or [])
+        else:
+            tool_sequence = _extract_tool_sequence(messages)
         check_result = {
+            **dict(route_trace.get("check_result", {}) or {}),
             "has_answer": bool(raw_answer),
             "sanitized": sanitized != raw_answer,
             "post_guard_applied": sanitized == guard_fallback or sanitized == SENSITIVE_REFUSAL,
@@ -3070,14 +3358,20 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         route_trace["tool_call_sequence"] = tool_sequence
         route_trace["check_result"] = check_result
         route_trace["answer_confidence"] = "medium" if tool_sequence else "high"
-        route_trace["readable_trace"] = {
-            "agent_process_summary": build_agent_process_summary(
-                user_text=str(state.get("task_goal") or latest_customer_user_text(messages)),
-                route_trace=route_trace,
-                final_answer=sanitized,
-                phase_history=list(state.get("phase_history", []) or []),
-            )
-        }
+        pending_before = dict(state.get("_pending_before", {}) or {})
+        pending_after = dict(state.get("pending_update_state", {}) or route_trace.get("pending_update_state", {}) or {})
+        route_trace["readable_trace"] = build_structured_readable_trace(
+            user_text=str(state.get("task_goal") or latest_customer_user_text(messages)),
+            route_trace=route_trace,
+            final_answer=sanitized,
+            phase_history=list(state.get("phase_history", []) or []),
+            source_channel=str(state.get("source_channel", "")),
+            has_attachment=_has_current_multimodal_media(messages),
+            attachment_type=str((state.get("perception_result") or {}).get("attachment_type") or ""),
+            pending_before=pending_before,
+            pending_after=pending_after,
+            pending_used=bool(route_trace.get("pending_used") or (route_trace.get("readable_trace") or {}).get("input_summary", {}).get("pending_used")),
+        )
         return {
             "phase": "done",
             "status": "success",

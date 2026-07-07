@@ -27,7 +27,7 @@ preprocess -> multimodal perception -> write_preflight_guard -> ship_update pars
 7. 授权知识库维护 `knowledge_admin.upsert_local_kb_entry`。
 8. HiFleet 官方社区、帮助中心、官网公开页面核验。
 9. 船舶查询、档案、PSC、轨迹、挂靠、统计、船位上传、静态信息更新。
-10. 船舶写操作的显式意图和必填字段保护。
+10. 船舶写操作的 `CustomerUnderstanding` 结构化识别、显式意图和必填字段保护。
 11. 多轮上下文与最近船舶实体记忆。
 12. 最终输出脱敏、链接抽取和 `output_assets`。
 13. `/run`、`/stream_run` 和微信旧 `content.query.prompt` 兼容。
@@ -86,8 +86,9 @@ npm run build
 
 1. `route_trace.route` 可为 `ship_update`。
 2. `route_trace.reasoning_trace.route_source` 应为 `write_preflight_guard`。
-3. `instruction_text`、`parsed_dynamic_fields`、`field_sources`、`resolved_identifier`、`write_args`、`missing_required_fields` 应足以解释是否真正进入写工具。
-4. 缺字段拦截时 `generated_tool_calls=[]`，不得委托标准 agent 补写。
+3. `reasoning_trace.understanding_result.operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason` 应能解释入口是否进入 harness。
+4. `instruction_text`、`parsed_dynamic_fields`、`field_sources`、`resolved_identifier`、`write_args`、`missing_required_fields` 应足以解释是否真正进入写工具。
+5. 缺字段拦截时 `generated_tool_calls=[]`，不得委托标准 agent 补写。
 
 ## 4. 当前重点验收场景
 
