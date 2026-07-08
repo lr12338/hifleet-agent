@@ -139,3 +139,37 @@ def test_llm_contract_extractor_static_json_drives_write_harness(monkeypatch):
         }
     ]
     assert trace.check_result["write_result"] is True
+
+
+def test_llm_contract_extractor_static_ship_type_syncs_minotype(monkeypatch):
+    monkeypatch.setattr(
+        "agents.customer_support_router._invoke_ship_update_contract_llm",
+        lambda text, perception=None: {
+            "operation_type": "static_update",
+            "ship_identity": {"mmsi": "730285526", "identity_status": "resolved", "candidate_mmsi": []},
+            "static_update_fields": {
+                "mmsi": "730285526",
+                "type": "散货船",
+            },
+            "missing_required_fields": [],
+            "invalid_fields": [],
+            "conflict_fields": [],
+            "action_recommendation": "execute_static_update",
+            "source": "llm_contract_extractor",
+        },
+    )
+    static_update = FakeTool("update_ship_static_info", lambda args: "静态信息更新成功！")
+    text = "更新船舶类型，MMSI 730285526，散货船"
+    entities = extract_entities(text)
+    trace = make_trace(classify_message(text, entities), entities)
+
+    output = execute_update_chain(text, entities, {"update_ship_static_info": static_update}, trace)
+
+    assert "静态信息更新成功" in output
+    assert static_update.calls == [
+        {
+            "mmsi": "730285526",
+            "ship_type": "散货船",
+            "minotype": "散货船",
+        }
+    ]

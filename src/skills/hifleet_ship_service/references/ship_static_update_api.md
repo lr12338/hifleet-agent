@@ -37,6 +37,7 @@
 
 > ⚠️ **字段名映射是关键**：工具参数名必须映射到API字段名，否则API不识别该字段，静默丢弃。
 > ⚠️ **width/length 描述勘误**：API官方文档中 width 标注为"船长"、length 标注为"船宽"，这是描述错误。根据标准海事惯例和请求示例验证（width=12.3, length=30.5），实际含义为 width=船宽、length=船长。
+> ⚠️ **船舶类型更新规则**：更新船型/船舶类型时必须同时写入 `type` 和 `minotype`，且两者字段值一致；如果只写 `type`，船舶详情页可能仍显示旧的 `minotype`。
 
 ### 请求示例
 
@@ -66,10 +67,10 @@
 | ship_name | name | 船名（英文）|
 | imo | imonumber | IMO编号 |
 | ship_type | type | 船型 |
+| minotype | minotype | 船舶子类型；更新船型时必须与 ship_type 相同 |
 | built_year | buildyear | 建造年份 |
 | draft | draught | 吃水 ⚠️ 与船位上传API不同 |
 | callsign | callsign | 呼号 |
-| minotype | minotype | MINO船型代码 |
 | wechatgroup | wechatgroup | 微信群组 |
 | destination | destination | 目的港 |
 | eta | eta | 预抵时间 |

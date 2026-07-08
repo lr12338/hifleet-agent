@@ -48,6 +48,8 @@ flowchart TD
     R --> S
 ```
 
+当前写入链路的关键点是：模型负责识别和组织候选字段，代码层不再用固定业务规则决定“是否写入哪艘船”；但在真正调用工具前，会做工具字段白名单、字段别名、空值清理和 skills 参数格式化，保证传给工具的是工具参数而不是 API body。
+
 ## 3. ship_update 子 agent
 
 子 agent 是船舶写入业务判断中心。主链路不再用固定规则解释“确认更新 / 只补 MMSI / 目的港 follow-up / 取消”等业务语义。
@@ -67,9 +69,42 @@ flowchart TD
 
 - JSON schema / enum 校验。
 - 写入工具白名单：`upload_ship_position`、`update_ship_static_info`。
-- 工具参数字段别名和空值清理。
+- 工具参数字段别名、空值清理和执行前格式化。
 - 真实工具调用、工具结果成功/失败判定、trace 记录。
 - LLM 子 agent 不可用或返回非法 JSON 时，才使用 deterministic fallback。
+
+### 3.1 参数解析与执行前格式化
+
+```mermaid
+flowchart LR
+    A["current_text / perception / active ship_update_draft"] --> B["ship_update 子 agent<br/>深度理解并输出 JSON"]
+    B --> C["schema + enum 校验"]
+    C --> D["工具字段白名单"]
+    D --> E["字段别名映射"]
+    E --> F["skills 参数格式化"]
+    F --> G{"status=ready_to_execute<br/>且工具允许?"}
+    G -->|是| H["真实写工具调用"]
+    G -->|否| I["追问 / non-write handoff / 错误收口"]
+```
+
+执行前格式化只处理工具参数形态，不重新判断业务意图：
+
+| 输入来源可能返回 | 最终工具参数 |
+| --- | --- |
+| `draught` | `draft` |
+| `status` / `nav_status` | `navstatus` |
+| `name` | `ship_name` |
+| `imonumber` | `imo` |
+| `type` | `ship_type` |
+| `buildyear` | `built_year` |
+| `116°19.746′ E` | `116.3291` |
+| `29°49.007′ N` | `29.816783` |
+| `2026-07-08 15:37 (UTC+8)` | `2026-07-08 15:37:00` |
+| `0 kn` | `0` |
+| `163°` | `163` |
+| `1.6 m` | `1.6` |
+
+如果 LLM 子 agent 同时返回 `normalized_fields.lon_dec / lat_dec`，主链路会保留这些值进入 trace，并把最终 `tool_args.lon / lat` 归一成十进制度。这样可避免日志中“已识别 decimal，但实际工具仍收到原始 OCR 字符串”的问题。
 
 ## 4. ship_update_draft
 
@@ -121,6 +156,8 @@ flowchart TD
 组合字段规则：
 
 - `船艏/航迹向: A / B` 必须解析为 `heading=A`、`course=B`。
+- 航速、船首向、航迹向、吃水可接受带单位或度数符号输入，例如 `0 kn`、`163°`、`1.6 m`，执行前必须转换成纯数值字符串。
+- 经纬度最终传给工具时优先为十进制度；工具层仍保留度分格式兜底转换能力。
 
 目的港/ETA 占位符清洗：
 
@@ -155,6 +192,13 @@ flowchart TD
 - `数据同步：预计 5 分钟内生效`。
 
 静态信息没有 `updatetime` 字段，因此成功回复不伪造更新时间。
+
+船舶类型更新专项规则：
+
+- 用户要求更新船型/船舶类型时，必须同时传 `ship_type` 和 `minotype`。
+- `ship_type` 映射 API 字段 `type`，`minotype` 映射 API 字段 `minotype`。
+- 两者字段值必须一致，例如 `ship_type="散货船"`、`minotype="散货船"`。
+- 如果子 agent 只输出其中一个字段，执行前会自动补齐另一字段；如果二者同时存在但值不一致，工具层拒绝执行。
 
 ## 6. 非写入咨询
 
@@ -204,6 +248,7 @@ flowchart TD
 
 - `/ETA`、`目的港/ETA: -- / --` 不进入写入参数。
 - 合法 `目的港/ETA:VNSGN/2026-07-03 09:00` 保留。
+- 船位工具参数按 skills 格式化：度分坐标转十进制度，时间补齐秒，带单位数值转纯数值。
 - 旧扁平 `pending_update_state` 可迁移为 `ship_update_draft`。
 - active draft + MMSI follow-up 使用当前 draft 字段写入。
 - `non_write` 交回 standard agent 排障，不直接返回内部分类话术。

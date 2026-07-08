@@ -141,6 +141,9 @@ query_type 只允许：
 - 明确要求修改/上传/更新船舶数据时才标记 ship_update；只是在问平台显示或更新慢时不要标记 ship_update。
 - 船舶写入只输出候选意图和候选字段，不代表允许写入；后续由 ship_update 子 agent 生成结构化工具计划，主 agent 只按计划执行允许的写入工具。
 - 更新船位、上传船位、补录船位、更新目的港/ETA、更新静态信息属于 ship_update 候选；为什么更新慢、船位跟踪异常、怎么手动更新目的港 ETA、能不能邮件更新 ETA 属于非写入知识/排障。
+- “更新船舶类型，散货船”“更新船型，MMSI...”“更新船舶静态信息”“更新呼号/船长/船宽/载重吨/建造年份/吃水”等明确命令属于 static_update 候选，必须输出 ship_update_candidate=true、ship_write_request=true、non_write_reason=none。
+- 只有用户询问“怎么在平台/前台/网页端手动更新”“是否有入口/按钮”“能否邮件自动更新”时，才输出 frontend_capability_question。不要因为 perception 里出现“操作方法”“按钮”“页面”就覆盖用户明确的后台代更新命令。
+- 多模态 perception 中的旧值、页面提示、按钮文字只作为字段证据；用户当前文本的明确写入命令优先于 perception 对问题性质的推测。
 - ship_update 候选必须填 operation_type：position_update/static_update/mixed_update/ambiguous_update。非写入目的港/ETA 能力咨询填 frontend_capability_question；数据延迟或跟踪异常填 data_delay_troubleshooting。
 - `船艏/航迹向: A / B` 表示 heading=A、course=B，不要把两个值当作同一字段冲突。
 - `目的港/ETA: -- / --`、空白、--、-、N/A、未知、目的港/ETA、/ETA、ETA 都表示未提供，不能填入 destination 或 eta。
@@ -184,6 +187,10 @@ Few-shot:
 输出：
 {"intent":"knowledge","confidence":"high","reason_summary":"用户基于截图询问海图或平台符号含义，需要结合多模态识别结果检索证据后回答","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户想确认截图中红色圆形图标的含义，并需要可核验的 HiFleet 或海图符号资料","query_type":"multimodal_symbol","search_keywords":["HiFleet 海图","红色圆形图标","符号含义"],"search_query_candidates":["HiFleet 海图 红色圆形图标 符号含义","海图 红色圆形 中心黑点 标志","HiFleet 海图 符号 识别"],"needs_multimodal_grounding":true,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":false}
 
+输入：请结合截图，更新船舶类型，散货船
+输出：
+{"intent":"ship_update","confidence":"high","reason_summary":"用户明确要求客服后台更新当前截图船舶的船舶类型","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户要把当前截图中船舶的船舶类型更新为散货船","query_type":"ship_query","search_keywords":["船舶类型","静态信息","散货船"],"search_query_candidates":["更新船舶类型 静态信息 散货船"],"needs_multimodal_grounding":false,"should_prefer_local_kb":false,"should_limit_to_hifleet_sites":false,"operation_type":"static_update","ship_update_candidate":true,"ship_write_request":true,"pending_action":"none","non_write_reason":"none","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{"ship_type":"散货船","minotype":"散货船"},"ship_update_confidence":"high"}
+
 输出要求：
 - 只返回 JSON
 - 不要输出 Markdown
@@ -191,7 +198,7 @@ Few-shot:
 - 不要补充任何 JSON 之外的文本
 
 JSON 格式:
-{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true,"operation_type":"none|ship_query|position_update|static_update|mixed_update|ambiguous_update|frontend_capability_question|data_delay_troubleshooting","ship_update_candidate":false,"pending_action":"resume|hold|cancel|pause|none","non_write_reason":"none|frontend_capability_question|data_delay_troubleshooting","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{},"ship_update_confidence":"high|medium|low"}
+{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true,"operation_type":"none|ship_query|position_update|static_update|mixed_update|ambiguous_update|frontend_capability_question|data_delay_troubleshooting","ship_update_candidate":false,"ship_write_request":false,"pending_action":"resume|hold|cancel|pause|none","non_write_reason":"none|frontend_capability_question|data_delay_troubleshooting","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{},"ship_update_confidence":"high|medium|low"}
 """
 
 
@@ -405,6 +412,20 @@ UNDERSTANDING_QUERY_TYPES = {
     "browser_verify",
 }
 
+UNDERSTANDING_OPERATION_TYPES = {
+    "none",
+    "ship_query",
+    "position_update",
+    "static_update",
+    "mixed_update",
+    "ambiguous_update",
+    "frontend_capability_question",
+    "data_delay_troubleshooting",
+}
+
+UNDERSTANDING_PENDING_ACTIONS = {"resume", "hold", "cancel", "pause", "none"}
+SHIP_UPDATE_OPERATION_HINTS = {"position_update", "static_update", "mixed_update", "ambiguous_update"}
+
 
 def _dedupe_short_strings(values: list[Any], limit: int) -> list[str]:
     items: list[str] = []
@@ -490,6 +511,82 @@ def _normalize_customer_support_understanding_result(raw: dict[str, Any], *, tex
         "should_prefer_local_kb": prefer_local_kb,
         "should_limit_to_hifleet_sites": limit_hifleet_sites,
     }
+
+
+def _normalize_ship_update_understanding_result(raw: dict[str, Any], *, fallback: dict[str, Any]) -> dict[str, Any]:
+    data = dict(raw or {})
+    operation_type = str(data.get("operation_type") or fallback.get("operation_type") or "none").strip()
+    if operation_type not in UNDERSTANDING_OPERATION_TYPES:
+        operation_type = "none"
+    pending_action = str(data.get("pending_action") or fallback.get("pending_action") or "none").strip()
+    if pending_action not in UNDERSTANDING_PENDING_ACTIONS:
+        pending_action = "none"
+    non_write_reason = str(data.get("non_write_reason") or fallback.get("non_write_reason") or "none").strip()
+    if non_write_reason not in {"none", "frontend_capability_question", "data_delay_troubleshooting"}:
+        non_write_reason = "none"
+    intent = str(data.get("intent") or fallback.get("intent") or "").strip()
+    ship_identity = data.get("ship_identity") if isinstance(data.get("ship_identity"), dict) else fallback.get("ship_identity") or {}
+    ship_update_fields = data.get("ship_update_fields") if isinstance(data.get("ship_update_fields"), dict) else fallback.get("ship_update_fields") or {}
+    confidence = str(data.get("ship_update_confidence") or data.get("confidence") or fallback.get("ship_update_confidence") or "medium").strip()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+    ship_candidate = bool(data.get("ship_update_candidate", fallback.get("ship_update_candidate", False)))
+    ship_write = bool(data.get("ship_write_request", fallback.get("ship_write_request", False)))
+    if operation_type in SHIP_UPDATE_OPERATION_HINTS and non_write_reason == "none":
+        ship_candidate = ship_candidate or intent == "ship_update"
+        ship_write = ship_write or ship_candidate
+    return {
+        **fallback,
+        **data,
+        "operation_type": operation_type,
+        "pending_action": pending_action,
+        "non_write_reason": non_write_reason,
+        "ship_update_candidate": ship_candidate,
+        "ship_write_request": ship_write,
+        "backend_action_request": bool(data.get("backend_action_request") or ship_candidate or ship_write),
+        "frontend_capability_question": operation_type == "frontend_capability_question" or non_write_reason == "frontend_capability_question",
+        "ship_identity": dict(ship_identity or {}),
+        "ship_update_fields": dict(ship_update_fields or {}),
+        "ship_update_confidence": confidence,
+        "source": str(data.get("source") or "json_understanding_agent"),
+    }
+
+
+def _run_lightweight_customer_understanding(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    text: str,
+    perception: dict[str, Any],
+    draft: dict[str, Any],
+    pending_update_state: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = build_customer_understanding(
+        text,
+        entities=asdict(extract_entities(text)),
+        has_media=bool(perception),
+        perception=perception,
+        pending_update_state=pending_update_state,
+    ).model_dump()
+    fallback["source"] = "fallback_customer_understanding"
+    payload = {
+        "latest_user_text": str(text or ""),
+        "perception": dict(perception or {}),
+        "active_ship_update_draft": dict(draft or {}),
+        "pending_update_state": dict(pending_update_state or {}),
+        "entities": asdict(extract_entities(text)),
+        "mode": "lightweight_preprocess_understanding",
+    }
+    raw = _invoke_customer_support_json_agent(
+        ctx,
+        cfg,
+        CUSTOMER_SUPPORT_UNDERSTANDING_PROMPT,
+        payload,
+        model_override=str((cfg.get("config") or {}).get("customer_support_understanding_model") or "").strip(),
+    )
+    if not raw:
+        return fallback
+    return _normalize_ship_update_understanding_result(raw, fallback=fallback)
 
 
 def _normalize_perception(raw: dict[str, Any], fallback_type: str = "") -> dict[str, Any]:
@@ -701,6 +798,14 @@ def _run_customer_support_intent_agent(
         "needs_multimodal_grounding": understanding_result["needs_multimodal_grounding"],
         "should_prefer_local_kb": understanding_result["should_prefer_local_kb"],
         "should_limit_to_hifleet_sites": understanding_result["should_limit_to_hifleet_sites"],
+        "operation_type": str(raw.get("operation_type") or "none"),
+        "ship_update_candidate": bool(raw.get("ship_update_candidate")),
+        "ship_write_request": bool(raw.get("ship_write_request")),
+        "pending_action": str(raw.get("pending_action") or "none"),
+        "non_write_reason": str(raw.get("non_write_reason") or "none"),
+        "ship_identity": dict(raw.get("ship_identity") or {}) if isinstance(raw.get("ship_identity"), dict) else {},
+        "ship_update_fields": dict(raw.get("ship_update_fields") or {}) if isinstance(raw.get("ship_update_fields"), dict) else {},
+        "ship_update_confidence": str(raw.get("ship_update_confidence") or raw.get("confidence") or "medium"),
         "fallback_route": str(raw.get("fallback_route") or decision.route or fallback_intent),
     }
 
@@ -1632,6 +1737,8 @@ def _run_direct_multimodal_perception(
         "lookup_keywords 写适合知识库或网页检索的短关键词。"
         "不要判断含义，不要下定义，不要写“表示/用于/意味着/属于/危险/安全”等解释性结论；"
         "suspected_symbol 和 suspected_issue 也只能写“待检索确认的图标/符号/问题”，不能写具体含义。\n"
+        "如果用户文字是明确命令，例如“更新船舶类型，散货船”“更新船位”“更新目的港”，"
+        "summary/visual_question_summary 只能描述“用户当前要求更新...”，不要改写成“咨询操作方法/询问入口/如何操作”。\n"
         "视频：基于可访问内容或首帧能力做客观摘要；不确定时 confidence=low。"
     )
     try:
@@ -2986,6 +3093,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     loaded_tools = _load_all_tools(profile)
     tool_map = {tool.name: tool for tool in loaded_tools}
     allowed_tool_names = [tool.name for tool in loaded_tools]
+    write_tool_names = [name for name in allowed_tool_names if name in {"upload_ship_position", "update_ship_static_info"}]
+    standard_tool_names = [name for name in allowed_tool_names if name not in {"upload_ship_position", "update_ship_static_info"}]
 
     def _extract_tool_sequence(messages: list[AnyMessage]) -> list[str]:
         sequence: list[str] = []
@@ -3048,6 +3157,16 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         if status == "uncertain":
             return f"本次{target}暂未确认成功，系统没有返回明确成功状态。请稍后重试，或联系人工客服核实处理。"
         return f"本次{target}暂未成功提交。请检查字段后稍后重试，或联系人工客服处理。"
+
+    def _has_write_success_claim(answer: str) -> bool:
+        value = str(answer or "")
+        return bool(re.search(r"(船位更新成功|静态信息更新成功|船舶信息更新成功|更新成功！)", value))
+
+    def _has_current_write_success(route_trace: dict[str, Any]) -> bool:
+        check = dict(route_trace.get("check_result") or {})
+        if check.get("current_run_tool_success") or check.get("allowed_success_claim") or check.get("write_result"):
+            return True
+        return any(name in {"upload_ship_position", "update_ship_static_info"} for name in list(route_trace.get("tool_call_sequence") or [])) and bool(check.get("write_result"))
 
     def _execute_ship_update_subagent_plan(
         *,
@@ -3181,7 +3300,9 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "session_id": str(state.get("session_id", "")),
             "route": "lightweight_skills_agent",
             "task_type": "multimodal_tool_calling",
-            "tool_bundle": list(allowed_tool_names),
+            "tool_bundle": list(standard_tool_names),
+            "standard_agent_tool_bundle": list(standard_tool_names),
+            "ship_update_tool_bundle": list(write_tool_names),
             "tool_call_sequence": [],
             "reasoning_trace": {
                 "pipeline": [
@@ -3242,13 +3363,14 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         pending_before = draft_to_pending_compat(draft_before)
         pending_after = draft_to_pending_compat(draft_after)
         pending_used = False
-        understanding = build_customer_understanding(
-            text,
-            entities=asdict(extract_entities(text)),
-            has_media=_has_current_multimodal_media(messages),
+        understanding = _run_lightweight_customer_understanding(
+            ctx=ctx,
+            cfg=cfg,
+            text=text,
             perception=perception,
+            draft=draft_after,
             pending_update_state=pending_after,
-        ).model_dump()
+        )
         route_trace["reasoning_trace"]["understanding_result"] = understanding
         if draft_after:
             draft_after["turns_elapsed"] = int(draft_after.get("turns_elapsed") or 0) + 1
@@ -3279,9 +3401,9 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         elif bool(understanding.get("ship_update_candidate")) or bool(understanding.get("ship_write_request")):
             should_run_ship_update_subagent = True
             gate_reason = "agent_ship_update"
-        elif _is_ship_update_confirmation_text(text):
+        elif pending_action == "resume":
             should_run_ship_update_subagent = True
-            gate_reason = "possible_ship_update_followup"
+            gate_reason = "agent_pending_resume"
         ship_update_subagent_gate = {
             "should_run_subagent": should_run_ship_update_subagent,
             "reason": "",
@@ -3504,6 +3626,10 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             scenario=str(understanding_result.get("scenario") or ""),
         )
         sanitized = guard_result.text
+        blocked_write_success_claim = False
+        if _has_write_success_claim(sanitized) and not _has_current_write_success(route_trace):
+            blocked_write_success_claim = True
+            sanitized = "本次船舶信息更新尚未执行成功。请提供本次需要更新的船舶 MMSI 和具体字段，我会按当前信息重新处理。"
         output_assets = _extract_output_assets(sanitized)
         if "generated_tool_calls" in state:
             tool_sequence = list(state.get("generated_tool_calls") or [])
@@ -3518,7 +3644,10 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "post_guard_applied": sanitized == guard_fallback or sanitized == SENSITIVE_REFUSAL,
             "deprecated_customer_router_bypassed": True,
             "output_asset_count": len(output_assets),
+            "blocked_unverified_write_success_claim": blocked_write_success_claim,
         }
+        if blocked_write_success_claim:
+            check_result["post_guard_applied"] = True
         if guard_result.triggered:
             check_result["post_guard_applied"] = True
             route_trace["evidence_guard"] = {

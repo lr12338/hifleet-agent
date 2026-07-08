@@ -57,7 +57,7 @@ def _format_static_update_success(mmsi: str, data: dict) -> str:
     field_labels = [
         ("name", "船名", ""),
         ("imonumber", "IMO", ""),
-        ("type", "船型", ""),
+        ("type", "船舶类型", ""),
         ("minotype", "船舶子类型", ""),
         ("flag", "船旗", ""),
         ("callsign", "呼号", ""),
@@ -84,6 +84,24 @@ def _format_static_update_success(mmsi: str, data: dict) -> str:
         lines.append(f"{label}: {value}{suffix}")
     lines.append("数据同步：预计 5 分钟内生效")
     return "\n".join(lines)
+
+
+def _clean_static_ship_type(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _sync_static_ship_type_fields(ship_type: str, minotype: str) -> tuple[str, str, str]:
+    ship_type_value = _clean_static_ship_type(ship_type)
+    minotype_value = _clean_static_ship_type(minotype)
+    if ship_type_value and minotype_value and ship_type_value != minotype_value:
+        return (
+            ship_type_value,
+            minotype_value,
+            f"船舶类型字段不一致：ship_type={ship_type_value}，minotype={minotype_value}。"
+            "更新船舶类型时 type 和 minotype 必须一致，请确认后重试。",
+        )
+    unified = ship_type_value or minotype_value
+    return unified, unified, ""
 
 # 将 scripts/ 目录加入 sys.path，以便直接 import
 _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
@@ -1280,6 +1298,15 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
         ctx = request_context.get() or new_context(method="update_ship_static_info")
         _ensure_imports()
 
+        synced_ship_type, synced_minotype, ship_type_error = _sync_static_ship_type_fields(ship_type, minotype)
+        if ship_type_error:
+            _emit_result(
+                "update_ship_static_info",
+                ctx,
+                ToolResult(status="error", code="UPDATE_STATIC_BAD_INPUT", message=ship_type_error, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="hifleet_ttse"),
+            )
+            return ship_type_error
+
         # 构造请求体 - 静态信息更新只需要 mmsi + bindCheck
         data = {
             "mmsi": mmsi,
@@ -1292,8 +1319,8 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
         str_field_map = {
             "name": ship_name,       # ship_name → name
             "imonumber": imo,        # imo → imonumber
-            "type": ship_type,       # ship_type → type
-            "minotype": minotype,    # minotype 与API一致
+            "type": synced_ship_type,       # ship_type → type
+            "minotype": synced_minotype,    # minotype 与API一致；船型更新时与type同步
             "flag": flag,
             "callsign": callsign,
             "destination": destination,

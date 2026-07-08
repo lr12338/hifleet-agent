@@ -160,3 +160,41 @@ def test_update_ship_static_info_success_returns_verification_link_and_fields(mo
     assert fake_static.calls[0][0]["mmsi"] == "414402130"
     assert fake_static.calls[0][0]["destination"] == "HUI ZHOU"
     assert fake_static.calls[0][0]["draught"] == 7.9
+
+
+def test_update_ship_static_info_syncs_ship_type_to_minotype(monkeypatch):
+    fake_static = FakeUpdateStaticInfo()
+    monkeypatch.setattr(ship_tools, "_ensure_imports", lambda: None)
+    monkeypatch.setattr(ship_tools, "_update_static_info", fake_static)
+    monkeypatch.setattr(ship_tools, "_ttse_key", lambda: "")
+
+    output = ship_tools.update_ship_static_info.invoke(
+        {
+            "mmsi": "730285526",
+            "ship_type": "散货船",
+        }
+    )
+
+    assert "静态信息更新成功！" in output
+    assert "船舶类型: 散货船" in output
+    assert "船舶子类型: 散货船" in output
+    assert fake_static.calls[0][0]["type"] == "散货船"
+    assert fake_static.calls[0][0]["minotype"] == "散货船"
+
+
+def test_update_ship_static_info_rejects_mismatched_ship_type_fields(monkeypatch):
+    fake_static = FakeUpdateStaticInfo()
+    monkeypatch.setattr(ship_tools, "_ensure_imports", lambda: None)
+    monkeypatch.setattr(ship_tools, "_update_static_info", fake_static)
+    monkeypatch.setattr(ship_tools, "_ttse_key", lambda: "")
+
+    output = ship_tools.update_ship_static_info.invoke(
+        {
+            "mmsi": "730285526",
+            "ship_type": "散货船",
+            "minotype": "油船",
+        }
+    )
+
+    assert "船舶类型字段不一致" in output
+    assert fake_static.calls == []

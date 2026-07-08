@@ -17,9 +17,18 @@ flowchart TD
     Normalize --> Profile[profile 解析]
     Profile --> Build[build_agent]
     Build --> CS[customer_support / customer_ceshi lightweight graph]
+    CS --> Pre[preprocess]
+    Pre --> Perception[direct multimodal perception]
+    Pre --> Understanding[CustomerUnderstanding JSON hint]
+    Understanding --> ShipUpdate[ship_update subagent]
+    ShipUpdate --> WriteBoundary[tool whitelist + skills parameter formatting]
+    WriteBoundary --> WriteTools[upload_ship_position / update_ship_static_info]
+    Pre --> Standard[standard tool-calling skills agent]
+    Standard --> ReadTools[knowledge / browser / ship read tools]
     Build --> EMP[legacy employee/workspace graph]
-    CS --> Standard[standard tool-calling skills agent]
     EMP --> EmployeeLoop[legacy knowledge or workspace loop]
+    WriteTools --> Finalize[finalize + guards]
+    ReadTools --> Finalize
     Main --> Obs[observability]
 ```
 
@@ -89,13 +98,17 @@ flowchart TD
     Msg[用户文字/语音/图片/视频] --> Pre[preprocess]
     Pre -->|敏感内部请求| Refuse[固定拒答]
     Pre -->|有多模态| Perception[Seed Lite direct perception]
-    Perception --> Rewrite[把转写/可见文字/摘要注入当前轮文本]
+    Perception --> Rewrite[客观整理 OCR/可见元素/摘要/检索关键词]
     Rewrite --> Understanding[CustomerUnderstanding]
     Understanding --> ShipGate[ship_update subagent gate]
     Pre --> Delegate[standard tool-calling skills agent]
     Rewrite --> Delegate
-    ShipGate --> ShipUpdate[ship_update subagent plan -> execute]
-    ShipUpdate --> Finalize[finalize + output guard]
+    ShipGate --> ShipUpdate[ship_update subagent JSON plan]
+    ShipUpdate --> NormalizeArgs[字段白名单/别名/skills 格式化]
+    NormalizeArgs --> WriteTools[真实写工具调用]
+    WriteTools --> Finalize[finalize + output guard]
+    ShipUpdate -->|non_write| Delegate
+    ShipUpdate -->|need_user_input/cancelled/error| Finalize
     Delegate --> Tools[模型自主选择 allowed tools]
     Tools --> Answer[模型整合工具结果]
     Answer --> Finalize[finalize + output guard]
@@ -111,7 +124,7 @@ flowchart TD
 - 对多模态输入调用 `doubao-seed-2-0-lite-260428` 做当前轮 direct perception。
 - 如果识别到音频转写、截图文字、图像/视频摘要、疑似符号或疑似问题，则替换当前轮用户文本，让后续 tool-calling agent 基于“文字 + 感知摘要”继续处理。
 - `CustomerUnderstanding` 输出 `operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason`、候选船舶标识和候选字段，作为 ship_update 子 agent 的 hint。
-- 如果当前轮存在 active `ship_update_draft`、被结构化理解为写入候选，或可能是写入 follow-up，轻量 graph 会先进入 ship_update 子 agent，而不是先委托标准 skills agent。
+- 如果当前轮存在 active `ship_update_draft`、被结构化理解为写入候选，或 pending action 要求恢复，轻量 graph 会先进入 ship_update 子 agent，而不是先委托标准 skills agent。
 - 写入 `route_trace.reasoning_trace.pipeline` 和 `perception_summary`，仅用于后台观测。
 
 ### 3.2 ship_update 子 agent 特殊分支
@@ -135,6 +148,15 @@ ship_update 当前规则：
   - `船名` 唯一命中仍要求用户确认 MMSI，避免写错船。
 - 子 agent 返回 `non_write` 时，graph 会交回 standard agent 继续知识/排障回答，不把内部分类话术直接发给客户。
 - 静态信息更新成功回复包含验证链接、MMSI、更新参数明细和预计同步时间；静态更新不伪造更新时间。
+
+执行前参数格式化：
+
+- 子 agent 输出的是工具参数，不是 API body。
+- 动态更新最终工具参数使用 `mmsi / lon / lat / updatetime / speed / heading / course / draft / navstatus / destination / eta`。
+- 静态更新最终工具参数使用 `mmsi / ship_name / imo / callsign / ship_type / minotype / width / length / dwt / built_year / destination / eta / draft`。
+- 代码层只做硬边界格式化，不重新判断业务意图：`draught -> draft`、`status -> navstatus`、`name -> ship_name`、`imonumber -> imo`、`type -> ship_type`、`buildyear -> built_year`。
+- 经纬度优先转成十进制度；`2026-07-08 15:37 (UTC+8)` 归一为 `2026-07-08 15:37:00`；`0 kn / 163° / 1.6 m` 归一为纯数值字符串。
+- 更新船舶类型时，`ship_type` 和 `minotype` 必须同时传且值一致；工具层会拒绝二者不一致的静态更新。
 
 ### 3.3 delegate
 
@@ -245,6 +267,7 @@ ship_update 当前规则：
 当前 ship_update 的解析与风控补充：
 
 - 动态写入的必填最小集合是 `mmsi / lon / lat / updatetime`，而不是“任意动态字段即可写”。
+- `ship_update_subagent` 会把 prompt-driven JSON 结果再按 skills 工具参数格式化，确保 trace 中的 `write_args` 与真实工具入参一致。
 - `route_trace.reasoning_trace` 中当前会记录 `ship_update_subagent`、`ship_update_draft`、`write_args`、`missing_required_fields`，便于解释为何没有调用工具。
 - 若用户真实意图是在咨询异常原因，ship_update 子 agent 应返回 `non_write` 并交回 standard agent 排障；排查时重点看 `ship_update_subagent.status` 和 `route_source=ship_update_subagent_non_write_handoff`。
 
@@ -361,5 +384,6 @@ flowchart TD
 - 改 `/run` 和微信旧格式兼容：改 `src/main.py`。
 - 改知识检索工具：改 `src/skills/knowledge_qa/tools.py` 及 runtime 文件。
 - 改授权写库：改 `src/skills/knowledge_admin/tools.py`。
-- 改船舶读写：改 `src/skills/hifleet_ship_service/tools.py`。
-- 旧 `customer_support_router.py` 不再承载当前 customer 的通用知识主链，但仍承载 ship_update 的确定性写请求解析与执行。
+- 改船舶读写工具接口或成功回复：改 `src/skills/hifleet_ship_service/tools.py`。
+- 改 ship_update 子 agent prompt、JSON 结构、draft 兼容或执行前参数格式化：改 `src/agents/ship_update_subagent.py`。
+- 旧 `customer_support_router.py` 不再承载当前 customer 的通用知识主链；保留为 legacy/fallback/test compatibility，不能作为新写入审核中心扩展。

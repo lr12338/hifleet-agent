@@ -389,6 +389,7 @@ def normalize_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     alias_map = {
         "name": "ship_name",
         "imonumber": "imo",
+        "type": "ship_type",
         "buildyear": "built_year",
         "draught": "draft",
         "status": "navstatus",
@@ -417,6 +418,8 @@ def normalize_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     fields = clean_optional_voyage_fields(fields)
     position_fields = clean_optional_voyage_fields(position_fields)
     static_fields = clean_optional_voyage_fields(static_fields)
+    fields = _sync_static_ship_type_fields(fields)
+    static_fields = _sync_static_ship_type_fields(static_fields)
     raw_mentions = clean_optional_voyage_fields(dict(data.get("raw_mentions") or {}))
     data["fields"] = fields
     data["ship_identity"] = ship_identity
@@ -430,6 +433,20 @@ def normalize_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     data["action_recommendation"] = str(data.get("action_recommendation") or "none")
     data["source"] = str(data.get("source") or "llm_contract_extractor")
     return data
+
+
+def _sync_static_ship_type_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    result = dict(fields or {})
+    ship_type = str(result.get("ship_type") or "").strip()
+    minotype = str(result.get("minotype") or "").strip()
+    if not (ship_type or minotype):
+        return result
+    if ship_type and minotype and ship_type != minotype:
+        return result
+    unified = ship_type or minotype
+    result["ship_type"] = unified
+    result["minotype"] = unified
+    return result
 
 
 def _stringify_fields(fields: dict[str, Any]) -> dict[str, str]:

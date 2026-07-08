@@ -176,6 +176,12 @@ def _normalize_time_parts(hour_or_hhmm: str | None, minute: str | None, second: 
 def _to_float(value: str) -> float | None:
     if value in (None, ""):
         return None
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", str(value).strip())
+    if match:
+        try:
+            return float(match.group(0))
+        except ValueError:
+            return None
     try:
         return float(str(value).strip())
     except ValueError:

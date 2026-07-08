@@ -34,13 +34,22 @@
 ## 当前主链路
 
 ```mermaid
-flowchart LR
+flowchart TD
     Client[渠道/调用方] --> API[src/main.py]
     API --> Profile[profile 解析]
-    Profile --> Graph[统一 phase graph]
-    Graph --> CS[customer_support / customer_ceshi<br/>preprocess -> delegate skills agent -> finalize]
-    CS --> ShipGate[CustomerUnderstanding hint<br/>ship_update_draft/current perception -> ship_update subagent]
-    ShipGate --> ShipWrite[ship_update subagent<br/>structured plan -> tool whitelist -> execute]
+    Profile --> Graph[customer_support / customer_ceshi lightweight graph]
+    Graph --> Pre[preprocess]
+    Pre --> Perception[多模态 perception<br/>OCR/可见元素/摘要/检索关键词]
+    Pre --> Understanding[CustomerUnderstanding JSON hint]
+    Understanding --> Gate{ship_update_draft<br/>或写入候选?}
+    Gate -->|是| ShipSub[ship_update 子 agent<br/>JSON plan]
+    ShipSub --> Format[工具白名单 + skills 参数格式化]
+    Format --> Write[upload_ship_position / update_ship_static_info]
+    Gate -->|否| Standard[standard skills agent]
+    ShipSub -->|non_write| Standard
+    Standard --> ReadTools[知识/浏览器/船舶读取工具]
+    Write --> Finalize[finalize + guards]
+    ReadTools --> Finalize
     API --> Obs[observability]
 ```
 
@@ -57,6 +66,7 @@ flowchart LR
 - 完整会话上下文交给 agent/checkpointer 处理，历史多媒体内容仅做安全脱敏
 - 多模态输入标准化与 direct perception
 - `customer_ceshi` 使用同一轻量客服 graph，并通过 `ship_update` 子 agent、`ship_update_draft`、兼容 pending 视图和 readable trace 验证高风险写入链路
+- ship_update 执行前按 skills 工具参数格式化：度分坐标转十进制度、带单位数值转纯数值、静态船型同步 `ship_type/minotype`
 
 ## 文档维护规则
 

@@ -57,6 +57,7 @@ status 只能使用中文航行状态，例如 在航、失控、帆船在航、
 
 静态信息更新字段：
 mmsi(必选), name, imonumber, callsign, type, minotype, width, length, dwt, buildyear, destination, eta, draught。
+更新船舶类型时，type 和 minotype 必须同时给出且值一致；若只识别到一个船型值，应同时填入 type/minotype。
 
 输出 JSON schema：
 {
@@ -3269,6 +3270,20 @@ STATIC_UPDATE_FIELD_ALIASES = {
 }
 
 
+def _sync_static_ship_type_update_args(args: dict[str, str]) -> dict[str, str]:
+    result = dict(args or {})
+    ship_type = str(result.get("ship_type") or "").strip()
+    minotype = str(result.get("minotype") or "").strip()
+    if not (ship_type or minotype):
+        return result
+    if ship_type and minotype and ship_type != minotype:
+        return result
+    unified = ship_type or minotype
+    result["ship_type"] = unified
+    result["minotype"] = unified
+    return result
+
+
 def _extract_instruction_text_for_ship_update(text: str) -> str:
     normalized = normalize_message_text(text)
     if not normalized:
@@ -3644,6 +3659,10 @@ def _validate_static_update_args(args: dict[str, str]) -> tuple[list[str], list[
         invalid.append("name")
     if args.get("built_year") and not re.fullmatch(r"20\d{2}|19\d{2}", str(args["built_year"])):
         invalid.append("buildyear")
+    ship_type = str(args.get("ship_type") or "").strip()
+    minotype = str(args.get("minotype") or "").strip()
+    if ship_type and minotype and ship_type != minotype:
+        invalid.append("ship_type/minotype")
     return missing, invalid
 
 
@@ -4196,7 +4215,7 @@ def _extract_static_update_args(instruction_text: str, *, mmsi: str, semantic_fi
         value = parsed.get(key, "")
         if value:
             args[key] = value
-    return args
+    return _sync_static_ship_type_update_args(args)
 
 
 def _static_update_requested(instruction_text: str) -> tuple[bool, list[str]]:

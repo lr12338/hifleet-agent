@@ -16,7 +16,7 @@ from agents.ship_update_extractor import (
     extract_and_normalize_ship_update_contract,
     extract_ship_update_parameters_with_agent,
 )
-from agents.ship_update_normalizer import clean_optional_voyage_fields
+from agents.ship_update_normalizer import clean_optional_voyage_fields, normalize_ship_update_fields
 
 
 SHIP_UPDATE_SUBAGENT_PROMPT = """你是 HiFleet ship_update 子 agent。请开启深度思考，但最终只输出 JSON。
@@ -39,8 +39,8 @@ SHIP_UPDATE_SUBAGENT_PROMPT = """你是 HiFleet ship_update 子 agent。请开�
 - 输出的是工具参数，不是 API body。
 - 工具参数字段：
   - mmsi：必选，string，船舶 MMSI。工具内部同时作为 API 的 name+mmsi；若只有英文船名，可输出 ship_name，但仍需 MMSI 才能 ready_to_execute。
-  - lon：必选，float/string，经度。优先输出十进制度；如果附件只给度分格式，可原样输出，工具内部可转换。
-  - lat：必选，float/string，纬度。优先输出十进制度；如果附件只给度分格式，可原样输出，工具内部可转换。
+  - lon：必选，float/string，经度。最终工具参数优先输出十进制度，例如 116.3291；不要输出 API 字段 lo。
+  - lat：必选，float/string，纬度。最终工具参数优先输出十进制度，例如 29.816783；不要输出 API 字段 la。
   - updatetime：必选，string，格式 yyyy-MM-dd HH:mm:ss。不得自动生成当前时间。
   - speed：可选，float/string，航速（节）。
   - heading：可选，float/string，船首向/船艏向（度）。
@@ -60,8 +60,8 @@ SHIP_UPDATE_SUBAGENT_PROMPT = """你是 HiFleet ship_update 子 agent。请开�
   - ship_name：可选，string，英文船名。API 字段 name。
   - imo：可选，string，IMO 编号。API 字段 imonumber。
   - callsign：可选，string，呼号。
-  - ship_type：可选，string，船型描述。API 字段 type。
-  - minotype：可选，string，船舶子类型。
+  - ship_type：可选，string，船型描述。API 字段 type。更新船舶类型时必须同时输出 ship_type 和 minotype，且值完全一致。
+  - minotype：可选，string，船舶子类型。更新船舶类型时必须与 ship_type 完全一致，因为船舶详情显示依赖该字段。
   - width：可选，string，船宽（米）。
   - length：可选，string，船长（米）。
   - dwt：可选，string，载重吨。
@@ -411,7 +411,8 @@ def _build_subagent_payload(
                 "required_tool_args": ["mmsi"],
                 "requires_at_least_one_update_field": True,
                 "optional_tool_args": ["ship_name", "imo", "callsign", "ship_type", "minotype", "width", "length", "dwt", "built_year", "destination", "eta", "draft", "wechatgroup"],
-                "api_mapping": {"ship_name": "name", "imo": "imonumber", "ship_type": "type", "built_year": "buildyear", "draft": "draught"},
+                "api_mapping": {"ship_name": "name", "imo": "imonumber", "ship_type": "type", "minotype": "minotype", "built_year": "buildyear", "draft": "draught"},
+                "ship_type_rule": "When updating vessel type, provide both ship_type and minotype with the same value.",
             },
         },
     }
@@ -450,8 +451,13 @@ def _coerce_llm_subagent_result(raw: dict[str, Any], *, fallback_pending: dict[s
             normalized_fields={},
             source="llm_subagent",
         )
-    tool_args = _coerce_tool_args(tool_name, dict(raw.get("tool_args") or {}))
-    normalized_fields = dict(raw.get("normalized_fields") or tool_args or {})
+    raw_normalized_fields = dict(raw.get("normalized_fields") or {})
+    raw_tool_args = _merge_raw_normalized_position_fields(
+        dict(raw.get("tool_args") or {}),
+        raw_normalized_fields,
+    )
+    tool_args = _coerce_tool_args(tool_name, raw_tool_args)
+    normalized_fields = {**raw_normalized_fields, **tool_args}
     draft = _normalize_ship_update_draft(dict(raw.get("ship_update_draft") or {}))
     if not draft.get("tool_args") and tool_args:
         draft.update(
@@ -511,7 +517,76 @@ def _coerce_tool_args(tool_name: str | None, args: dict[str, Any]) -> dict[str, 
         if key not in allowed:
             continue
         coerced[key] = value
-    return clean_optional_voyage_fields(coerced)
+    cleaned = clean_optional_voyage_fields(coerced)
+    if tool_name == "upload_ship_position":
+        cleaned = _normalize_position_tool_args(cleaned)
+    if tool_name == "update_ship_static_info":
+        cleaned = _sync_static_ship_type_tool_args(cleaned)
+    return cleaned
+
+
+def _merge_raw_normalized_position_fields(args: dict[str, Any], normalized_fields: dict[str, Any]) -> dict[str, Any]:
+    result = dict(args or {})
+    if not normalized_fields:
+        return result
+    if not result.get("lon"):
+        lon_value = normalized_fields.get("lon") or normalized_fields.get("longitude_decimal") or normalized_fields.get("lon_dec")
+        if lon_value not in (None, ""):
+            result["lon"] = lon_value
+    if not result.get("lat"):
+        lat_value = normalized_fields.get("lat") or normalized_fields.get("latitude_decimal") or normalized_fields.get("lat_dec")
+        if lat_value not in (None, ""):
+            result["lat"] = lat_value
+    if not result.get("updatetime") and normalized_fields.get("updatetime"):
+        result["updatetime"] = normalized_fields["updatetime"]
+    return result
+
+
+def _normalize_position_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    result = dict(args or {})
+    normalized = normalize_ship_update_fields({key: str(value) for key, value in result.items() if value not in (None, "")})
+    if normalized.longitude_valid and normalized.longitude_decimal is not None:
+        result["lon"] = _format_numeric_tool_value(normalized.longitude_decimal)
+    if normalized.latitude_valid and normalized.latitude_decimal is not None:
+        result["lat"] = _format_numeric_tool_value(normalized.latitude_decimal)
+    if normalized.updatetime_valid and normalized.normalized_updatetime:
+        result["updatetime"] = normalized.normalized_updatetime
+    numeric_fields = {
+        "speed": normalized.speed,
+        "heading": normalized.heading,
+        "course": normalized.course,
+        "draft": normalized.draft,
+    }
+    for key, value in numeric_fields.items():
+        if value is not None:
+            result[key] = _format_numeric_tool_value(value)
+    if normalized.nav_status:
+        result["navstatus"] = normalized.nav_status
+    return clean_optional_voyage_fields(result)
+
+
+def _format_numeric_tool_value(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.6f}".rstrip("0").rstrip(".")
+
+
+def _sync_static_ship_type_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    result = dict(args or {})
+    ship_type = str(result.get("ship_type") or "").strip()
+    minotype = str(result.get("minotype") or "").strip()
+    if not (ship_type or minotype):
+        return result
+    if ship_type and minotype and ship_type != minotype:
+        return result
+    unified = ship_type or minotype
+    result["ship_type"] = unified
+    result["minotype"] = unified
+    return result
 
 
 def _coerce_string_list(value: Any) -> list[str]:
@@ -879,7 +954,7 @@ def _static_tool_args(fields: dict[str, Any]) -> dict[str, str]:
         if raw_value in (None, ""):
             continue
         args[key] = str(raw_value).strip()
-    return args
+    return {key: str(value) for key, value in _sync_static_ship_type_tool_args(args).items()}
 
 
 def _merge_static_followup_value(text: str, pending: dict[str, Any], fields: dict[str, Any]) -> None:
