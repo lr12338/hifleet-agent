@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 SHIP_UPDATE_CONTRACT_EXTRACTION_PROMPT = """你是 HiFleet 客服 Agent 的参数格式化器。
 你只负责把用户输入和附件识别结果格式化为 JSON。不得调用工具，不得生成客服回复，不得编造字段。
 没有提供的字段不要填。字段不确定时写入 invalid_fields 或 conflict_fields，不要强行补齐。
-operation_type 和 action_recommendation 只是候选判断，不是写入许可；最终是否执行写工具必须由 shared harness 校验字段、目标船和工具结果。
+operation_type 和 action_recommendation 只是候选判断，不是写入许可；主链路中最终是否执行写工具由 ship_update 子 agent 结构化结果与工具结果共同决定。
 字段来源只能是当前轮用户文本、当前轮附件识别结果或当前 active pending。不得从历史其他船舶的成功回复、历史截图或历史 MMSI 中补写经纬度、ETA、吃水、状态或更新时间。
 如果目的港/ETA 显示为 --、-、-- / --、空白、N/A、未知，或只识别到“目的港/ETA”“/ETA”“ETA”等标签残片，表示未提供该字段，destination 和 eta 都必须保持为空。
 

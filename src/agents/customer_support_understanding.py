@@ -91,7 +91,7 @@ def build_customer_understanding(
     intent = "ship_update" if ship_write else "knowledge"
     notes = ""
     if has_media:
-        notes = "当前请求包含多模态内容，理解层记录任务语义和候选字段，最终写入由 shared harness 校验。"
+        notes = "当前请求包含多模态内容，理解层记录任务语义和候选字段，船舶更新由 ship_update 子 agent 生成工具计划。"
 
     action_allowed = ship_write and not frontend_question and not email_question and not ship_data_issue
     pending_action = _infer_pending_action(
@@ -148,6 +148,8 @@ def _is_explicit_ship_write_request(text: str, operation_type: str, has_percepti
         return False
     write_markers = ("更新", "上传", "修改", "补录", "改为", "update")
     if any(marker in lowered for marker in write_markers):
+        return True
+    if operation_type == "static_update" and any(marker in value for marker in ("错误", "有误", "不对", "错了")):
         return True
     return has_perception and operation_type in {"position_update", "static_update"} and any(marker in value for marker in ("船位", "目的港", "ETA", "eta", "静态"))
 

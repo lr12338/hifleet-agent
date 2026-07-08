@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, Literal
 LLM_CONFIG_RELATIVE_PATH = 'config/agent_llm_config.json'
-DEFAULT_TEXT_MODEL = 'doubao-seed-2-0-lite-260428'
+DEFAULT_TEXT_MODEL = 'deepseek-v4-flash-260425'
 DEFAULT_MULTIMODAL_MODEL = 'doubao-seed-2-0-lite-260428'
 ThinkingType = Literal['enabled', 'disabled']
 ReasoningEffort = Literal['minimal', 'low', 'medium', 'high']
@@ -86,6 +86,12 @@ def normalize_llm_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     config['thinking_type'] = thinking_settings['thinking_type']
     config['reasoning_effort'] = thinking_settings['reasoning_effort']
     config['deep_thinking_enabled'] = thinking_settings['thinking_type'] != 'disabled'
+    config['text_thinking_type'] = normalize_thinking_type(config.get('text_thinking_type') or config.get('thinking_type'))
+    config['multimodal_thinking_type'] = normalize_thinking_type(config.get('multimodal_thinking_type') or config.get('thinking_type'))
+    config['customer_support_json_thinking_type'] = normalize_thinking_type(config.get('customer_support_json_thinking_type') or config.get('thinking_type'))
+    config['text_model_base_url_env'] = str(config.get('text_model_base_url_env') or '').strip()
+    config['multimodal_model_base_url_env'] = str(config.get('multimodal_model_base_url_env') or '').strip()
+    config['json_model_base_url_env'] = str(config.get('json_model_base_url_env') or '').strip()
     data['config'] = config
     data.setdefault('sp', 'System prompt dynamically assembled from config/system_prompt_base.md + skills/*/SKILL.md')
     data.setdefault('tools', [])
@@ -127,8 +133,9 @@ def resolve_model_selection(
     modality: Literal['text', 'multimodal'] = 'multimodal' if has_multimodal_input else 'text'
     default_model = cfg['multimodal_model'] if has_multimodal_input else cfg['text_model']
     model = str(requested_model or default_model).strip() or default_model
+    default_thinking = cfg.get('multimodal_thinking_type') if has_multimodal_input else cfg.get('text_thinking_type')
     thinking_settings = resolve_thinking_settings(
-        requested_thinking or cfg.get('thinking_type'),
+        requested_thinking or default_thinking or cfg.get('thinking_type'),
         requested_reasoning_effort or cfg.get('reasoning_effort'),
     )
     return {
@@ -147,6 +154,12 @@ def export_llm_config_view(config: dict[str, Any] | None) -> dict[str, Any]:
         'thinking_type': cfg['thinking_type'],
         'reasoning_effort': cfg['reasoning_effort'],
         'deep_thinking_enabled': bool(cfg.get('deep_thinking_enabled')),
+        'text_thinking_type': cfg['text_thinking_type'],
+        'multimodal_thinking_type': cfg['multimodal_thinking_type'],
+        'customer_support_json_thinking_type': cfg['customer_support_json_thinking_type'],
+        'text_model_base_url_env': cfg['text_model_base_url_env'],
+        'multimodal_model_base_url_env': cfg['multimodal_model_base_url_env'],
+        'json_model_base_url_env': cfg['json_model_base_url_env'],
         'text_model_presets': TEXT_MODEL_PRESETS,
         'multimodal_model_presets': MULTIMODAL_MODEL_PRESETS,
     }

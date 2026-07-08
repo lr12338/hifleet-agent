@@ -16,10 +16,10 @@ flowchart TD
     Main --> Normalize[消息归一化]
     Normalize --> Profile[profile 解析]
     Profile --> Build[build_agent]
-    Build --> CS[customer_support lightweight graph]
-    Build --> EMP[customer_ceshi standard graph]
+    Build --> CS[customer_support / customer_ceshi lightweight graph]
+    Build --> EMP[legacy employee/workspace graph]
     CS --> Standard[standard tool-calling skills agent]
-    EMP --> EmployeeLoop[knowledge or workspace loop]
+    EMP --> EmployeeLoop[legacy knowledge or workspace loop]
     Main --> Obs[observability]
 ```
 
@@ -29,19 +29,20 @@ flowchart TD
 | --- | --- |
 | `src/main.py` | HTTP 入口、`/run`/`/stream_run`、微信旧格式归一化、模型路由、观测写入 |
 | `src/agents/profiles.py` | profile 配置、请求体/header 解析、权限边界 |
-| `src/agents/agent.py` | `build_agent()`、`customer_support` 轻量 graph、`customer_ceshi` 标准 graph |
+| `src/agents/agent.py` | `build_agent()`、`customer_support` / `customer_ceshi` 轻量 graph、ship_update 子 agent 调度 |
 | `config/agent_profiles.json` | `customer_support` / `customer_ceshi` skills、工具权限和别名 |
 | `config/profiles/customer_support.md` | 外部客服轻量 skills agent 的业务规则和安全边界 |
 | `config/agent_llm_config.json` | 默认模型、thinking、工具配置 |
 | `src/agents/customer_support_guard.py` | 客服最终输出脱敏、拒答、链接清洗 |
 | `src/agents/customer_support_understanding.py` | 需求处理 agent 的结构化理解，包括 ship_update 候选、pending 动作和非写入原因 |
+| `src/agents/ship_update_subagent.py` | prompt-driven 船舶更新子 agent、`ship_update_draft`、旧 pending 兼容和 fallback |
 | `src/skills/knowledge_qa/tools.py` | `local_kb_search / web_search / web_search_agent_browser` |
 | `src/skills/knowledge_admin/tools.py` | 授权写入本地结构化客服知识库 |
 | `src/skills/hifleet_ship_service/tools.py` | 船舶查询、统计、轨迹、挂靠、船位上传、静态信息更新 |
 | `src/skills/multimodal_support/tools.py` | 附件 metadata 辅助 |
 | `src/skills/browser_verify/tools.py` | 公开网页核验、`agent_browser_deep_search` |
 
-`src/agents/customer_support_router.py` 和旧 `_build_customer_support_agent()` 不再承担当前 `customer_support` 的通用知识主链，但 ship_update 这类写请求会先由 `CustomerUnderstanding` 输出结构化候选，再在轻量 graph 的 `write_preflight_guard` 分支中进入 `execute_update_chain(...)` 做解析、校验和执行。它们既是回滚与旧测试参考，也是当前船舶写操作的受控执行模块。
+`src/agents/customer_support_router.py` 和旧 `_build_customer_support_agent()` 不再承担当前 `customer_support` 的通用知识主链。ship_update 写请求当前由 `ship_update` 子 agent 输出结构化计划，主 graph 只负责工具白名单、真实工具调用、工具结果判定和 trace。`customer_support_router.py` 主要保留为 legacy/fallback/test compatibility。
 
 Profile 解析规则：
 
@@ -53,15 +54,15 @@ Profile 解析规则：
 
 | 维度 | `customer_support` | `customer_ceshi` |
 | --- | --- | --- |
-| 面向对象 | 外部客户、微信客服、WebSDK、CRM；兼容旧 `employee_assistant` 调用 | 内部测试、后台运营 |
-| 主目标 | 直接回复客户，并在需要时调用 allowed skills | 帮员工完成知识问答、文件检查、表格分析和产物任务 |
-| 主执行方式 | 轻量 graph；默认 `preprocess -> delegate -> finalize`，ship_update 为 `write_preflight_guard -> ship_update` 特殊分支 | 标准 tool-calling agent，保留 employee workspace 能力 |
-| 模型 | 默认 `doubao-seed-2-0-lite-260428` | 同后台配置，默认也可使用 Seed Lite |
-| 多模态 | 支持文本、图片、语音、视频当前轮理解 | 支持多模态转写/理解后进入内部流程 |
-| 船舶工具 | 允许读写 ship service 工具 | 允许读写 ship service 工具 |
-| 沙盒/Python | 禁用 | 启用，仅测试/内部 profile |
-| 文件/产物 | 禁用 employee workspace 和客服文件产物工具 | 启用受控 workspace / artifact 能力 |
-| 输出安全 | `sanitize_customer_output` + 敏感请求拦截 | 内部输出，但仍禁止泄露密钥和危险路径 |
+| 面向对象 | 外部客户、微信客服、WebSDK、CRM；兼容旧 `employee_assistant` 调用 | 回归、trace、后台客服链路验证 |
+| 主目标 | 直接回复客户，并在需要时调用 allowed skills | 验证同一客服 graph 下的高风险写入、可读 trace 和回归场景 |
+| 主执行方式 | 轻量 graph；默认 `preprocess -> delegate -> finalize`，ship_update 可在 preprocess 由子 agent 接管 | 同一 lightweight graph，profile prompt 更强调回归和审计 |
+| 模型 | 文本模型默认 `deepseek-v4-flash-260425`，多模态默认 `doubao-seed-2-0-lite-260428` | 同后台配置 |
+| 多模态 | 支持文本、图片、语音、视频当前轮理解；perception 只客观整理上下文 | 同 customer_support |
+| 船舶工具 | 写工具不暴露给 standard agent；由 ship_update 子 agent 计划后主链路调用 | 同 customer_support |
+| 沙盒/Python | 禁用 | 当前客服链路禁用；历史沙盒 runbook 已归档 |
+| 文件/产物 | 禁用 employee workspace 和客服文件产物工具 | 当前客服链路禁用 |
+| 输出安全 | `sanitize_customer_output` + 敏感请求拦截 + evidence guard | 同 customer_support |
 
 `customer_support` 当前 skills：
 
@@ -90,10 +91,10 @@ flowchart TD
     Pre -->|有多模态| Perception[Seed Lite direct perception]
     Perception --> Rewrite[把转写/可见文字/摘要注入当前轮文本]
     Rewrite --> Understanding[CustomerUnderstanding]
-    Understanding --> WriteGuard[write_preflight_guard]
+    Understanding --> ShipGate[ship_update subagent gate]
     Pre --> Delegate[standard tool-calling skills agent]
     Rewrite --> Delegate
-    WriteGuard --> ShipUpdate[ship_update parse/validate/execute]
+    ShipGate --> ShipUpdate[ship_update subagent plan -> execute]
     ShipUpdate --> Finalize[finalize + output guard]
     Delegate --> Tools[模型自主选择 allowed tools]
     Tools --> Answer[模型整合工具结果]
@@ -109,30 +110,31 @@ flowchart TD
 - 检测当前轮是否包含 `image_url`、`input_audio`、`video_url`。
 - 对多模态输入调用 `doubao-seed-2-0-lite-260428` 做当前轮 direct perception。
 - 如果识别到音频转写、截图文字、图像/视频摘要、疑似符号或疑似问题，则替换当前轮用户文本，让后续 tool-calling agent 基于“文字 + 感知摘要”继续处理。
-- `CustomerUnderstanding` 输出 `operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason`、候选船舶标识和候选字段。
-- 如果当前轮被结构化理解为明确写入候选，轻量 graph 会先经过 `write_preflight_guard` 判断是否应直接进入 ship_update 受控链路，而不是先委托标准 skills agent。
+- `CustomerUnderstanding` 输出 `operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason`、候选船舶标识和候选字段，作为 ship_update 子 agent 的 hint。
+- 如果当前轮存在 active `ship_update_draft`、被结构化理解为写入候选，或可能是写入 follow-up，轻量 graph 会先进入 ship_update 子 agent，而不是先委托标准 skills agent。
 - 写入 `route_trace.reasoning_trace.pipeline` 和 `perception_summary`，仅用于后台观测。
 
-### 3.2 write_preflight_guard 与 ship_update 特殊分支
+### 3.2 ship_update 子 agent 特殊分支
 
 `customer_support` 的大多数请求会进入标准 skills agent，但船舶写操作是一个例外：
 
-- 只有 `CustomerUnderstanding.ship_update_candidate=true` 且 `non_write_reason=none`，或 active pending 明确需要恢复时，才会从轻量 graph 命中 `write_preflight_guard`。
-- 命中后进入 `src/agents/customer_support_router.py` 的 ship_update 受控执行链，而不是完全交给标准 skills agent 自主规划。
+- 有 active `ship_update_draft`、`CustomerUnderstanding.ship_update_candidate=true`，或当前轮可能是写入 follow-up 时，会进入 `ship_update` 子 agent。
+- 命中后由 `src/agents/ship_update_subagent.py` 输出结构化计划，而不是完全交给标准 skills agent 自主规划。
 - 这条链路当前执行方式是：
-  `preprocess -> multimodal perception -> write_preflight_guard -> ship_update parse/validate/execute -> finalize`
+  `preprocess -> multimodal perception -> ship_update subagent -> write tool execution or standard-agent handoff -> finalize`
 
 ship_update 当前规则：
 
 - 动态/静态写模式只由当前轮指令文本决定；图片里出现 `呼号 / AIS船名 / 船型` 不会自动把“更新船位”切成静态更新。
-- 参数解析只用当前轮文本和当前轮 perception，不复用历史船舶标识。
+- 参数解析只用当前轮文本、当前轮 perception 和当前 `ship_update_draft`，不复用历史其他船舶标识。
 - `船艏/航迹向: A / B` 作为结构化组合字段处理为 `heading=A`、`course=B`，优先于 semantic 误抽导致的同字段冲突。
-- `目的港/ETA: -- / --`、`/ETA`、`ETA`、空白、`N/A`、`未知` 等占位符不会进入 pending 或写入参数。
+- `目的港/ETA: -- / --`、`/ETA`、`ETA`、空白、`N/A`、`未知` 等占位符不会进入 draft 或写入参数。
 - 动态更新缺 `mmsi / lon / lat / updatetime` 任一项时，直接在解析层返回缺字段提示，不调用写工具。
 - 当前轮仅提供 `IMO` 或 `船名` 时，最多触发一次 `ship_search`：
   - `IMO` 唯一命中可直接补全 MMSI。
   - `船名` 唯一命中仍要求用户确认 MMSI，避免写错船。
-- `execute_update_chain(...)` 当前是薄执行器，真正的字段抽取、缺字段提示和工具入参组装都来自单次解析结果对象。
+- 子 agent 返回 `non_write` 时，graph 会交回 standard agent 继续知识/排障回答，不把内部分类话术直接发给客户。
+- 静态信息更新成功回复包含验证链接、MMSI、更新参数明细和预计同步时间；静态更新不伪造更新时间。
 
 ### 3.3 delegate
 
@@ -152,7 +154,7 @@ ship_update 当前规则：
 - 平台知识：`local_kb_search -> web_search -> web_search_agent_browser`
 - 授权知识库维护：`upsert_local_kb_entry`
 - 公开网页核验：`verify_public_page` / `agent_browser_deep_search`
-- 船舶读写：`ship_search`、`get_ship_position`、`get_ship_archive`、`get_ship_trajectory`、`upload_ship_position`、`update_ship_static_info` 等
+- 船舶读取：`ship_search`、`get_ship_position`、`get_ship_archive`、`get_ship_trajectory` 等。写工具不暴露给 standard agent，由 ship_update 子 agent 计划后主链路调用。
 - 多模态辅助：`inspect_media_attachment`
 
 ### 3.4 finalize
@@ -212,7 +214,7 @@ ship_update 当前规则：
 
 ```json
 {
-  "text_model": "doubao-seed-2-0-lite-260428",
+  "text_model": "deepseek-v4-flash-260425",
   "multimodal_model": "doubao-seed-2-0-lite-260428",
   "thinking_type": "enabled",
   "reasoning_effort": "medium"
@@ -235,7 +237,7 @@ ship_update 当前规则：
 
 - 只有用户明确要求“上传 / 更新 / 修改 / 补录”船位或静态信息时，才调用写工具。
 - 问“为什么不更新 / 更新慢 / 看不到最新船位”属于知识或排障问题，不是写操作。
-- 船位写操作至少需要 MMSI 和一个实际更新字段，例如经纬度、航速、航向、目的港、ETA、吃水、航行状态或更新时间。
+- 船位写操作至少需要 MMSI、经度、纬度、更新时间。
 - 静态信息写操作至少需要 MMSI 和一个静态字段，例如船名、IMO、船型、尺寸、船旗、呼号、建造年份、目的港、ETA 或吃水。
 - 缺字段时只追问一个最关键字段。
 - 工具没有明确成功时，不能对外宣称已更新成功。
@@ -243,8 +245,8 @@ ship_update 当前规则：
 当前 ship_update 的解析与风控补充：
 
 - 动态写入的必填最小集合是 `mmsi / lon / lat / updatetime`，而不是“任意动态字段即可写”。
-- `route_trace.reasoning_trace` 中当前会记录 `instruction_text`、`parsed_dynamic_fields`、`field_sources`、`resolved_identifier`、`write_args`、`missing_required_fields`，便于解释为何没有调用工具。
-- 若 OCR 文本里出现 `更新于`、`暂未收到更新船位`、`船位报告` 等词，而用户真实意图是在咨询异常原因，当前仍存在误触发 ship_update 的风险；排查时不要只看 `route=ship_update`，还要结合 `instruction_text` 与 `missing_required_fields` 判断是否误路由。
+- `route_trace.reasoning_trace` 中当前会记录 `ship_update_subagent`、`ship_update_draft`、`write_args`、`missing_required_fields`，便于解释为何没有调用工具。
+- 若用户真实意图是在咨询异常原因，ship_update 子 agent 应返回 `non_write` 并交回 standard agent 排障；排查时重点看 `ship_update_subagent.status` 和 `route_source=ship_update_subagent_non_write_handoff`。
 
 ## 7. 知识检索与授权写库
 

@@ -7,14 +7,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agents.agent import (
     SENSITIVE_REFUSAL as AGENT_SENSITIVE_REFUSAL,
     build_agent,
+    _build_customer_support_json_llm,
     _build_customer_support_followup_question,
     _build_customer_support_agent,
+    _build_llm,
     _build_lightweight_customer_support_agent,
     _customer_support_route_for_intent,
     _execute_customer_support_harness,
     _execute_customer_support_planner,
     _heuristic_image_perception,
     _run_customer_support_perception_agent,
+    _run_direct_multimodal_perception,
     _repair_customer_support_answer,
     _run_customer_support_intent_agent,
     _run_customer_support_response_qa_agent,
@@ -74,6 +77,67 @@ def test_customer_support_ship_update_respects_write_policy():
     decision = _customer_support_route_for_intent("ship_update", allow_write=False)
     assert decision.route == "knowledge"
     assert decision.tool_bundle == KNOWLEDGE_BUNDLE
+
+
+def test_role_model_config_controls_text_json_and_multimodal_llms(monkeypatch):
+    created = []
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            created.append(kwargs)
+
+        def invoke(self, messages):
+            return AIMessage(
+                content=(
+                    '{"attachment_type":"image","summary":"红色圆形、中心黑点",'
+                    '"visual_question_summary":"用户想确认图标含义",'
+                    '"lookup_keywords":"HiFleet 海图 红色圆形","needs_knowledge_lookup":true,'
+                    '"confidence":"high"}'
+                )
+            )
+
+    monkeypatch.setenv("COZE_WORKLOAD_IDENTITY_API_KEY", "test-key")
+    monkeypatch.setenv("COZE_INTEGRATION_MODEL_BASE_URL", "https://global.example")
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://text.example")
+    monkeypatch.setenv("MM_MODEL_BASE_URL", "https://multimodal.example")
+    monkeypatch.setenv("JSON_MODEL_BASE_URL", "https://json.example")
+    monkeypatch.setattr("agents.agent.ChatOpenAI", FakeChatOpenAI)
+    cfg = {
+        "config": {
+            "text_model": "deepseek-v4-flash-260425",
+            "multimodal_model": "doubao-seed-2-0-lite-260428",
+            "customer_support_json_model": "deepseek-v4-flash-260425",
+            "thinking_type": "enabled",
+            "reasoning_effort": "high",
+            "text_thinking_type": "enabled",
+            "multimodal_thinking_type": "disabled",
+            "customer_support_json_thinking_type": "disabled",
+            "text_model_base_url_env": "TEXT_MODEL_BASE_URL",
+            "multimodal_model_base_url_env": "MM_MODEL_BASE_URL",
+            "json_model_base_url_env": "JSON_MODEL_BASE_URL",
+        }
+    }
+
+    _build_llm(SimpleNamespace(), cfg, streaming=True)
+    _build_customer_support_json_llm(SimpleNamespace(), cfg)
+    perception = _run_direct_multimodal_perception(
+        ctx=SimpleNamespace(),
+        cfg=cfg,
+        messages=[HumanMessage(content=[{"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}])],
+    )
+
+    assert created[0]["model"] == "deepseek-v4-flash-260425"
+    assert created[0]["base_url"] == "https://text.example"
+    assert created[0]["extra_body"]["thinking"]["type"] == "enabled"
+    assert created[1]["model"] == "deepseek-v4-flash-260425"
+    assert created[1]["base_url"] == "https://json.example"
+    assert created[1]["extra_body"]["thinking"]["type"] == "disabled"
+    assert created[2]["model"] == "doubao-seed-2-0-lite-260428"
+    assert created[2]["base_url"] == "https://multimodal.example"
+    assert created[2]["extra_body"]["thinking"]["type"] == "disabled"
+    assert perception["visual_question_summary"] == "用户想确认图标含义"
+    assert perception["needs_knowledge_lookup"] is True
 
 
 def test_customer_support_state_dict_supports_dataclass_entities():
@@ -322,22 +386,21 @@ def test_customer_support_image_direct_perception_feeds_multimodal_route(monkeyp
     assert "安全水域浮标" not in result["messages"][-1].content
 
 
-def test_lightweight_chart_symbol_uses_objective_features_and_verified_link(monkeypatch):
+def test_lightweight_chart_symbol_delegates_objective_features_to_standard_agent(monkeypatch):
     class FakeStandardAgent:
-        def invoke(self, payload, context=None):
-            raise AssertionError("chart symbol image should not delegate before verification")
+        def __init__(self):
+            self.calls = []
 
-    local = FakeTool("local_kb_search", lambda args: '{"can_answer": false, "items": []}')
-    web = FakeTool("web_search", lambda args: '{"can_answer": false, "best_urls": []}')
-    browser = FakeTool(
-        "web_search_agent_browser",
-        lambda args: (
-            "海图图标说明：红色圆形中心黑点对应安全水域浮标。"
-            "https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming"
-        ),
-    )
-    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
-    monkeypatch.setattr("agents.agent._load_all_tools", lambda profile: [local, web, browser])
+        def invoke(self, payload, context=None, config=None):
+            self.calls.append(payload)
+            return {
+                "messages": list(payload["messages"])
+                + [AIMessage(content="根据已检索资料，红色圆形中心黑点对应安全水域浮标。")]
+            }
+
+    standard_agent = FakeStandardAgent()
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: standard_agent)
+    monkeypatch.setattr("agents.agent._load_all_tools", lambda profile: [])
     monkeypatch.setattr(
         "agents.agent._run_direct_multimodal_perception",
         lambda **kwargs: {
@@ -347,6 +410,9 @@ def test_lightweight_chart_symbol_uses_objective_features_and_verified_link(monk
             "visible_text": "",
             "suspected_symbol": "待检索确认的图标/符号",
             "suspected_issue": "",
+            "visual_question_summary": "用户想确认全球海图中红色圆形中心黑点图标的含义",
+            "lookup_keywords": "HiFleet 海图 红色圆形 中心黑点 图标含义",
+            "needs_knowledge_lookup": True,
             "confidence": "high",
         },
     )
@@ -373,31 +439,37 @@ def test_lightweight_chart_symbol_uses_objective_features_and_verified_link(monk
         config={"configurable": {"thread_id": "s-chart-verified"}},
     )
 
+    delegated_text = standard_agent.calls[0]["messages"][-1].content
+    assert "附件可见特征：红色圆形、中心黑点" in delegated_text
+    assert "附件问题摘要：用户想确认全球海图中红色圆形中心黑点图标的含义" in delegated_text
+    assert "建议检索关键词：HiFleet 海图 红色圆形 中心黑点 图标含义" in delegated_text
     assert "安全水域浮标" in result["messages"][-1].content
-    assert "验证链接：https://www.hifleet.com/wp/communities/fleet/haitutubiaoshuoming" in result["messages"][-1].content
-    assert result["generated_tool_calls"] == ["local_kb_search", "web_search", "web_search_agent_browser"]
+    assert "chart_symbol_verify" not in result["phase_history"]
+    assert result["generated_tool_calls"] == []
 
 
-def test_lightweight_chart_symbol_without_evidence_asks_human_confirmation(monkeypatch):
+def test_lightweight_chart_symbol_weak_perception_still_delegates_without_fixed_branch(monkeypatch):
     class FakeStandardAgent:
-        def invoke(self, payload, context=None):
-            raise AssertionError("chart symbol image should not delegate before verification")
+        def __init__(self):
+            self.calls = []
 
-    local = FakeTool("local_kb_search", lambda args: '{"can_answer": false, "items": []}')
-    web = FakeTool("web_search", lambda args: '{"can_answer": false, "best_urls": []}')
-    browser = FakeTool("web_search_agent_browser", lambda args: "未检索到足够可信的信息")
-    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
-    monkeypatch.setattr("agents.agent._load_all_tools", lambda profile: [local, web, browser])
+        def invoke(self, payload, context=None, config=None):
+            self.calls.append(payload)
+            return {"messages": list(payload["messages"]) + [AIMessage(content="请补充一张更清晰的截图或圈出要确认的图标。")]}
+
+    standard_agent = FakeStandardAgent()
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: standard_agent)
+    monkeypatch.setattr("agents.agent._load_all_tools", lambda profile: [])
     monkeypatch.setattr(
         "agents.agent._run_direct_multimodal_perception",
         lambda **kwargs: {
             "attachment_type": "image",
-            "summary": "红色圆形、中心黑点",
-            "visible_features": "红色圆形、中心黑点",
+            "summary": "",
+            "visible_features": "",
             "visible_text": "",
-            "suspected_symbol": "待检索确认的图标/符号",
+            "suspected_symbol": "",
             "suspected_issue": "",
-            "confidence": "high",
+            "confidence": "low",
         },
     )
     graph = _build_lightweight_customer_support_agent(
@@ -423,9 +495,9 @@ def test_lightweight_chart_symbol_without_evidence_asks_human_confirmation(monke
         config={"configurable": {"thread_id": "s-chart-unverified"}},
     )
 
-    assert "初步识别为：红色圆形、中心黑点" in result["messages"][-1].content
-    assert "未检索到准确官方内容" in result["messages"][-1].content
-    assert "安全水域浮标" not in result["messages"][-1].content
+    assert standard_agent.calls
+    assert "chart_symbol_verify" not in result["phase_history"]
+    assert result["messages"][-1].content == "请补充一张更清晰的截图或圈出要确认的图标。"
 
 
 def test_customer_support_agent_imports_guard_refusal_constant():
@@ -812,7 +884,7 @@ def test_customer_support_graph_multimodal_ship_update_requires_current_identifi
 
     assert position.calls == []
     assert result["route_trace"]["route"] == "ship_update"
-    assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_preflight_guard"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "ship_update_subagent"
     assert "POSN 42°21.034'N" in result["route_trace"]["reasoning_trace"]["perception_summary"]["visible_text"]
     assert "需要明确船舶身份标识" in result["messages"][-1].content
 
@@ -902,7 +974,7 @@ def test_customer_support_graph_multimodal_ship_update_uses_upload_only(monkeypa
     )
 
     assert result["route_trace"]["route"] == "ship_update"
-    assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_preflight_guard"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "ship_update_subagent"
     assert result["generated_tool_calls"] == ["upload_ship_position"]
     assert static_update.calls == []
     assert len(position.calls) == 1

@@ -43,6 +43,48 @@ def _emit_result(tool_name: str, ctx, result: ToolResult):
         },
     )
 
+
+def _wechat_ship_url(mmsi: str) -> str:
+    return (
+        "https://open.weixin.qq.com/connect/oauth2/authorize?"
+        "appid=wx9d402b54c1d84ebf&"
+        "redirect_uri=http://www.hifleet.com/wap-simple/index.html&"
+        f"response_type=code&scope=snsapi_base&state={mmsi}#wechat_redirect"
+    )
+
+
+def _format_static_update_success(mmsi: str, data: dict) -> str:
+    field_labels = [
+        ("name", "船名", ""),
+        ("imonumber", "IMO", ""),
+        ("type", "船型", ""),
+        ("minotype", "船舶子类型", ""),
+        ("flag", "船旗", ""),
+        ("callsign", "呼号", ""),
+        ("length", "船长", " 米"),
+        ("width", "船宽", " 米"),
+        ("dwt", "载重吨", ""),
+        ("buildyear", "建造年份", ""),
+        ("destination", "目的港", ""),
+        ("eta", "ETA", ""),
+        ("draught", "吃水", " 米"),
+    ]
+    lines = [
+        "静态信息更新成功！",
+        f"MMSI: {mmsi}",
+        f"点击查看：{_wechat_ship_url(mmsi)}",
+        "更新参数:",
+    ]
+    for key, label, suffix in field_labels:
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        lines.append(f"{label}: {value}{suffix}")
+    lines.append("数据同步：预计 5 分钟内生效")
+    return "\n".join(lines)
+
 # 将 scripts/ 目录加入 sys.path，以便直接 import
 _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 if _SCRIPTS_DIR not in sys.path:
@@ -1127,12 +1169,7 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
         if isinstance(result, str):
             # 判断是否成功
             if "成功" in result or "更新成功" in result:
-                wechat_url = (
-                    f"https://open.weixin.qq.com/connect/oauth2/authorize?"
-                    f"appid=wx9d402b54c1d84ebf&"
-                    f"redirect_uri=http://www.hifleet.com/wap-simple/index.html&"
-                    f"response_type=code&scope=snsapi_base&state={mmsi}#wechat_redirect"
-                )
+                wechat_url = _wechat_ship_url(mmsi)
                 lines = [
                     f"船位更新成功！",
                     f"MMSI: {mmsi}",
@@ -1327,7 +1364,7 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
                     return output
                 status = str(parsed.get("status", ""))
                 if status in ("0", "1"):
-                    output = f"静态信息更新成功！\nMMSI: {mmsi}\n更新字段: {', '.join(update_fields)}"
+                    output = _format_static_update_success(mmsi, data)
                     _emit_result(
                         "update_ship_static_info",
                         ctx,
@@ -1344,7 +1381,7 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
             except json.JSONDecodeError:
                 # 纯文本响应
                 if "成功" in result:
-                    output = f"静态信息更新成功！\nMMSI: {mmsi}\n更新字段: {', '.join(update_fields)}"
+                    output = _format_static_update_success(mmsi, data)
                     _emit_result(
                         "update_ship_static_info",
                         ctx,

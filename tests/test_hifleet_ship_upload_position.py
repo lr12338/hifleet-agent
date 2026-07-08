@@ -21,6 +21,16 @@ class FakeUploadPosition:
         return "更新成功！"
 
 
+class FakeUpdateStaticInfo:
+    def __init__(self, result='{"status":"1"}'):
+        self.calls = []
+        self.result = result
+
+    def update_static_info(self, data, usertoken=""):
+        self.calls.append((data, usertoken))
+        return self.result
+
+
 def test_upload_ship_position_requires_explicit_updatetime(monkeypatch):
     fake_upload = FakeUploadPosition()
     monkeypatch.setattr(ship_tools, "_ensure_imports", lambda: None)
@@ -116,3 +126,37 @@ def test_upload_ship_position_success_uses_only_submitted_time_and_fields(monkey
     assert "之前错误" not in output
     assert fake_upload.calls[0][0]["updatetime"] == "2026-06-15 10:20:30"
     assert fake_upload.calls[0][0]["status"] == "在航"
+
+
+def test_update_ship_static_info_success_returns_verification_link_and_fields(monkeypatch):
+    fake_static = FakeUpdateStaticInfo()
+    monkeypatch.setattr(ship_tools, "_ensure_imports", lambda: None)
+    monkeypatch.setattr(ship_tools, "_update_static_info", fake_static)
+    monkeypatch.setattr(ship_tools, "_ttse_key", lambda: "")
+
+    output = ship_tools.update_ship_static_info.invoke(
+        {
+            "mmsi": "414402130",
+            "destination": "HUI ZHOU",
+            "eta": "2026-07-11 20:00",
+            "draft": "7.9",
+            "ship_name": "TEST SHIP",
+            "imo": "9876543",
+        }
+    )
+
+    assert "静态信息更新成功！" in output
+    assert "MMSI: 414402130" in output
+    assert "点击查看：https://open.weixin.qq.com/connect/oauth2/authorize?" in output
+    assert "state=414402130#wechat_redirect" in output
+    assert "更新参数:" in output
+    assert "船名: TEST SHIP" in output
+    assert "IMO: 9876543" in output
+    assert "目的港: HUI ZHOU" in output
+    assert "ETA: 2026-07-11 20:00" in output
+    assert "吃水: 7.9 米" in output
+    assert "数据同步：预计 5 分钟内生效" in output
+    assert "更新字段:" not in output
+    assert fake_static.calls[0][0]["mmsi"] == "414402130"
+    assert fake_static.calls[0][0]["destination"] == "HUI ZHOU"
+    assert fake_static.calls[0][0]["draught"] == 7.9

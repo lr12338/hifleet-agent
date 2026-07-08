@@ -62,18 +62,25 @@ from agents.customer_support_router import (
     extract_entities,
     format_unverified_chart_symbol_answer,
     format_verified_chart_symbol_answer,
-    build_text_from_pending_update,
-    is_active_pending_update_state,
     latest_user_text as latest_customer_user_text,
     make_trace,
     normalize_message_text,
     resolve_entities_with_context,
     should_use_ship_context,
     validate_links,
+    classify_write_tool_result,
 )
 from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
 from agents.customer_support_evidence_guard import apply_high_risk_evidence_guard
 from agents.customer_support_understanding import build_customer_understanding
+from agents.ship_update_subagent import (
+    ALLOWED_WRITE_TOOLS,
+    default_ship_update_draft,
+    draft_to_pending_compat,
+    is_active_ship_update_draft,
+    legacy_pending_to_draft,
+    run_ship_update_subagent,
+)
 from coze_coding_utils.runtime_ctx.context import default_headers
 from llm_config import DEFAULT_MULTIMODAL_MODEL, DEFAULT_TEXT_MODEL, build_thinking_payload, load_llm_config, resolve_thinking_settings
 from skills import SkillLoader
@@ -106,7 +113,6 @@ CUSTOMER_SUPPORT_UNDERSTANDING_PROMPT = """你是 HiFleet 客服系统的需求�
 - conversation: 总结上文、回看上一条问题、询问上一个船舶
 - knowledge: 平台功能、产品、业务、故障排查、行业知识
 - troubleshooting: 上传失败、加载失败、权限/浏览器/文件格式等故障排查
-- chart_symbol: 用户基于截图询问海图/地图符号、图标、颜色含义
 - ship_query: 单步船舶查询，如船位、档案、PSC
 - ship_analysis: 多步船舶分析，如轨迹、挂靠、航次、上一离港、当前停船、一致性判断
 - ship_stats: 区域、海峡、港口、红海绕航等统计
@@ -128,12 +134,12 @@ query_type 只允许：
 规则：
 - 默认这是 HiFleet 客服场景；但明显闲聊、泛化电脑/网络问题不要硬套 HiFleet。
 - 如果有附件，必须优先结合附件和 perception 理解用户真实诉求。
-- 如果有附件识别结果 perception，应优先结合 perception 判断：截图像海图/地图符号时优先 chart_symbol；截图有 Error/失败/加载异常时优先 troubleshooting；文件/表格类附件优先 file_task。
+- 如果有附件识别结果 perception，应优先结合 perception 判断真实诉求；截图中的海图符号、平台图标、颜色标识含义问题按多模态知识/排障处理，并生成适合知识库或网页检索的关键词；截图有 Error/失败/加载异常时优先 troubleshooting；文件/表格类附件优先 file_task。
 - 不要因为出现“船位/更新”就默认 ship_update；像“船位更新很慢”“为什么更新这么慢”属于 knowledge。
 - 对“上面/这艘船/上一条/总结”等强依赖上下文的问题，优先结合上下文理解，不要忽略会话历史。
 - 如果当前问题是船舶追问，但本轮没写船名/MMSI/IMO，只要上下文里已有明确船舶，可以标记 use_context_ship=true。
 - 明确要求修改/上传/更新船舶数据时才标记 ship_update；只是在问平台显示或更新慢时不要标记 ship_update。
-- 船舶写入只输出候选意图和候选字段，不代表允许写入；最终是否执行只能由 shared ship_update harness 校验。
+- 船舶写入只输出候选意图和候选字段，不代表允许写入；后续由 ship_update 子 agent 生成结构化工具计划，主 agent 只按计划执行允许的写入工具。
 - 更新船位、上传船位、补录船位、更新目的港/ETA、更新静态信息属于 ship_update 候选；为什么更新慢、船位跟踪异常、怎么手动更新目的港 ETA、能不能邮件更新 ETA 属于非写入知识/排障。
 - ship_update 候选必须填 operation_type：position_update/static_update/mixed_update/ambiguous_update。非写入目的港/ETA 能力咨询填 frontend_capability_question；数据延迟或跟踪异常填 data_delay_troubleshooting。
 - `船艏/航迹向: A / B` 表示 heading=A、course=B，不要把两个值当作同一字段冲突。
@@ -148,7 +154,7 @@ query_type 只允许：
 - 问题反馈/排障类问题（例如不显示、保存不了、无法闭合、找不到按钮、报警不触发）必须让 query 同时覆盖：功能规则、常见原因、处理方法、权限/页面限制。
 - 不要只生成一个泛化 query；例如“怎么绘制区域标注”应拆成“HiFleet 区域标注 绘制 步骤”“HiFleet 电子围栏 标注及电子围栏报警”“HiFleet 我的标注 区域标注 编辑 报警”“HiFleet 区域回放 绘制 区域”等多角度 query。
 - rewritten_user_need 要表达“用户真正想确认什么”，不是复述，也不是回答。
-- 若附件是海图/符号截图，优先考虑 chart_symbol 或 multimodal_understanding，不要误判为普通 knowledge。
+- 若附件是海图/符号截图，不要直接猜含义；应标记 needs_multimodal_grounding=true，并生成检索关键词交给文本 agent 检索后回答。
 - 若附件或文字显示是页面报错、上传失败、功能异常，优先考虑 troubleshooting。
 
 query_type 判定规则：
@@ -176,7 +182,7 @@ Few-shot:
 
 输入：这个红色圆圈是什么意思（附海图截图）
 输出：
-{"intent":"chart_symbol","confidence":"high","reason_summary":"用户在询问海图符号含义","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户想确认截图中的海图符号具体含义","query_type":"multimodal_symbol","search_keywords":["HiFleet 海图","红色圆圈","符号含义"],"search_query_candidates":["HiFleet 海图 红色圆圈 符号含义","海图 红色圆圈 标志","HiFleet 海图 符号 识别"],"needs_multimodal_grounding":true,"should_prefer_local_kb":false,"should_limit_to_hifleet_sites":false}
+{"intent":"knowledge","confidence":"high","reason_summary":"用户基于截图询问海图或平台符号含义，需要结合多模态识别结果检索证据后回答","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户想确认截图中红色圆形图标的含义，并需要可核验的 HiFleet 或海图符号资料","query_type":"multimodal_symbol","search_keywords":["HiFleet 海图","红色圆形图标","符号含义"],"search_query_candidates":["HiFleet 海图 红色圆形图标 符号含义","海图 红色圆形 中心黑点 标志","HiFleet 海图 符号 识别"],"needs_multimodal_grounding":true,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":false}
 
 输出要求：
 - 只返回 JSON
@@ -333,13 +339,28 @@ def _state_dict_from_model(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
+def _resolve_role_base_url(cfg: dict[str, Any], role: str) -> str:
+    config = dict(cfg.get("config") or {})
+    env_key_by_role = {
+        "text": "text_model_base_url_env",
+        "multimodal": "multimodal_model_base_url_env",
+        "json": "json_model_base_url_env",
+    }
+    env_name = str(config.get(env_key_by_role.get(role, "")) or "").strip()
+    if env_name:
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return os.getenv("COZE_INTEGRATION_MODEL_BASE_URL", "").strip()
+
+
 def _build_customer_support_json_llm(ctx, cfg: dict[str, Any], model_override: str = "") -> ChatOpenAI | None:
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
-    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
+    base_url = _resolve_role_base_url(cfg, "json")
     if not api_key or not base_url:
         return None
-    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
-    model = str(model_override or (cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg, role="json")
+    model = str(model_override or (cfg.get("config") or {}).get("customer_support_json_model") or (cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
     try:
         headers = _safe_default_headers(ctx)
     except Exception:
@@ -351,7 +372,7 @@ def _build_customer_support_json_llm(ctx, cfg: dict[str, Any], model_override: s
         temperature=0.1,
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
-        extra_body={"thinking": build_thinking_payload("disabled")},
+        extra_body={"thinking": build_thinking_payload(runtime_settings["thinking_type"], runtime_settings["reasoning_effort"])},
         default_headers=headers,
     )
 
@@ -524,11 +545,11 @@ def _run_customer_support_perception_agent(
         return {}
 
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
-    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
+    base_url = _resolve_role_base_url(cfg, "multimodal")
     if not api_key or not base_url:
         return {}
 
-    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg, role="multimodal")
     model = str((cfg.get("config") or {}).get("multimodal_model") or runtime_settings["model"]).strip()
     llm = ChatOpenAI(
         model=model,
@@ -537,7 +558,7 @@ def _run_customer_support_perception_agent(
         temperature=0.0,
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
-        extra_body={"thinking": build_thinking_payload("disabled")},
+        extra_body={"thinking": build_thinking_payload(runtime_settings["thinking_type"], runtime_settings["reasoning_effort"])},
         default_headers=_safe_default_headers(ctx),
     )
     content: list[dict[str, Any]] = [{"type": "text", "text": f"用户问题：{text}\n请识别附件并只返回 JSON。"}]
@@ -1053,7 +1074,7 @@ def build_structured_readable_trace(
         + _redact_trace_text(user_text, limit=120)
         + "」。agent 判断请求类型为 "
         + _redact_trace_text(extraction.get("operation_type") or understanding.get("intent") or trace.get("route") or "unknown", limit=60)
-        + "。Harness 基于结构化候选参数校验字段、目标船舶和工具结果；"
+        + "。写入链路基于 ship_update 子 agent 结构化结果和工具结果决定回复策略；"
         + ("工具返回明确成功，因此允许成功话术。" if allowed_success else "未满足成功条件时不会输出成功话术。")
     )
     readable = {
@@ -1542,6 +1563,9 @@ def _fallback_multimodal_perception(messages: list[AnyMessage] | list[Any] | Non
         "visible_text": "",
         "suspected_symbol": "",
         "suspected_issue": "",
+        "visual_question_summary": "",
+        "lookup_keywords": "",
+        "needs_knowledge_lookup": False,
         "confidence": "low",
         "source": "fallback",
         "user_text": user_text,
@@ -1556,10 +1580,15 @@ def _normalize_multimodal_perception(raw: dict[str, Any], fallback: dict[str, An
     if confidence not in {"high", "medium", "low"}:
         confidence = "low"
     value["confidence"] = confidence
-    for key in ("recognized_text", "summary", "visible_features", "visible_text", "suspected_symbol", "suspected_issue", "attachment_type"):
+    for key in ("recognized_text", "summary", "visible_features", "visible_text", "suspected_symbol", "suspected_issue", "visual_question_summary", "lookup_keywords", "attachment_type"):
         if isinstance(value.get(key), list):
             value[key] = "，".join(str(item).strip() for item in value.get(key) or [] if str(item).strip())
         value[key] = str(value.get(key) or "").strip()
+    raw_lookup = value.get("needs_knowledge_lookup")
+    if isinstance(raw_lookup, str):
+        value["needs_knowledge_lookup"] = raw_lookup.strip().lower() in {"true", "1", "yes", "是", "需要"}
+    else:
+        value["needs_knowledge_lookup"] = bool(raw_lookup)
     if not value["visible_features"] and value["summary"]:
         value["visible_features"] = value["summary"]
     value["source"] = str(value.get("source") or "direct_multimodal_model")
@@ -1577,10 +1606,10 @@ def _run_direct_multimodal_perception(
     if not _has_current_multimodal_media(messages):
         return fallback
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
-    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
+    base_url = _resolve_role_base_url(cfg, "multimodal")
     if not api_key or not base_url:
         return fallback
-    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg, role="multimodal")
     model = str((cfg.get("config") or {}).get("multimodal_model") or runtime_settings["model"] or DEFAULT_MULTIMODAL_MODEL).strip()
     llm = ChatOpenAI(
         model=model,
@@ -1589,18 +1618,20 @@ def _run_direct_multimodal_perception(
         temperature=0.0,
         streaming=False,
         timeout=(cfg.get("config") or {}).get("timeout", 600),
-        extra_body={"thinking": build_thinking_payload("disabled")},
+        extra_body={"thinking": build_thinking_payload(runtime_settings["thinking_type"], runtime_settings["reasoning_effort"])},
         default_headers=_safe_default_headers(ctx),
     )
     prompt = (
         "你是 HiFleet 多模态感知层。只输出 JSON，不要解释。\n"
         "字段：attachment_type(audio|image|video|unknown), recognized_text, summary, visible_features, visible_text, "
-        "suspected_symbol, suspected_issue, confidence(high|medium|low)。\n"
+        "suspected_symbol, suspected_issue, visual_question_summary, lookup_keywords, needs_knowledge_lookup, confidence(high|medium|low)。\n"
         "音频：尽量转写语音内容到 recognized_text。\n"
         "图片：只客观描述可见文字、界面元素、颜色、形状、位置关系、图标外观或报错文字。\n"
-        "图标/海图符号场景：visible_features 只写客观特征，例如“红色圆形、中心黑点、无文字”。"
+        "图标/海图符号/平台按钮场景：visible_features 只写客观特征，例如“红色圆形、中心黑点、无文字”；"
+        "visual_question_summary 写成可交给文本客服 agent 处理的问题，例如“用户想确认截图中红色圆形中心黑点图标的含义”；"
+        "lookup_keywords 写适合知识库或网页检索的短关键词。"
         "不要判断含义，不要下定义，不要写“表示/用于/意味着/属于/危险/安全”等解释性结论；"
-        "suspected_symbol 和 suspected_issue 也只能写“待检索确认的图标/符号”，不能写具体含义。\n"
+        "suspected_symbol 和 suspected_issue 也只能写“待检索确认的图标/符号/问题”，不能写具体含义。\n"
         "视频：基于可访问内容或首帧能力做客观摘要；不确定时 confidence=low。"
     )
     try:
@@ -1617,15 +1648,10 @@ def _run_direct_multimodal_perception(
 def _multimodal_perception_has_signal(perception: dict[str, Any]) -> bool:
     if str(perception.get("confidence") or "").lower() in {"high", "medium"}:
         return True
-    return any(str(perception.get(key) or "").strip() for key in ("recognized_text", "summary", "visible_text", "suspected_symbol", "suspected_issue"))
-
-
-def _is_chart_symbol_image_request(text: str, messages: list[AnyMessage] | list[Any] | None) -> bool:
-    q = (text or "").lower()
-    if not _has_current_multimodal_media(messages):
-        return False
-    markers = ["全球海图", "海图", "图标", "符号", "图中", "标志", "这个在", "是什么意思"]
-    return any(marker in q for marker in markers)
+    return any(
+        str(perception.get(key) or "").strip()
+        for key in ("recognized_text", "summary", "visible_text", "suspected_symbol", "suspected_issue", "visual_question_summary", "lookup_keywords")
+    )
 
 
 def _is_ship_position_update_request(text: str) -> bool:
@@ -1714,12 +1740,18 @@ def _objective_multimodal_text(perception: dict[str, Any], user_text: str = "") 
     recognized = str(perception.get("recognized_text") or "").strip()
     features = str(perception.get("visible_features") or perception.get("summary") or "").strip()
     visible = str(perception.get("visible_text") or "").strip()
+    question_summary = str(perception.get("visual_question_summary") or "").strip()
+    lookup_keywords = str(perception.get("lookup_keywords") or "").strip()
     if recognized:
         parts.append(f"语音识别内容：{recognized}")
     if features:
         parts.append(f"附件可见特征：{features}")
     if visible:
         parts.append(f"可见文字：{visible}")
+    if question_summary:
+        parts.append(f"附件问题摘要：{question_summary}")
+    if lookup_keywords:
+        parts.append(f"建议检索关键词：{lookup_keywords}")
     if user_text:
         parts.append(f"用户补充：{user_text}")
     return "\n".join(parts).strip() or user_text
@@ -1865,6 +1897,7 @@ class LightweightCustomerSupportState(TypedDict, total=False):
     route_trace: dict[str, Any]
     check_result: dict[str, Any]
     pending_update_state: dict[str, Any]
+    ship_update_draft: dict[str, Any]
     _pending_before: dict[str, Any]
     delegate_input_message_count: int
     delegate_answer: str
@@ -2039,15 +2072,24 @@ def _load_llm_config(workspace_path: str) -> dict[str, Any]:
     return load_llm_config(workspace_path)
 
 
-def _resolve_runtime_llm_settings(ctx, cfg: dict[str, Any]) -> dict[str, str]:
+def _resolve_runtime_llm_settings(ctx, cfg: dict[str, Any], *, role: str = "text") -> dict[str, str]:
     config = dict(cfg.get("config") or {})
     route = get_current_llm_route()
     requested_model = str(route.get("model", "")).strip()
     requested_thinking = str(route.get("thinking_type", "")).strip()
     requested_effort = str(route.get("reasoning_effort", "")).strip()
-    model = requested_model or str(config.get("text_model") or config.get("model") or DEFAULT_TEXT_MODEL).strip()
+    if role == "multimodal":
+        default_model = str(config.get("multimodal_model") or DEFAULT_MULTIMODAL_MODEL).strip()
+        default_thinking = config.get("multimodal_thinking_type") or config.get("thinking_type") or "enabled"
+    elif role == "json":
+        default_model = str(config.get("customer_support_json_model") or config.get("customer_support_reasoning_model") or config.get("text_model") or config.get("model") or DEFAULT_TEXT_MODEL).strip()
+        default_thinking = config.get("customer_support_json_thinking_type") or config.get("thinking_type") or "enabled"
+    else:
+        default_model = str(config.get("text_model") or config.get("model") or DEFAULT_TEXT_MODEL).strip()
+        default_thinking = config.get("text_thinking_type") or config.get("thinking_type") or "enabled"
+    model = requested_model or default_model
     thinking = resolve_thinking_settings(
-        requested_thinking or config.get("thinking_type") or "enabled",
+        requested_thinking or default_thinking,
         requested_effort or config.get("reasoning_effort") or "medium",
     )
     return {"model": model, **thinking}
@@ -2055,8 +2097,8 @@ def _resolve_runtime_llm_settings(ctx, cfg: dict[str, Any]) -> dict[str, str]:
 
 def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
     api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
-    base_url = os.getenv("COZE_INTEGRATION_MODEL_BASE_URL")
-    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg)
+    base_url = _resolve_role_base_url(cfg, "text")
+    runtime_settings = _resolve_runtime_llm_settings(ctx, cfg, role="text")
     logger.info(
         "[MainAgent] Resolved model=%s thinking=%s effort=%s streaming=%s",
         runtime_settings["model"],
@@ -2080,7 +2122,11 @@ def _build_standard_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
     logger.info("[MainAgent] Building standard agent graph")
     system_prompt = _build_system_prompt(workspace_path, profile=profile, intent_hint=intent_hint)
     llm = _build_llm(ctx, cfg, streaming=True)
-    tools = _load_all_tools(profile)
+    tools = [
+        tool
+        for tool in _load_all_tools(profile)
+        if tool.name not in {"upload_ship_position", "update_ship_static_info"}
+    ]
     return create_agent(
         model=llm,
         system_prompt=system_prompt,
@@ -2994,6 +3040,139 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             assets.append({"type": asset_type, "url": clean})
         return assets[:8]
 
+    def _ship_update_failure_answer(operation_type: str, result_status: dict[str, Any]) -> str:
+        target = "静态信息更新" if operation_type == "static_update" else "船位更新"
+        status = str(result_status.get("status") or "uncertain")
+        if status == "empty":
+            return f"本次{target}暂未成功提交：工具没有返回明确结果。请稍后重试，或联系人工客服处理。"
+        if status == "uncertain":
+            return f"本次{target}暂未确认成功，系统没有返回明确成功状态。请稍后重试，或联系人工客服核实处理。"
+        return f"本次{target}暂未成功提交。请检查字段后稍后重试，或联系人工客服处理。"
+
+    def _execute_ship_update_subagent_plan(
+        *,
+        text: str,
+        perception: dict[str, Any],
+        pending_update_state: dict[str, Any],
+        understanding: dict[str, Any],
+        route_trace: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+        subagent_prompt_driven = bool((cfg.get("config") or {}).get("ship_update_subagent_prompt_driven"))
+        json_agent = (
+            lambda system_prompt, payload: _invoke_customer_support_json_agent(
+                ctx,
+                cfg,
+                system_prompt,
+                payload,
+                model_override=str((cfg.get("config") or {}).get("ship_update_subagent_model") or ""),
+            )
+        ) if subagent_prompt_driven else None
+        plan = run_ship_update_subagent(
+            text,
+            perception=perception,
+            pending_update_state=pending_update_state,
+            understanding=understanding,
+            source_turn_id=str(route_trace.get("run_id") or ""),
+            json_agent=json_agent,
+        )
+        plan_dict = plan.model_dump()
+        route_trace.setdefault("reasoning_trace", {})["ship_update_subagent"] = plan_dict
+        route_trace.setdefault("reasoning_trace", {})["ship_update_draft"] = dict(plan.ship_update_draft)
+        route_trace.setdefault("reasoning_trace", {})["ship_update_extraction"] = {
+            "source": plan.source,
+            "operation_type": plan.operation_type,
+            "normalized_fields": dict(plan.normalized_fields),
+            "missing_required_fields": list(plan.missing_fields),
+            "can_write": plan.status == "ready_to_execute",
+            "tool_name": plan.tool_name or "",
+        }
+        route_trace.setdefault("reasoning_trace", {})["missing_required_fields"] = list(plan.missing_fields)
+        route_trace.setdefault("reasoning_trace", {})["write_args"] = dict(plan.tool_args)
+        route_trace.setdefault("reasoning_trace", {})["write_mode"] = (
+            "static" if plan.operation_type == "static_update" else "dynamic" if plan.operation_type == "position_update" else ""
+        )
+        route_trace["ship_update_subagent"] = {
+            "source": plan.source,
+            "status": plan.status,
+            "operation_type": plan.operation_type,
+            "tool_name": plan.tool_name or "",
+            "pending_action": plan.pending_action,
+            "confidence": plan.confidence,
+            "evidence_sources": list(plan.evidence_sources),
+        }
+        if plan.status != "ready_to_execute":
+            draft = dict(plan.ship_update_draft or legacy_pending_to_draft(plan.pending_update_state or pending_update_state))
+            if plan.draft_action == "clear" or plan.status == "cancelled":
+                draft.update({"active": False, "status": "cancelled"})
+            pending = draft_to_pending_compat(draft)
+            answer = plan.reply_to_user or guard_fallback
+            check = {
+                "ship_update_subagent_status": plan.status,
+                "missing_required_fields": list(plan.missing_fields),
+                "draft_action": plan.draft_action,
+                "ship_update_draft": draft,
+                "pending_update_state": pending,
+                "write_result": False,
+                "allowed_success_claim": False,
+                "current_run_tool_success": False,
+            }
+            return answer, pending, [], check
+        if plan.tool_name not in ALLOWED_WRITE_TOOLS:
+            draft = dict(plan.ship_update_draft or default_ship_update_draft())
+            pending = draft_to_pending_compat(draft)
+            check = {
+                "ship_update_subagent_status": "error",
+                "draft_action": plan.draft_action,
+                "write_result": False,
+                "allowed_success_claim": False,
+                "current_run_tool_success": False,
+                "ship_update_draft": draft,
+                "pending_update_state": pending,
+            }
+            return "本次船舶信息更新暂未执行：子 agent 未返回允许的写入工具。请补充更新内容后重试。", pending, [], check
+        write_tools = {tool.name: tool for tool in SkillLoader.get_tools_by_names(SHIP_UPDATE_BUNDLE)}
+        tool = write_tools.get(str(plan.tool_name))
+        if tool is None:
+            draft = dict(plan.ship_update_draft or default_ship_update_draft())
+            pending = draft_to_pending_compat(draft)
+            check = {
+                "ship_update_subagent_status": "error",
+                "draft_action": plan.draft_action,
+                "write_result": False,
+                "allowed_success_claim": False,
+                "current_run_tool_success": False,
+                "ship_update_draft": draft,
+                "pending_update_state": pending,
+            }
+            return f"本次船舶信息更新暂未执行：缺少工具 {plan.tool_name}。", pending, [], check
+        t0 = time.time()
+        route_trace.setdefault("tool_call_sequence", []).append(str(plan.tool_name))
+        output = str(tool.invoke(plan.tool_args) or "")
+        route_trace.setdefault("latency_hotspot", {})[str(plan.tool_name)] = int((time.time() - t0) * 1000)
+        result_status = classify_write_tool_result(output)
+        success = bool(result_status.get("success"))
+        draft = dict(plan.ship_update_draft or default_ship_update_draft())
+        if success:
+            draft.update({"active": False, "status": "executed_success", "missing_fields": []})
+            answer = output
+        else:
+            draft.update({"active": True, "status": "executed_failed"})
+            answer = _ship_update_failure_answer(plan.operation_type, result_status)
+        pending = draft_to_pending_compat(draft)
+        check = {
+            "ship_update_subagent_status": plan.status,
+            "draft_action": plan.draft_action,
+            "write_result": success,
+            "write_result_status": result_status,
+            "allowed_success_claim": success,
+            "current_run_tool_success": success,
+            "ship_update_draft": draft,
+            "pending_update_state": pending,
+            "write_args": dict(plan.tool_args),
+            "executed_tool": str(plan.tool_name),
+        }
+        return answer, pending, [str(plan.tool_name)], check
+
     def preprocess_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
         messages = list(state.get("messages", []) or [])
         text = _latest_user_text(messages)
@@ -3033,13 +3212,12 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                     "check_result": {"blocked": True, "pre_guard": True},
                     "answer_confidence": "high",
                 },
-            }
+        }
 
         perception: dict[str, Any] = {}
-        is_chart_symbol_request = _is_chart_symbol_image_request(text, messages)
         if _has_current_multimodal_media(messages):
             perception = _run_direct_multimodal_perception(ctx=ctx, cfg=cfg, messages=messages)
-            if _multimodal_perception_has_signal(perception) and not is_chart_symbol_request:
+            if _multimodal_perception_has_signal(perception):
                 text = _objective_multimodal_text(perception, text)
                 messages = _messages_with_text_replacement(messages, text)
             else:
@@ -3053,10 +3231,16 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "suspected_symbol": str(perception.get("suspected_symbol") or ""),
             "suspected_issue": str(perception.get("suspected_issue") or ""),
             "visible_features": str(perception.get("visible_features") or ""),
+            "visual_question_summary": str(perception.get("visual_question_summary") or "")[:300],
+            "lookup_keywords": str(perception.get("lookup_keywords") or "")[:200],
+            "needs_knowledge_lookup": bool(perception.get("needs_knowledge_lookup")),
             "confidence": str(perception.get("confidence") or ""),
         }
-        pending_before = dict(state.get("pending_update_state", {}) or {})
-        pending_after = dict(pending_before)
+        raw_pending_before = dict(state.get("pending_update_state", {}) or {})
+        draft_before = dict(state.get("ship_update_draft", {}) or legacy_pending_to_draft(raw_pending_before))
+        draft_after = dict(draft_before)
+        pending_before = draft_to_pending_compat(draft_before)
+        pending_after = draft_to_pending_compat(draft_after)
         pending_used = False
         understanding = build_customer_understanding(
             text,
@@ -3066,54 +3250,19 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             pending_update_state=pending_after,
         ).model_dump()
         route_trace["reasoning_trace"]["understanding_result"] = understanding
-        if pending_after:
-            pending_after["turns_elapsed"] = int(pending_after.get("turns_elapsed") or 0) + 1
-            if int(pending_after.get("turns_elapsed") or 0) > int(pending_after.get("expires_after_turns") or 5):
-                pending_after.update({"active": False, "status": "expired", "can_resume": False})
+        if draft_after:
+            draft_after["turns_elapsed"] = int(draft_after.get("turns_elapsed") or 0) + 1
+            if int(draft_after.get("turns_elapsed") or 0) > int(draft_after.get("expires_after_turns") or 5):
+                draft_after.update({"active": False, "status": "expired"})
                 route_trace["reasoning_trace"]["pending_clear_reason"] = "expired"
-            if any(marker in text for marker in ("取消更新", "不用更新", "取消", "先不更新")):
-                pending_after.update({"active": False, "status": "cancelled", "can_resume": False})
-                route_trace["reasoning_trace"]["pending_clear_reason"] = "cancelled_by_user"
-        if pending_before and not is_active_pending_update_state(pending_after):
-            pending_before = dict(pending_before)
-        elif is_active_pending_update_state(pending_after):
-            current_entities = extract_entities(text)
-            mmsi_only = bool(current_entities.mmsi and normalize_message_text(text) == current_entities.mmsi)
-            pending_action = str(understanding.get("pending_action") or "none")
-            if pending_action == "pause":
-                pending_after.update({"active": False, "status": "cancelled", "can_resume": False})
-                route_trace["reasoning_trace"]["pending_clear_reason"] = "topic_switched"
-            elif pending_action == "cancel":
-                pending_after.update({"active": False, "status": "cancelled", "can_resume": False})
-                route_trace["reasoning_trace"]["pending_clear_reason"] = "cancelled_by_user"
-            elif mmsi_only and pending_after.get("status") in {"awaiting_ship_identity", "awaiting_required_fields"}:
-                pending_used = True
-                text = build_text_from_pending_update(pending_after, text)
-                messages = _messages_with_text_replacement(messages, text)
-                route_trace["reasoning_trace"]["pending_resume_reason"] = "mmsi_followup"
-            elif pending_after.get("status") == "awaiting_mmsi_confirmation" and pending_action == "resume" and bool((pending_after.get("ship_identity") or {}).get("mmsi")):
-                pending_used = True
-                text = build_text_from_pending_update(pending_after, text)
-                messages = _messages_with_text_replacement(messages, text)
-                route_trace["reasoning_trace"]["pending_resume_reason"] = "active_pending_confirmation"
-            elif pending_after.get("status") == "awaiting_field_confirmation" and pending_action == "resume":
-                pending_used = True
-                text = build_text_from_pending_update(pending_after, text)
-                messages = _messages_with_text_replacement(messages, text)
-                route_trace["reasoning_trace"]["pending_resume_reason"] = "active_pending_field_confirmation"
+        pending_after = draft_to_pending_compat(draft_after)
         route_trace["pending_used"] = pending_used
         route_trace["pending_update_state"] = pending_after
+        route_trace["ship_update_draft"] = draft_after
         route_trace["reasoning_trace"]["pending_update_state_before"] = pending_before
         route_trace["reasoning_trace"]["pending_update_state"] = pending_after
-        if pending_used:
-            understanding = build_customer_understanding(
-                text,
-                entities=asdict(extract_entities(text)),
-                has_media=_has_current_multimodal_media(messages),
-                perception=perception,
-                pending_update_state=pending_after,
-            ).model_dump()
-            route_trace["reasoning_trace"]["understanding_result"] = understanding
+        route_trace["reasoning_trace"]["ship_update_draft_before"] = draft_before
+        route_trace["reasoning_trace"]["ship_update_draft"] = draft_after
         is_ship_tracking_issue = _is_ship_tracking_issue_request(text)
         is_non_write_capability_question = _is_non_write_update_capability_question(text)
         route_trace["reasoning_trace"]["ship_tracking_issue"] = is_ship_tracking_issue
@@ -3121,106 +3270,125 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         operation_type = str(understanding.get("operation_type") or "none")
         non_write_reason = str(understanding.get("non_write_reason") or "none")
         pending_action = str(understanding.get("pending_action") or "none")
-        ship_update_gate = {
-            "should_run_harness": False,
+        active_pending_now = is_active_ship_update_draft(draft_after)
+        should_run_ship_update_subagent = False
+        gate_reason = ""
+        if active_pending_now:
+            should_run_ship_update_subagent = True
+            gate_reason = "active_pending_update"
+        elif bool(understanding.get("ship_update_candidate")) or bool(understanding.get("ship_write_request")):
+            should_run_ship_update_subagent = True
+            gate_reason = "agent_ship_update"
+        elif _is_ship_update_confirmation_text(text):
+            should_run_ship_update_subagent = True
+            gate_reason = "possible_ship_update_followup"
+        ship_update_subagent_gate = {
+            "should_run_subagent": should_run_ship_update_subagent,
             "reason": "",
             "pending_used": bool(pending_used),
             "operation_type": operation_type,
             "pending_action": pending_action,
             "non_write_reason": non_write_reason,
-            "agent_source": "customer_understanding",
+            "active_pending": active_pending_now,
+            "agent_source": "customer_understanding_hint",
         }
-        if pending_used:
-            ship_update_gate.update(
-                {
-                    "should_run_harness": True,
-                    "reason": str(route_trace["reasoning_trace"].get("pending_resume_reason") or "active_pending_update"),
-                }
-            )
-        elif bool(understanding.get("ship_update_candidate")) and non_write_reason == "none":
-            ship_update_gate.update({"should_run_harness": True, "reason": "agent_ship_update"})
-        elif bool(understanding.get("ship_write_request")) and non_write_reason == "none":
-            ship_update_gate.update({"should_run_harness": True, "reason": "agent_ship_update"})
+        ship_update_subagent_gate["reason"] = gate_reason
+        ship_update_gate = {
+            **dict(ship_update_subagent_gate),
+            "should_run_harness": should_run_ship_update_subagent,
+        }
         route_trace["ship_update_gate"] = dict(ship_update_gate)
+        route_trace["ship_update_subagent_gate"] = dict(ship_update_subagent_gate)
         route_trace["reasoning_trace"]["ship_update_gate"] = dict(ship_update_gate)
-        should_run_write_preflight = bool(ship_update_gate["should_run_harness"])
-        if should_run_write_preflight:
-            context = build_conversation_context(messages)
-            current_user_text = _latest_user_text(messages)
-            raw_entities = extract_entities(current_user_text)
-            entities = raw_entities
-            answer, trace_dict = _execute_customer_support_harness(
+        route_trace["reasoning_trace"]["ship_update_subagent_gate"] = dict(ship_update_subagent_gate)
+        if should_run_ship_update_subagent:
+            answer, pending_after, tool_calls, check_result = _execute_ship_update_subagent_plan(
                 text=text,
-                route="ship_update",
-                task_type="ship_update",
-                tool_bundle=SHIP_UPDATE_BUNDLE,
-                entities=entities,
-                context=context,
-                attachments=extract_attachments(messages),
                 perception=perception,
-                session_id=str(state.get("session_id", "")),
-                run_id=str(getattr(ctx, "run_id", "") or ""),
+                pending_update_state=draft_after,
+                understanding=understanding,
+                route_trace=route_trace,
             )
+            draft_after = dict(check_result.get("ship_update_draft") or legacy_pending_to_draft(pending_after))
             preflight_perception_summary = dict(route_trace["reasoning_trace"].get("perception_summary", {}) or {})
-            route_trace.update(trace_dict)
+            if check_result.get("ship_update_subagent_status") == "non_write":
+                if str(check_result.get("draft_action") or "") == "clear":
+                    draft_after.update({"active": False, "status": "cancelled"})
+                    pending_after = draft_to_pending_compat(draft_after)
+                route_trace["route"] = "lightweight_skills_agent"
+                route_trace["pending_update_state"] = pending_after
+                route_trace["ship_update_draft"] = draft_after
+                route_trace["check_result"] = dict(check_result)
+                route_trace["reasoning_trace"] = {
+                    **dict(route_trace.get("reasoning_trace", {}) or {}),
+                    "route_source": "ship_update_subagent_non_write_handoff",
+                    "ship_update_gate": dict(ship_update_gate),
+                    "ship_update_subagent_gate": dict(ship_update_subagent_gate),
+                    "perception_summary": preflight_perception_summary,
+                    "pending_update_state_before": pending_before,
+                    "pending_update_state": pending_after,
+                    "ship_update_draft_before": draft_before,
+                    "ship_update_draft": draft_after,
+                }
+                return {
+                    "phase": "preprocess",
+                    "phase_history": ["preprocess", "ship_update_subagent", "delegate"],
+                    "status": "running",
+                    "task_goal": text,
+                    "messages": messages,
+                    "perception_result": perception,
+                    "generated_answer": "",
+                    "delegate_answer": "",
+                    "generated_tool_calls": [],
+                    "delegate_input_message_count": len(messages),
+                    "output_assets": [],
+                    "check_result": dict(check_result),
+                    "pending_update_state": pending_after,
+                    "ship_update_draft": draft_after,
+                    "_pending_before": pending_before,
+                    "intent_hint": "troubleshooting" if is_ship_tracking_issue else "knowledge",
+                    "route_trace": route_trace,
+                    "response_modalities": ["text", "link"],
+                }
             route_trace["route"] = "ship_update"
-            new_pending = dict((trace_dict.get("reasoning_trace") or {}).get("pending_update_state") or (trace_dict.get("check_result") or {}).get("pending_update_state") or {})
-            if new_pending:
-                pending_after = new_pending
             route_trace["pending_update_state"] = pending_after
+            route_trace["ship_update_draft"] = draft_after
+            pending_used = bool(
+                pending_used
+                or "active_pending" in list((route_trace.get("ship_update_subagent") or {}).get("evidence_sources") or [])
+            )
             route_trace["pending_used"] = pending_used
             route_trace["reasoning_trace"] = {
-                **dict(trace_dict.get("reasoning_trace", {}) or {}),
-                "route_source": "write_preflight_guard",
+                **dict(route_trace.get("reasoning_trace", {}) or {}),
+                "route_source": "ship_update_subagent",
                 "ship_update_gate": dict(ship_update_gate),
+                "ship_update_subagent_gate": dict(ship_update_subagent_gate),
                 "perception_summary": preflight_perception_summary,
                 "pending_update_state_before": pending_before,
                 "pending_update_state": pending_after,
+                "ship_update_draft_before": draft_before,
+                "ship_update_draft": draft_after,
             }
+            route_trace["check_result"] = dict(check_result)
+            route_trace["tool_call_sequence"] = list(tool_calls)
+            route_trace["answer_confidence"] = "high" if check_result.get("write_result") else "medium"
             return {
                 "phase": "done",
-                "phase_history": ["preprocess", "write_preflight_guard", "done"],
+                "phase_history": ["preprocess", "ship_update_subagent", "done"],
                 "status": "success",
                 "task_goal": text,
                 "messages": [AIMessage(content=answer)],
                 "perception_result": perception,
                 "generated_answer": answer,
                 "delegate_answer": answer,
-                "generated_tool_calls": list(trace_dict.get("tool_call_sequence", []) or []),
+                "generated_tool_calls": list(tool_calls),
                 "delegate_input_message_count": len(messages),
                 "output_assets": _extract_output_assets(answer),
-                "check_result": dict(trace_dict.get("check_result", {}) or {}),
+                "check_result": dict(check_result),
                 "pending_update_state": pending_after,
+                "ship_update_draft": draft_after,
                 "_pending_before": pending_before,
                 "intent_hint": "ship_update",
-                "route_trace": route_trace,
-                "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
-            }
-        if is_chart_symbol_request:
-            answer, evidence_outputs = _verify_chart_symbol_with_tools(text, perception, tool_map, route_trace)
-            route_trace["check_result"] = {
-                "has_answer": True,
-                "chart_symbol_verified": "验证链接：" in answer,
-                "evidence_output_count": len([item for item in evidence_outputs if item]),
-                "deprecated_customer_router_bypassed": True,
-            }
-            route_trace["answer_confidence"] = "high" if "验证链接：" in answer else "low"
-            return {
-                "phase": "done",
-                "phase_history": ["preprocess", "chart_symbol_verify", "done"],
-                "status": "success",
-                "task_goal": text,
-                "messages": [AIMessage(content=answer)],
-                "perception_result": perception,
-                "generated_answer": answer,
-                "delegate_answer": answer,
-                "generated_tool_calls": list(route_trace.get("tool_call_sequence", []) or []),
-                "delegate_input_message_count": len(messages),
-                "output_assets": _extract_output_assets(answer),
-                "check_result": dict(route_trace.get("check_result", {}) or {}),
-                "pending_update_state": pending_after,
-                "_pending_before": pending_before,
-                "intent_hint": "knowledge",
                 "route_trace": route_trace,
                 "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
             }
@@ -3240,6 +3408,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "intent_hint": classify_intent_fast(text, has_media=_has_current_multimodal_media(messages)),
             "route_trace": route_trace,
             "pending_update_state": pending_after,
+            "ship_update_draft": draft_after,
             "_pending_before": pending_before,
             "response_modalities": ["text", "link"],
         }
@@ -3286,6 +3455,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "perception_result": dict(state.get("perception_result", {}) or {}),
                 "route_trace": route_trace,
                 "pending_update_state": dict(state.get("pending_update_state", {}) or {}),
+                "ship_update_draft": dict(state.get("ship_update_draft", {}) or {}),
                 "_pending_before": dict(state.get("_pending_before", {}) or {}),
                 "response_modalities": ["text"],
             }
@@ -3296,6 +3466,11 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         if not tool_sequence:
             tool_sequence = _extract_tool_sequence(messages)
         route_trace = dict(state.get("route_trace", {}) or {})
+        if state.get("check_result"):
+            route_trace["check_result"] = {
+                **dict(route_trace.get("check_result", {}) or {}),
+                **dict(state.get("check_result", {}) or {}),
+            }
         route_trace["tool_call_sequence"] = tool_sequence
         route_trace["delegate_thread_id"] = delegate_thread_id
         delegated["phase"] = "delegate"
@@ -3309,6 +3484,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         delegated["perception_result"] = dict(state.get("perception_result", {}) or {})
         delegated["route_trace"] = route_trace
         delegated["pending_update_state"] = dict(state.get("pending_update_state", {}) or {})
+        delegated["ship_update_draft"] = dict(state.get("ship_update_draft", {}) or {})
         delegated["_pending_before"] = dict(state.get("_pending_before", {}) or {})
         delegated["response_modalities"] = list(state.get("response_modalities", ["text", "link"]))
         return delegated
@@ -3360,6 +3536,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         route_trace["answer_confidence"] = "medium" if tool_sequence else "high"
         pending_before = dict(state.get("_pending_before", {}) or {})
         pending_after = dict(state.get("pending_update_state", {}) or route_trace.get("pending_update_state", {}) or {})
+        ship_update_draft = dict(state.get("ship_update_draft", {}) or route_trace.get("ship_update_draft", {}) or legacy_pending_to_draft(pending_after))
         route_trace["readable_trace"] = build_structured_readable_trace(
             user_text=str(state.get("task_goal") or latest_customer_user_text(messages)),
             route_trace=route_trace,
@@ -3383,6 +3560,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "output_assets": output_assets,
             "check_result": check_result,
             "route_trace": route_trace,
+            "pending_update_state": pending_after,
+            "ship_update_draft": ship_update_draft,
         }
 
     def route_after_preprocess(state: LightweightCustomerSupportState) -> str:

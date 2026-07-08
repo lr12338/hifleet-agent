@@ -42,6 +42,13 @@ def _is_negated_safe_statement(value: str) -> bool:
 
 
 def _has_verified_evidence(route_trace: dict[str, Any]) -> bool:
+    check = route_trace.get("check_result")
+    if isinstance(check, dict) and (
+        check.get("allowed_success_claim")
+        or check.get("write_result")
+        or check.get("current_run_tool_success")
+    ):
+        return True
     if bool(route_trace.get("verified_evidence")):
         return True
     evidence_guard = route_trace.get("evidence_guard")

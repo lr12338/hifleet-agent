@@ -108,6 +108,7 @@ def _last_match(pattern: str, text: str, flags: int = re.IGNORECASE) -> str:
 
 def _extract_position_pair(text: str) -> tuple[str, str]:
     patterns = [
+        rf"(?:位置|posn|position)[:：\s]*({COORD_VALUE})\s*[,，/]\s*({COORD_VALUE})",
         rf"(?:位置|posn|position)[:：\s]*({COORD_VALUE})\s+({COORD_VALUE})",
         rf"lat(?:itude)?[:：\s]*({COORD_VALUE}).*?lon(?:gitude|g)?[:：\s]*({COORD_VALUE})",
         rf"纬度[:：\s]*({COORD_VALUE}).*?经度[:：\s]*({COORD_VALUE})",
@@ -120,6 +121,14 @@ def _extract_position_pair(text: str) -> tuple[str, str]:
         second = _clean(match.group(2))
         if re.search(r"[NSns南北]", first) or re.search(r"[EWew东西]", second):
             return second, first
+        if not re.search(r"[NSEWnsew东西南北]", first + second):
+            try:
+                first_num = abs(float(first))
+                second_num = abs(float(second))
+            except ValueError:
+                first_num = second_num = 0
+            if first_num <= 90 and second_num <= 180:
+                return second, first
         return first, second
     return "", ""
 
@@ -270,6 +279,7 @@ def _infer_operation_type(text: str, fields: dict[str, str]) -> str:
         any(marker in text for marker in static_markers)
         or any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in static_update_markers)
         or any(field in fields for field in static_only_fields)
+        or bool(re.search(r"(目的港|ETA|eta|预抵).{0,12}(错误|有误|不对|错了)", text, flags=re.IGNORECASE))
     )
     if has_position and has_static:
         return "mixed_update"

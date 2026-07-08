@@ -327,7 +327,7 @@ IMO
     assert position.calls[0]["heading"] == "359"
     assert position.calls[0]["course"] == "359"
     extraction = result["route_trace"]["reasoning_trace"]["ship_update_extraction"]
-    assert extraction["source"] == "llm_contract_extractor"
+    assert extraction["source"] == "fallback_contract_parser"
     assert extraction["operation_type"] == "position_update"
 
 

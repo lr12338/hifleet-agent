@@ -53,6 +53,12 @@ class LLMConfigRequest(BaseModel):
     multimodal_model: str = Field(min_length=1)
     thinking_type: Literal['enabled', 'disabled'] = 'enabled'
     reasoning_effort: Literal['minimal', 'low', 'medium', 'high'] = 'medium'
+    text_thinking_type: Literal['enabled', 'disabled'] | None = None
+    multimodal_thinking_type: Literal['enabled', 'disabled'] | None = None
+    customer_support_json_thinking_type: Literal['enabled', 'disabled'] | None = None
+    text_model_base_url_env: str | None = None
+    multimodal_model_base_url_env: str | None = None
+    json_model_base_url_env: str | None = None
 
 
 class ChatDebugSessionSaveRequest(BaseModel):

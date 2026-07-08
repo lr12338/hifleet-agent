@@ -48,6 +48,297 @@ def _graph(monkeypatch, tools, profile_id="customer_ceshi", run_id="r-ceshi-pend
     )
 
 
+def _prompt_driven_graph(monkeypatch, tools, profile_id="customer_ceshi", run_id="r-ceshi-prompt-driven"):
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None, config=None):
+            return {"messages": list(payload["messages"])}
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: tools)
+    return _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id=run_id),
+        cfg={"config": {"ship_update_subagent_prompt_driven": True}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id=profile_id, skills=["hifleet_ship_service"]),
+    )
+
+
+def test_prompt_driven_subagent_ready_position_calls_upload(monkeypatch):
+    upload = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
+
+    def fake_json_agent(ctx, cfg, system_prompt, payload, model_override=""):
+        assert "ship_update 子 agent" in system_prompt
+        assert payload["tool_contracts"]["upload_ship_position"]["required_tool_args"] == ["mmsi", "lon", "lat", "updatetime"]
+        return {
+            "status": "ready_to_execute",
+            "operation_type": "position_update",
+            "tool_name": "upload_ship_position",
+            "tool_args": {
+                "mmsi": "730285526",
+                "lon": "121.687167",
+                "lat": "39.006833",
+                "updatetime": "2026-07-04 14:43:00",
+                "draught": "11.2",
+                "status": "系泊",
+            },
+            "missing_fields": [],
+            "pending_action": "none",
+            "reply_to_user": "",
+            "confidence": "high",
+            "evidence_sources": ["current_text"],
+        }
+
+    monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", fake_json_agent)
+    graph = _prompt_driven_graph(monkeypatch, [upload])
+
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="更新船位")], "session_id": "s-prompt-position", "agent_profile": "customer_ceshi"},
+        config={"configurable": {"thread_id": "s-prompt-position"}},
+    )
+
+    assert result["generated_tool_calls"] == ["upload_ship_position"]
+    assert upload.calls == [
+        {
+            "mmsi": "730285526",
+            "lon": "121.687167",
+            "lat": "39.006833",
+            "updatetime": "2026-07-04 14:43:00",
+            "draft": "11.2",
+            "navstatus": "系泊",
+        }
+    ]
+    assert result["route_trace"]["ship_update_subagent"]["source"] == "llm_subagent"
+
+
+def test_prompt_driven_subagent_ready_static_calls_update(monkeypatch):
+    static_update = FakeTool("update_ship_static_info", lambda args: "静态信息更新成功！")
+
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "status": "ready_to_execute",
+            "operation_type": "static_update",
+            "tool_name": "update_ship_static_info",
+            "tool_args": {
+                "mmsi": "730285526",
+                "name": "QING FENG LING",
+                "imonumber": "9663702",
+                "type": "散货船",
+                "buildyear": "2018",
+                "draught": "9.5",
+                "destination": "PIRAEUS",
+            },
+            "missing_fields": [],
+            "pending_action": "none",
+            "reply_to_user": "",
+            "confidence": "high",
+            "evidence_sources": ["current_text"],
+        },
+    )
+    graph = _prompt_driven_graph(monkeypatch, [static_update])
+
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="更新目的港，MMSI 730285526，PIRAEUS")], "session_id": "s-prompt-static", "agent_profile": "customer_ceshi"},
+        config={"configurable": {"thread_id": "s-prompt-static"}},
+    )
+
+    assert result["generated_tool_calls"] == ["update_ship_static_info"]
+    assert static_update.calls == [
+        {
+            "mmsi": "730285526",
+            "ship_name": "QING FENG LING",
+            "imo": "9663702",
+            "ship_type": "散货船",
+            "built_year": "2018",
+            "draft": "9.5",
+            "destination": "PIRAEUS",
+        }
+    ]
+
+
+def test_prompt_driven_subagent_blocks_invalid_tool(monkeypatch):
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "status": "ready_to_execute",
+            "operation_type": "position_update",
+            "tool_name": "delete_ship",
+            "tool_args": {"mmsi": "730285526"},
+            "confidence": "high",
+        },
+    )
+    graph = _prompt_driven_graph(monkeypatch, [upload])
+
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="更新船位")], "session_id": "s-prompt-invalid-tool", "agent_profile": "customer_ceshi"},
+        config={"configurable": {"thread_id": "s-prompt-invalid-tool"}},
+    )
+
+    assert upload.calls == []
+    assert result["generated_tool_calls"] == []
+    assert result["route_trace"]["ship_update_subagent"]["status"] == "error"
+    assert "不允许的写入工具" in result["messages"][-1].content
+
+
+def test_prompt_driven_subagent_need_user_input_saves_pending(monkeypatch):
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    pending = {
+        "active": True,
+        "operation_type": "position_update",
+        "status": "awaiting_ship_identity",
+        "source_turn_id": "r-ceshi-prompt-driven",
+        "expires_after_turns": 5,
+        "turns_elapsed": 0,
+        "ship_identity": {"mmsi": "", "imo": "", "name": "", "candidate_mmsi": []},
+        "extracted_fields": {"lon": "121.687167", "lat": "39.006833", "updatetime": "2026-07-04 14:43:00"},
+        "missing_required_fields": ["MMSI"],
+        "invalid_fields": [],
+        "conflict_fields": [],
+        "last_question_to_user": "请补充 MMSI。",
+        "confirmation_required": False,
+        "can_resume": True,
+    }
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "status": "need_user_input",
+            "operation_type": "position_update",
+            "tool_name": None,
+            "tool_args": {},
+            "missing_fields": ["MMSI"],
+            "pending_action": "create",
+            "pending_update_state": pending,
+            "reply_to_user": "请补充 MMSI。",
+            "confidence": "high",
+            "evidence_sources": ["current_text"],
+        },
+    )
+    graph = _prompt_driven_graph(monkeypatch, [upload])
+
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="更新船位")], "session_id": "s-prompt-need-input", "agent_profile": "customer_ceshi"},
+        config={"configurable": {"thread_id": "s-prompt-need-input"}},
+    )
+
+    assert upload.calls == []
+    assert result["pending_update_state"]["status"] == "awaiting_ship_identity"
+    assert result["messages"][-1].content == "请补充 MMSI。"
+    assert result["ship_update_draft"]["active"] is True
+    assert result["ship_update_draft"]["tool_args"]["lon"] == "121.687167"
+
+
+def test_prompt_driven_non_write_hands_off_to_standard_agent(monkeypatch):
+    upload = FakeTool("upload_ship_position", lambda args: "不应调用")
+    standard_agent = RecordingStandardAgent(response="船位延迟通常与 AIS 接收覆盖、卫星/岸基数据链路、平台同步队列有关。请提供 MMSI 和时间段，我可以继续排查。")
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: standard_agent)
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [upload])
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "status": "non_write",
+            "operation_type": "none",
+            "tool_name": None,
+            "tool_args": {},
+            "missing_fields": [],
+            "draft_action": "none",
+            "ship_update_draft": {},
+            "reply_to_user": "内部分类话术不应直接返回",
+            "confidence": "high",
+            "evidence_sources": ["current_text"],
+        },
+    )
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-ceshi-non-write-handoff"),
+        cfg={"config": {"ship_update_subagent_prompt_driven": True}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_ceshi", skills=["hifleet_ship_service"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="为什么船位延迟这么高")],
+            "pending_update_state": {
+                "active": True,
+                "operation_type": "position_update",
+                "status": "awaiting_ship_identity",
+                "source_turn_id": "previous-turn",
+                "expires_after_turns": 5,
+                "turns_elapsed": 0,
+                "ship_identity": {"mmsi": "", "imo": "", "name": "", "candidate_mmsi": []},
+                "extracted_fields": {"lon": "110.5", "lat": "23.1", "updatetime": "2026-07-08 13:39:00"},
+                "missing_required_fields": ["MMSI"],
+                "invalid_fields": [],
+                "conflict_fields": [],
+                "last_question_to_user": "请补充 MMSI。",
+                "confirmation_required": False,
+                "can_resume": True,
+            },
+            "session_id": "s-ceshi-non-write-handoff",
+            "agent_profile": "customer_ceshi",
+        },
+        config={"configurable": {"thread_id": "s-ceshi-non-write-handoff"}},
+    )
+
+    assert upload.calls == []
+    assert standard_agent.calls
+    assert "内部分类话术" not in result["messages"][-1].content
+    assert "船位延迟" in result["messages"][-1].content
+    assert result["route_trace"]["check_result"]["ship_update_subagent_status"] == "non_write"
+
+
+def test_legacy_flat_pending_migrates_to_draft_and_mmsi_followup_executes(monkeypatch):
+    upload = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
+    standard_agent = RecordingStandardAgent()
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: standard_agent)
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [upload])
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-ceshi-flat-pending"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_ceshi", skills=["hifleet_ship_service"]),
+    )
+    legacy_flat_pending = {
+        "eta": "2026-06-06 14:30 (UTC)",
+        "lat": "23°25.776' N",
+        "lon": "110°32.46' E",
+        "speed": "0",
+        "course": "123",
+        "heading": "122",
+        "navstatus": "机动船在航",
+        "ship_name": "RUN GUI 666",
+        "updatetime": "2026-07-08 13:39:00",
+        "destination": "AONANTONG",
+    }
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="413904458")],
+            "pending_update_state": legacy_flat_pending,
+            "session_id": "s-ceshi-flat-pending",
+            "agent_profile": "customer_ceshi",
+        },
+        config={"configurable": {"thread_id": "s-ceshi-flat-pending"}},
+    )
+
+    assert standard_agent.calls == []
+    assert upload.calls == [
+        {
+            "mmsi": "413904458",
+            "lon": "110°32.46' E",
+            "lat": "23°25.776' N",
+            "updatetime": "2026-07-08 13:39:00",
+            "speed": "0",
+            "heading": "122",
+            "course": "123",
+            "navstatus": "机动船在航",
+            "destination": "AONANTONG",
+            "eta": "2026-06-06 14:30 (UTC)",
+        }
+    ]
+    assert result["ship_update_draft"]["status"] == "executed_success"
+
+
 def test_ambiguous_update_creates_awaiting_operation_pending(monkeypatch):
     upload = FakeTool("upload_ship_position", lambda args: "不应调用")
     graph = _graph(monkeypatch, [upload])
@@ -101,7 +392,7 @@ def test_missing_mmsi_pending_then_followup_mmsi_executes(monkeypatch):
 
 
 @pytest.mark.parametrize("profile_id", ["customer_support", "customer_ceshi"])
-def test_shared_harness_pending_mmsi_followup_same_for_support_and_ceshi(monkeypatch, profile_id):
+def test_ship_update_subagent_pending_mmsi_followup_same_for_support_and_ceshi(monkeypatch, profile_id):
     upload = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
     graph = _graph(monkeypatch, [upload], profile_id=profile_id, run_id=f"r-{profile_id}-shared-pending")
     session_id = f"s-{profile_id}-shared-pending"
@@ -129,7 +420,8 @@ def test_shared_harness_pending_mmsi_followup_same_for_support_and_ceshi(monkeyp
     )
 
     assert second["route_trace"]["pending_used"] is True
-    assert second["route_trace"]["ship_update_gate"]["reason"] == "mmsi_followup"
+    assert second["route_trace"]["ship_update_subagent_gate"]["reason"] == "active_pending_update"
+    assert "active_pending" in second["route_trace"]["ship_update_subagent"]["evidence_sources"]
     assert upload.calls == [
         {
             "mmsi": "375066971",
@@ -210,12 +502,53 @@ def test_single_mmsi_without_pending_does_not_execute_write(monkeypatch):
     assert result["route_trace"]["readable_trace"]["input_summary"]["pending_used"] is False
 
 
-def test_mmsi_confirmation_pending_uses_current_pending_fields_not_history(monkeypatch):
-    upload = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
-    search = FakeTool("ship_search", lambda args: "AOSHI\nMMSI: 308068077 | IMO: 1234567")
+def test_static_destination_error_pending_then_destination_followup_executes(monkeypatch):
+    static_update = FakeTool("update_ship_static_info", lambda args: "静态信息更新成功！")
     standard_agent = RecordingStandardAgent()
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: standard_agent)
-    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [search, upload])
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [static_update])
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-ceshi-static-destination-pending"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_ceshi", skills=["hifleet_ship_service"]),
+    )
+    thread_config = {"configurable": {"thread_id": "s-ceshi-static-destination-pending"}}
+
+    first = graph.invoke(
+        {
+            "messages": [HumanMessage(content="636018167 船舶目的港错误")],
+            "session_id": "s-ceshi-static-destination-pending",
+            "agent_profile": "customer_ceshi",
+        },
+        config=thread_config,
+    )
+
+    assert static_update.calls == []
+    assert first["pending_update_state"]["operation_type"] == "static_update"
+    assert first["pending_update_state"]["status"] == "awaiting_required_fields"
+
+    second = graph.invoke(
+        {
+            "messages": [HumanMessage(content="正确的目的港信息 PIRAEUS")],
+            "session_id": "s-ceshi-static-destination-pending",
+            "agent_profile": "customer_ceshi",
+        },
+        config=thread_config,
+    )
+
+    assert standard_agent.calls == []
+    assert static_update.calls == [{"mmsi": "636018167", "destination": "PIRAEUS"}]
+    assert second["generated_tool_calls"] == ["update_ship_static_info"]
+    assert second["check_result"]["current_run_tool_success"] is True
+    assert second["messages"][-1].content == "静态信息更新成功！"
+
+
+def test_ship_name_pending_followup_mmsi_uses_current_pending_fields_not_history(monkeypatch):
+    upload = FakeTool("upload_ship_position", lambda args: "船位更新成功！")
+    standard_agent = RecordingStandardAgent()
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: standard_agent)
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [upload])
     graph = _build_lightweight_customer_support_agent(
         ctx=SimpleNamespace(run_id="r-ceshi-confirm-pending"),
         cfg={"config": {}},
@@ -241,8 +574,7 @@ def test_mmsi_confirmation_pending_uses_current_pending_fields_not_history(monke
     )
 
     assert upload.calls == []
-    assert first["pending_update_state"]["status"] == "awaiting_mmsi_confirmation"
-    assert first["pending_update_state"]["ship_identity"]["mmsi"] == "308068077"
+    assert first["pending_update_state"]["status"] == "awaiting_ship_identity"
 
     second = graph.invoke(
         {
@@ -256,7 +588,7 @@ def test_mmsi_confirmation_pending_uses_current_pending_fields_not_history(monke
                         "航行状态: 失控\n更新时间: 2026-07-06 14:34:00"
                     )
                 ),
-                HumanMessage(content="确认更新"),
+                HumanMessage(content="308068077"),
             ],
             "session_id": "s-ceshi-confirm-pending",
             "agent_profile": "customer_ceshi",
@@ -267,7 +599,8 @@ def test_mmsi_confirmation_pending_uses_current_pending_fields_not_history(monke
     assert standard_agent.calls == []
     assert second["route_trace"]["route"] == "ship_update"
     assert second["route_trace"]["pending_used"] is True
-    assert second["route_trace"]["ship_update_gate"]["reason"] == "active_pending_confirmation"
+    assert second["route_trace"]["ship_update_subagent_gate"]["reason"] == "active_pending_update"
+    assert "active_pending" in second["route_trace"]["ship_update_subagent"]["evidence_sources"]
     assert upload.calls
     assert upload.calls[0]["mmsi"] == "308068077"
     assert upload.calls[0]["lon"] == "118°3.185' E"
@@ -298,8 +631,11 @@ def test_confirm_update_without_pending_does_not_execute_write(monkeypatch):
     )
 
     assert upload.calls == []
-    assert standard_agent.calls
-    assert result["route_trace"]["ship_update_gate"]["should_run_harness"] is False
+    assert standard_agent.calls == []
+    assert result["route_trace"]["ship_update_gate"]["should_run_harness"] is True
+    assert result["route_trace"]["ship_update_subagent_gate"]["should_run_subagent"] is True
+    assert result["route_trace"]["ship_update_subagent_gate"]["reason"] == "possible_ship_update_followup"
+    assert result["route_trace"]["ship_update_subagent"]["status"] == "need_user_input"
     assert result["route_trace"]["pending_used"] is False
     assert "更新成功" not in result["messages"][-1].content
 
@@ -353,7 +689,8 @@ def test_field_confirmation_pending_resume_executes_current_pending_fields(monke
     assert standard_agent.calls == []
     assert result["route_trace"]["route"] == "ship_update"
     assert result["route_trace"]["pending_used"] is True
-    assert result["route_trace"]["ship_update_gate"]["reason"] == "active_pending_field_confirmation"
+    assert result["route_trace"]["ship_update_subagent_gate"]["reason"] == "active_pending_update"
+    assert "active_pending" in result["route_trace"]["ship_update_subagent"]["evidence_sources"]
     assert upload.calls == [
         {
             "mmsi": "477167800",
@@ -368,7 +705,7 @@ def test_field_confirmation_pending_resume_executes_current_pending_fields(monke
     ]
 
 
-def test_first_step_ship_update_understanding_forces_harness(monkeypatch):
+def test_first_step_ship_update_understanding_forces_subagent(monkeypatch):
     upload = FakeTool("upload_ship_position", lambda args: "不应调用")
     standard_agent = RecordingStandardAgent()
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: standard_agent)

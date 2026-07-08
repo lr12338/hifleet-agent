@@ -130,6 +130,17 @@ def update_llm_config(req: LLMConfigRequest) -> dict[str, Any]:
     cfg['config']['reasoning_effort'] = req.reasoning_effort
     cfg['config']['deep_thinking_enabled'] = req.thinking_type != 'disabled'
     cfg['config']['model'] = cfg['config']['text_model']
+    for key in (
+        'text_thinking_type',
+        'multimodal_thinking_type',
+        'customer_support_json_thinking_type',
+        'text_model_base_url_env',
+        'multimodal_model_base_url_env',
+        'json_model_base_url_env',
+    ):
+        value = getattr(req, key, None)
+        if value is not None:
+            cfg['config'][key] = str(value).strip()
     normalized = save_llm_config(cfg)
     return export_llm_config_view(normalized)
 

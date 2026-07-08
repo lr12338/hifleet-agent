@@ -10,29 +10,29 @@
 preprocess -> delegate standard skills agent -> finalize
 ```
 
-其中 ship_update 是轻量 graph 的确定性特殊分支：
+其中 ship_update 是轻量 graph 的 prompt-driven 子 agent 特殊分支：
 
 ```text
-preprocess -> multimodal perception -> write_preflight_guard -> ship_update parse/validate/execute -> finalize
+preprocess -> multimodal perception -> ship_update subagent -> tool whitelist -> execute or standard-agent handoff -> finalize
 ```
 
 回归重点：
 
 1. 前置安全拦截。
 2. 文本、语音、图片、视频当前轮多模态 direct perception。
-3. `doubao-seed-2-0-lite-260428` 默认模型与 `thinking_type=enabled`、`reasoning_effort=medium`。
+3. 文本模型 `deepseek-v4-flash-260425`、多模态模型 `doubao-seed-2-0-lite-260428` 与 `thinking_type=enabled`、`reasoning_effort=medium`。
 4. 模型自主调用 `knowledge_qa`、`browser_verify`、`hifleet_ship_service`、`multimodal_support`。
 5. `knowledge_qa` 按 `local_kb_search -> web_search -> web_search_agent_browser` 顺序受控升级。
 6. 平台操作/问题反馈类问题的多关键词检索和证据充分性复核。
 7. 授权知识库维护 `knowledge_admin.upsert_local_kb_entry`。
 8. HiFleet 官方社区、帮助中心、官网公开页面核验。
 9. 船舶查询、档案、PSC、轨迹、挂靠、统计、船位上传、静态信息更新。
-10. 船舶写操作的 `CustomerUnderstanding` 结构化识别、显式意图和必填字段保护。
+10. 船舶写操作的 `ship_update` 子 agent 结构化计划、`ship_update_draft`、显式意图和必填字段保护。
 11. 多轮上下文与最近船舶实体记忆。
 12. 最终输出脱敏、链接抽取和 `output_assets`。
 13. `/run`、`/stream_run` 和微信旧 `content.query.prompt` 兼容。
 
-旧 `customer_support_router.py`、旧 planner/review/harness 和旧 `_build_customer_support_agent()` 不再承载当前 customer 的通用知识主链，但 ship_update 写请求仍会在 `write_preflight_guard` 分支中进入 `customer_support_router.py` 的受控执行链。
+旧 `customer_support_router.py`、旧 planner/review/harness 和旧 `_build_customer_support_agent()` 不再承载当前 customer 的通用知识主链。ship_update 写请求当前由 `ship_update` 子 agent 生成结构化计划，主链路只负责工具白名单、真实工具调用、工具结果判定和 trace。
 
 Profile 选择只看请求体 `agent_profile` 或请求头 `x-agent-profile`；`source_channel` 只用于日志和后台筛选，不参与运行时 Profile 判断。未传合法 Profile 时默认 `customer_support`。
 
@@ -85,10 +85,10 @@ npm run build
 如果是 ship_update 写请求，验收还应满足：
 
 1. `route_trace.route` 可为 `ship_update`。
-2. `route_trace.reasoning_trace.route_source` 应为 `write_preflight_guard`。
-3. `reasoning_trace.understanding_result.operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason` 应能解释入口是否进入 harness。
-4. `instruction_text`、`parsed_dynamic_fields`、`field_sources`、`resolved_identifier`、`write_args`、`missing_required_fields` 应足以解释是否真正进入写工具。
-5. 缺字段拦截时 `generated_tool_calls=[]`，不得委托标准 agent 补写。
+2. `route_trace.reasoning_trace.ship_update_subagent.status` 应能解释执行、追问、取消、错误或 non-write handoff。
+3. `reasoning_trace.understanding_result.operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason` 只作为 hint，不是最终写入许可。
+4. `ship_update_draft`、`write_args`、`missing_required_fields` 应足以解释是否真正进入写工具。
+5. 缺字段拦截时 `generated_tool_calls=[]`；`non_write` 应交回 standard agent 排障/知识回答，不得调用写工具。
 
 ## 4. 当前重点验收场景
 
