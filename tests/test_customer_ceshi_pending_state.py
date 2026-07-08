@@ -200,7 +200,7 @@ def test_prompt_driven_subagent_normalizes_position_tool_args(monkeypatch):
             "draft": "1.6",
             "navstatus": "系泊",
             "destination": "HUKOU",
-            "eta": "2026-07-06 18:30 (UTC)",
+            "eta": "2026-07-06 18:30:00",
         }
     ]
 
@@ -501,7 +501,7 @@ def test_legacy_flat_pending_migrates_to_draft_and_mmsi_followup_executes(monkey
             "course": "123",
             "navstatus": "机动船在航",
             "destination": "AONANTONG",
-            "eta": "2026-06-06 14:30 (UTC)",
+            "eta": "2026-06-06 14:30:00",
         }
     ]
     assert result["ship_update_draft"]["status"] == "executed_success"

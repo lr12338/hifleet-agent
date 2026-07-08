@@ -100,11 +100,35 @@ flowchart LR
 | `116°19.746′ E` | `116.3291` |
 | `29°49.007′ N` | `29.816783` |
 | `2026-07-08 15:37 (UTC+8)` | `2026-07-08 15:37:00` |
+| `2026-07-06 18:30 (UTC)` | `2026-07-06 18:30:00` |
 | `0 kn` | `0` |
 | `163°` | `163` |
 | `1.6 m` | `1.6` |
 
 如果 LLM 子 agent 同时返回 `normalized_fields.lon_dec / lat_dec`，主链路会保留这些值进入 trace，并把最终 `tool_args.lon / lat` 归一成十进制度。这样可避免日志中“已识别 decimal，但实际工具仍收到原始 OCR 字符串”的问题。
+
+ETA 是可选字段。若 ETA 只识别到 `2026-` 等残缺值或无法归一成日期时间，应从 `tool_args` 中丢弃，不阻断船位核心字段更新。
+
+完整船位工具参数示例：
+
+```json
+{
+  "mmsi": "353738000",
+  "lon": "122",
+  "lat": "31",
+  "updatetime": "2025-03-31 09:52:13",
+  "speed": "7.1",
+  "heading": "135.0",
+  "course": "254.1",
+  "draft": "4.2",
+  "destination": "DA LIAN",
+  "eta": "2025-03-27 14:00:00",
+  "navstatus": "机动船在航",
+  "ship_name": "LEO I"
+}
+```
+
+对应 API body 由工具内部映射生成，其中 `draft -> draught`、`navstatus -> status`、`mmsi -> name + mmsi`。
 
 ## 4. ship_update_draft
 
@@ -158,6 +182,7 @@ flowchart LR
 - `船艏/航迹向: A / B` 必须解析为 `heading=A`、`course=B`。
 - 航速、船首向、航迹向、吃水可接受带单位或度数符号输入，例如 `0 kn`、`163°`、`1.6 m`，执行前必须转换成纯数值字符串。
 - 经纬度最终传给工具时优先为十进制度；工具层仍保留度分格式兜底转换能力。
+- ETA 最终按 `yyyy-MM-dd HH:mm:ss` 传给工具；带 `(UTC)` 的展示文本会被清理，残缺 ETA 作为可选字段丢弃。
 
 目的港/ETA 占位符清洗：
 
@@ -199,6 +224,28 @@ flowchart LR
 - `ship_type` 映射 API 字段 `type`，`minotype` 映射 API 字段 `minotype`。
 - 两者字段值必须一致，例如 `ship_type="散货船"`、`minotype="散货船"`。
 - 如果子 agent 只输出其中一个字段，执行前会自动补齐另一字段；如果二者同时存在但值不一致，工具层拒绝执行。
+
+完整静态信息工具参数示例：
+
+```json
+{
+  "mmsi": "100000278",
+  "ship_name": "CESHI",
+  "imo": "0",
+  "callsign": "0",
+  "ship_type": "散货船",
+  "minotype": "散货船",
+  "width": "12.3",
+  "length": "30.5",
+  "dwt": "12000",
+  "built_year": "2018",
+  "destination": "EE SLM",
+  "eta": "2021-05-22 00:00:00",
+  "draft": "1.0"
+}
+```
+
+对应 API body 由工具内部映射生成，其中 `ship_name -> name`、`imo -> imonumber`、`ship_type -> type`、`built_year -> buildyear`、`draft -> draught`。
 
 ## 6. 非写入咨询
 

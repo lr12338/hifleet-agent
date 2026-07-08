@@ -103,6 +103,23 @@ def _sync_static_ship_type_fields(ship_type: str, minotype: str) -> tuple[str, s
     unified = ship_type_value or minotype_value
     return unified, unified, ""
 
+
+def _normalize_optional_eta_value(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"\([^)]*\)", "", raw).strip()
+    cleaned = re.sub(r"（[^）]*）", "", cleaned).strip()
+    cleaned = cleaned.replace("/", "-").replace("T", " ").replace("：", ":")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    match = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2})(?::?(\d{2})(?::(\d{1,2}))?)?)?", cleaned)
+    if not match:
+        return ""
+    hour = int(match.group(4) or 0)
+    minute = int(match.group(5) or 0)
+    second = int(match.group(6) or 0)
+    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d} {hour:02d}:{minute:02d}:{second:02d}"
+
 # 将 scripts/ 目录加入 sys.path，以便直接 import
 _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 if _SCRIPTS_DIR not in sys.path:
@@ -1133,7 +1150,9 @@ def upload_ship_position(mmsi: str, lon: str = "", lat: str = "",
         if destination:
             data["destination"] = destination
         if eta:
-            data["eta"] = eta
+            normalized_eta = _normalize_optional_eta_value(eta)
+            if normalized_eta:
+                data["eta"] = normalized_eta
         if draft:
             try:
                 data["draught"] = float(draft)  # API文档字段名为 draught
@@ -1324,7 +1343,7 @@ def update_ship_static_info(mmsi: str, ship_name: str = "", imo: str = "",
             "flag": flag,
             "callsign": callsign,
             "destination": destination,
-            "eta": eta,
+            "eta": _normalize_optional_eta_value(eta),
             "wechatgroup": wechatgroup,  # wechatgroup 与API一致
         }
         for api_key, val in str_field_map.items():

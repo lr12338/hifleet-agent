@@ -156,6 +156,7 @@ ship_update 当前规则：
 - 静态更新最终工具参数使用 `mmsi / ship_name / imo / callsign / ship_type / minotype / width / length / dwt / built_year / destination / eta / draft`。
 - 代码层只做硬边界格式化，不重新判断业务意图：`draught -> draft`、`status -> navstatus`、`name -> ship_name`、`imonumber -> imo`、`type -> ship_type`、`buildyear -> built_year`。
 - 经纬度优先转成十进制度；`2026-07-08 15:37 (UTC+8)` 归一为 `2026-07-08 15:37:00`；`0 kn / 163° / 1.6 m` 归一为纯数值字符串。
+- ETA 是可选航次字段，带 `(UTC)` 的值会归一为 `yyyy-MM-dd HH:mm:ss`；残缺或无法解析的 ETA 会被丢弃，不阻断船位核心字段写入。
 - 更新船舶类型时，`ship_type` 和 `minotype` 必须同时传且值一致；工具层会拒绝二者不一致的静态更新。
 
 ### 3.3 delegate

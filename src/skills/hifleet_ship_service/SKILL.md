@@ -116,6 +116,8 @@ metadata:
 2. 经纬度格式转换（度分秒 → 十进制度），工具内部自动处理
 3. 需要唯一 MMSI；若仅有 IMO，先执行 Workflow 1 搜索，唯一匹配后可继续更新；若仅有船名，先执行 Workflow 1 搜索候选，即使唯一匹配也要请用户确认 MMSI 后再更新，多候选或无匹配时要求用户确认 MMSI
 4. 调用 `upload_ship_position` 工具，参数：mmsi="414726000" lon="116.875" lat="22.125" updatetime="2026-06-30 10:16:00"，可选传 speed/heading/course/draft/navstatus/destination/eta
+   - 工具参数不是 API body：`draft` 映射 API `draught`，`navstatus` 映射 API `status`，`mmsi` 会同时作为 API `name` 和 `mmsi`
+   - 完整示例：mmsi="353738000" lon="122" lat="31" updatetime="2025-03-31 09:52:13" speed="7.1" heading="135.0" course="254.1" draft="4.2" destination="DA LIAN" eta="2025-03-27 14:00:00" navstatus="机动船在航" ship_name="LEO I"
 5. 返回上传结果
 6. 仅当本轮输入字段完整且船舶标识明确时直接执行；不得用历史 MMSI 或当前系统时间补值
 
@@ -125,6 +127,8 @@ metadata:
 2. 需要 MMSI（若仅有船名，先执行 Workflow 1）
 3. 调用 `update_ship_static_info` 工具，参数：mmsi="636025653" destination="LUOYUAN" eta="2026-05-09 20:00:00"
    - 更新船舶类型时必须同时传 `ship_type` 和 `minotype`，且值一致，例如：mmsi="730285526" ship_type="散货船" minotype="散货船"
+   - 工具参数不是 API body：`ship_name` 映射 API `name`，`imo` 映射 `imonumber`，`ship_type` 映射 `type`，`built_year` 映射 `buildyear`，`draft` 映射 `draught`
+   - 完整示例：mmsi="100000278" ship_name="CESHI" imo="0" callsign="0" ship_type="散货船" minotype="散货船" width="12.3" length="30.5" dwt="12000" built_year="2018" destination="EE SLM" eta="2021-05-22 00:00:00" draft="1.0"
 4. 返回更新结果。成功时返回格式包含“静态信息更新成功”、MMSI、HiFleet 微信验证链接、更新参数明细和“数据同步：预计 5 分钟内生效”
 5. **直接执行无需确认**
 
@@ -154,6 +158,7 @@ metadata:
 - **海峡通航**：无需 api_key 也可查询，但仅限近 1 周数据
 - **更新操作**：仅更新用户当前请求或当前附件明确提供的参数，不设置默认值
 - **更新缺失数据**：船位上传缺少可唯一解析的船舶标识、经度、纬度、更新时间任一项时，提示用户补充
+- **ETA 规则**：ETA 是可选字段，最终格式建议为 `yyyy-MM-dd HH:mm:ss`；展示文本中的 `(UTC)` 会被清理，残缺或无法解析的 ETA 不应阻断船位核心字段更新
 - **船舶类型更新规则**：静态信息中 `ship_type` 映射 API `type`，`minotype` 映射 API `minotype`；更新船型/船舶类型时两者必须同时更新且字段值一致
 - **船名更新规则**：用户只给船名时必须先搜索候选船舶；即使唯一匹配，也要返回船名/MMSI/IMO 请用户确认后再更新；无匹配或多候选时要求用户确认 MMSI，不按中文名/简称/船队名前缀猜测更新
 - **写操作规则**：仅在本轮字段完整且目标船舶明确时执行；不得默认复用历史 MMSI，不得编造更新时间或状态修正结论

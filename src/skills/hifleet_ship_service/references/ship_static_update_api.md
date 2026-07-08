@@ -19,21 +19,21 @@
 
 | API字段名 | 必选 | 类型 | 说明 |
 |-----------|------|------|------|
-| mmsi | 是 | string | 船舶 MMSI |
+| mmsi | 是 | string | 船舶 MMSI，例如 `"100000278"` |
 | bindCheck | 是 | string | 是否检查绑定微信，"0"=不检查，"1"=检查。建议传"0" |
-| name | 否 | string | 船名（必须为英文船名）|
-| imonumber | 否 | string | IMO 编号 |
-| callsign | 否 | string | 呼号 |
-| type | 否 | string | 船型描述（如"散货船"、"渔船"）|
-| minotype | 否 | string | 船舶子类型（船舶详情显示的是该字段）|
-| width | 否 | string | **船宽**（米）⚠️ API文档描述误写为"船长"，实际为船宽 |
-| length | 否 | string | **船长**（米）⚠️ API文档描述误写为"船宽"，实际为船长 |
-| dwt | 否 | string | 载重吨 |
-| buildyear | 否 | string | 建造年份，格式 yyyy |
+| name | 否 | string | 船名，必须为英文船名，例如 `"CESHI"` |
+| imonumber | 否 | string | IMO 编号，例如 `"0"` |
+| callsign | 否 | string | 呼号，例如 `"0"` |
+| type | 否 | string | 船型描述，例如 `"散货船"`、`"渔船"` |
+| minotype | 否 | string | 船舶子类型；更新船型时必须同 `type`，例如 `"散货船"` |
+| width | 否 | string | **船宽**（米），例如 `"12.3"`。API文档描述误写为"船长"，实际为船宽 |
+| length | 否 | string | **船长**（米），例如 `"30.5"`。API文档描述误写为"船宽"，实际为船长 |
+| dwt | 否 | string | 载重吨，例如 `"12000"` |
+| buildyear | 否 | string | 建造年份，格式 `yyyy`，例如 `"2018"` |
 | wechatgroup | 否 | string | 分组ID，控制权限用，可为空 |
-| destination | 否 | string | 目的港 |
-| eta | 否 | string | 预抵时间 |
-| draught | 否 | double | 吃水（米）|
+| destination | 否 | string | 目的港，例如 `"EE SLM"` |
+| eta | 否 | string | 预抵时间，例如 `"2021-05-22 00:00:00"` |
+| draught | 否 | double | 吃水（米），例如 `"1.0"` |
 
 > ⚠️ **字段名映射是关键**：工具参数名必须映射到API字段名，否则API不识别该字段，静默丢弃。
 > ⚠️ **width/length 描述勘误**：API官方文档中 width 标注为"船长"、length 标注为"船宽"，这是描述错误。根据标准海事惯例和请求示例验证（width=12.3, length=30.5），实际含义为 width=船宽、length=船长。
@@ -62,6 +62,8 @@
 
 ## 工具参数名 → API字段名映射
 
+Agent / skill 调用工具时必须传工具参数，不直接传 API body。工具内部负责字段映射、`bindCheck=0` 和成功回复格式。
+
 | 工具参数名 | → API字段名 | 说明 |
 |-----------|------------|------|
 | ship_name | name | 船名（英文）|
@@ -78,6 +80,36 @@
 | length | length | 船长 |
 | dwt | dwt | 载重吨 |
 | flag | flag | 船旗国（API文档未列出但实测可用）|
+
+### 工具调用参数示例
+
+```json
+{
+  "mmsi": "100000278",
+  "ship_name": "CESHI",
+  "imo": "0",
+  "callsign": "0",
+  "ship_type": "散货船",
+  "minotype": "散货船",
+  "width": "12.3",
+  "length": "30.5",
+  "dwt": "12000",
+  "built_year": "2018",
+  "destination": "EE SLM",
+  "eta": "2021-05-22 00:00:00",
+  "draft": "1.0"
+}
+```
+
+### 解析和格式化规则
+
+- 静态更新必须包含 `mmsi` 和至少一个非 `mmsi` 更新字段。
+- `ship_name` 必须是英文船名；中文船名、简称或船队名前缀不能猜测写入。
+- 更新船型/船舶类型时必须同时传 `ship_type` 和 `minotype`，且二者值一致；只提供其中一个时工具层会自动补齐，二者不一致时拒绝执行。
+- `width` 是船宽，`length` 是船长；不要按旧 API 文档的错误描述反向映射。
+- `built_year` 必须是 4 位年份。
+- `eta` 建议归一为 `yyyy-MM-dd HH:mm:ss`；无法归一的 ETA 作为可选字段丢弃。
+- `目的港/ETA: -- / --`、`/ETA`、`ETA`、`N/A`、`未知` 等占位符表示未提供，不传 `destination/eta`。
 
 ## 成功响应
 

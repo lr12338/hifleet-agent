@@ -128,6 +128,49 @@ def test_upload_ship_position_success_uses_only_submitted_time_and_fields(monkey
     assert fake_upload.calls[0][0]["status"] == "在航"
 
 
+def test_upload_ship_position_normalizes_optional_eta(monkeypatch):
+    fake_upload = FakeUploadPosition()
+    monkeypatch.setattr(ship_tools, "_ensure_imports", lambda: None)
+    monkeypatch.setattr(ship_tools, "_coord_utils", FakeCoordUtils)
+    monkeypatch.setattr(ship_tools, "_upload_position", fake_upload)
+    monkeypatch.setattr(ship_tools, "_ttse_key", lambda: "")
+
+    output = ship_tools.upload_ship_position.invoke(
+        {
+            "mmsi": "413994561",
+            "lon": "116.3291",
+            "lat": "29.816783",
+            "updatetime": "2026-07-08 16:18:00",
+            "destination": "HUKOU",
+            "eta": "2026-07-06 18:30 (UTC)",
+        }
+    )
+
+    assert "船位更新成功" in output
+    assert fake_upload.calls[0][0]["eta"] == "2026-07-06 18:30:00"
+
+
+def test_upload_ship_position_drops_invalid_optional_eta(monkeypatch):
+    fake_upload = FakeUploadPosition()
+    monkeypatch.setattr(ship_tools, "_ensure_imports", lambda: None)
+    monkeypatch.setattr(ship_tools, "_coord_utils", FakeCoordUtils)
+    monkeypatch.setattr(ship_tools, "_upload_position", fake_upload)
+    monkeypatch.setattr(ship_tools, "_ttse_key", lambda: "")
+
+    ship_tools.upload_ship_position.invoke(
+        {
+            "mmsi": "413994561",
+            "lon": "116.3291",
+            "lat": "29.816783",
+            "updatetime": "2026-07-08 16:18:00",
+            "destination": "HUKOU",
+            "eta": "2026-",
+        }
+    )
+
+    assert "eta" not in fake_upload.calls[0][0]
+
+
 def test_update_ship_static_info_success_returns_verification_link_and_fields(monkeypatch):
     fake_static = FakeUpdateStaticInfo()
     monkeypatch.setattr(ship_tools, "_ensure_imports", lambda: None)
@@ -153,12 +196,13 @@ def test_update_ship_static_info_success_returns_verification_link_and_fields(mo
     assert "船名: TEST SHIP" in output
     assert "IMO: 9876543" in output
     assert "目的港: HUI ZHOU" in output
-    assert "ETA: 2026-07-11 20:00" in output
+    assert "ETA: 2026-07-11 20:00:00" in output
     assert "吃水: 7.9 米" in output
     assert "数据同步：预计 5 分钟内生效" in output
     assert "更新字段:" not in output
     assert fake_static.calls[0][0]["mmsi"] == "414402130"
     assert fake_static.calls[0][0]["destination"] == "HUI ZHOU"
+    assert fake_static.calls[0][0]["eta"] == "2026-07-11 20:00:00"
     assert fake_static.calls[0][0]["draught"] == 7.9
 
 

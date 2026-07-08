@@ -89,7 +89,7 @@ npm run build
 3. `reasoning_trace.understanding_result.operation_type`、`ship_update_candidate`、`pending_action`、`non_write_reason` 只作为 hint，不是最终写入许可。
 4. `ship_update_draft`、`write_args`、`missing_required_fields` 应足以解释是否真正进入写工具。
 5. `write_args` 必须是 skills 工具参数格式，而不是 API body：动态更新用 `draft/navstatus`，静态更新用 `ship_name/imo/ship_type/built_year/draft`。
-6. 经纬度、时间和带单位数值必须在执行前格式化：度分坐标转十进制度，时间补齐到 `yyyy-MM-dd HH:mm:ss`，`0 kn / 163° / 1.6 m` 转纯数值。
+6. 经纬度、时间和带单位数值必须在执行前格式化：度分坐标转十进制度，时间补齐到 `yyyy-MM-dd HH:mm:ss`，`0 kn / 163° / 1.6 m` 转纯数值，ETA 中的 `(UTC)` 清理为标准时间。
 7. 缺字段拦截时 `generated_tool_calls=[]`；`non_write` 应交回 standard agent 排障/知识回答，不得调用写工具。
 
 ## 4. 当前重点验收场景
@@ -142,6 +142,7 @@ npm run build
 - 动态更新缺 `mmsi / lon / lat / updatetime` 任一项时，必须在解析层直接返回缺字段提示，`generated_tool_calls=[]`。
 - 动态更新中 `船艏/航迹向: A / B` 必须解析为 `heading=A`、`course=B`，不得把二者当作同一字段冲突。
 - 动态更新中 `目的港/ETA: -- / --`、`/ETA`、`ETA` 等占位符不得进入 draft、`write_args` 或最终成功回复。
+- 动态更新中残缺 ETA 不应导致写入失败；无法归一的 ETA 作为可选字段丢弃。
 - 静态更新船型/船舶类型时，必须同时传 `ship_type` 与 `minotype` 且值一致。
 - 缺少 MMSI、经纬度、更新时间或静态字段等必要信息时，只追问一个最关键字段。
 - 工具未返回成功时，不得宣称已更新成功。

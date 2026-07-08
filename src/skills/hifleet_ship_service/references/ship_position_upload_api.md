@@ -19,17 +19,17 @@
 
 | API字段名 | 必选 | 类型 | 说明 |
 |-----------|------|------|------|
-| name | 是 | string | 船名或MMSI（通常传MMSI）|
-| mmsi | 否 | string | 船舶MMSI |
-| lon | 是 | float | 经度（十进制度）|
-| lat | 是 | float | 纬度（十进制度）|
-| updatetime | 是 | string | 更新时间，格式 yyyy-MM-dd HH:mm:ss |
-| speed | 否 | float | 航速（节）|
-| heading | 否 | float | 船首向（度）|
-| course | 否 | float | 航迹向（度）|
-| draught | 否 | float | 吃水（米）|
-| destination | 否 | string | 目的港 |
-| eta | 否 | string | 预抵时间 |
+| name | 是 | string | 船名或 MMSI，通常传 MMSI，例如 `"LEO I"` 或 `"353738000"` |
+| mmsi | 否 | string | 船舶 MMSI，例如 `"353738000"` |
+| lon | 是 | float | 经度，十进制度，例如 `122` |
+| lat | 是 | float | 纬度，十进制度，例如 `31` |
+| updatetime | 是 | string | 更新时间，格式 `yyyy-MM-dd HH:mm:ss`，例如 `"2025-03-31 09:52:13"` |
+| speed | 否 | float | 航速（节），例如 `7.1` |
+| heading | 否 | float | 船首向（度），例如 `135.0` |
+| course | 否 | float | 航迹向（度），例如 `254.1` |
+| draught | 否 | float | 吃水（米），例如 `4.2` |
+| destination | 否 | string | 目的港，例如 `"DA LIAN"` |
+| eta | 否 | string | 预抵时间，例如 `"2025-03-27 14:00"` |
 | status | 否 | string | 航行状态（中文文本，见下方状态值列表）|
 | wechatgroup | 否 | string | 分组ID，控制权限用 |
 | checkFly | 否 | string | 值为"0"时不做飞点校验，其他做校验 |
@@ -64,6 +64,8 @@
 
 ## 工具参数名 → API字段名映射
 
+Agent / skill 调用工具时必须传工具参数，不直接传 API body。工具内部负责字段映射、经纬度转换和 `checkFly/bindCheck` 默认值。
+
 | 工具参数名 | → API字段名 | 说明 |
 |-----------|------------|------|
 | mmsi | name + mmsi | 同时传name和mmsi字段 |
@@ -79,6 +81,34 @@
 | eta | eta | 预抵时间 |
 | ship_name | name | 船名（如需更新）|
 | wechatgroup | wechatgroup | 微信群组 |
+
+### 工具调用参数示例
+
+```json
+{
+  "mmsi": "353738000",
+  "lon": "122",
+  "lat": "31",
+  "updatetime": "2025-03-31 09:52:13",
+  "speed": "7.1",
+  "heading": "135.0",
+  "course": "254.1",
+  "draft": "4.2",
+  "destination": "DA LIAN",
+  "eta": "2025-03-27 14:00:00",
+  "navstatus": "机动船在航",
+  "ship_name": "LEO I"
+}
+```
+
+### 解析和格式化规则
+
+- `lon/lat` 最终优先使用十进制度；输入为 `116°19.746′ E`、`29°49.007′ N` 时可先解析为 `116.3291`、`29.816783`。
+- `updatetime` 必须来自用户文本或附件，不能用当前系统时间补齐。
+- `speed/heading/course/draft` 可从 `0 kn`、`163°`、`1.6 m` 等展示文本提取数值。
+- `船艏/航迹向: A / B` 解析为 `heading=A`、`course=B`。
+- `eta` 为可选字段，最终建议归一为 `yyyy-MM-dd HH:mm:ss`；无法归一或残缺时丢弃，不阻断船位更新。
+- `目的港/ETA: -- / --`、`/ETA`、`ETA`、`N/A`、`未知` 等占位符表示未提供，不传 `destination/eta`。
 
 ## 成功响应
 
