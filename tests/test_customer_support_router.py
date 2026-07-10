@@ -2160,3 +2160,13 @@ def test_sanitize_customer_output_strips_more_search_noise_and_html_placeholders
     assert "HTMLLINK" not in cleaned
     assert "下载APP" not in cleaned
     assert "继续补充船名" not in cleaned
+
+
+def test_sanitize_customer_output_rewrites_legacy_business_contacts():
+    raw = "如需了解具体费用，可以联系销售团队：电话:13167163653，邮箱:sales@hifleet.com"
+
+    cleaned = sanitize_customer_output(raw)
+
+    assert "400-963-6899" in cleaned
+    assert "13167163653" not in cleaned
+    assert "sales@hifleet.com" not in cleaned

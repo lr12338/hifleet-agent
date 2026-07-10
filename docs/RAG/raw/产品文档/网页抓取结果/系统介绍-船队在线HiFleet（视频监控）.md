@@ -78,7 +78,7 @@ Shanghai Maili Marine Technology Co.,Ltd
 
  地址: 上海市浦东新区沈家弄路738号509室
  邮箱: wuxin@hifleet.com
- 电话: 18838918622
+ 电话: 400-963-6899
  网址: www.hifleet.com
 产品
 船位跟踪

@@ -5,6 +5,7 @@ import re
 from urllib.parse import urlparse
 
 SENSITIVE_REFUSAL = "抱歉，这部分属于系统内部安全信息，不能提供。我可以继续协助您处理 HiFleet 平台使用、船舶查询或业务问题。"
+UNIFIED_HIFLEET_CONTACT = "400-963-6899"
 
 _SENSITIVE_PATTERNS = [
     re.compile(r"\b(?:api[_-]?key|token|secret|password|passwd|hifleet_key\d*)\b", re.IGNORECASE),
@@ -27,6 +28,19 @@ _INTERNAL_TOOL_NAMES = [
     "run_sandboxed_python",
     "inspect_tabular_file",
     "download_public_file_to_artifact",
+]
+
+_LEGACY_BUSINESS_CONTACT_PATTERNS = [
+    re.compile(r"\b13167163653\b"),
+    re.compile(r"\b17717038095\b"),
+    re.compile(r"\b18621816900\b"),
+    re.compile(r"\b13301806207\b"),
+    re.compile(r"\b18021044009\b"),
+    re.compile(r"\b18838918622\b"),
+    re.compile(r"\b18021005038\b"),
+    re.compile(r"\b021-20956899\b"),
+    re.compile(r"\b131\*{2,}3653\b"),
+    re.compile(r"\bsales@hifleet\.com\b", re.IGNORECASE),
 ]
 
 
@@ -65,6 +79,8 @@ def sanitize_customer_output(text: str) -> str:
     value = re.sub(r"(?mi)^.*服务电话:400-963-6899.*$", "", value)
     value = re.sub(r"(?mi)^.*微信:hifleetkhzs.*$", "", value)
     value = re.sub(r"(?mi)^.*微信客服：?hifleetkhzs请用中文回复。?.*$", "微信客服：hifleetkhzs", value)
+    for pattern in _LEGACY_BUSINESS_CONTACT_PATTERNS:
+        value = pattern.sub(UNIFIED_HIFLEET_CONTACT, value)
     for name in _INTERNAL_TOOL_NAMES:
         value = re.sub(re.escape(name), "内部分析", value, flags=re.IGNORECASE)
     value = re.sub(r"SMART_SEARCH_[A-Z0-9_]+", "官方知识检索命中", value)
