@@ -1,5 +1,6 @@
 import sys
 import json
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -39,6 +40,7 @@ from agents.customer_support_router import (
     should_use_ship_context,
     validate_links,
     _generate_knowledge_expansion_query,
+    _merge_knowledge_search_plan,
     _rewrite_hifleet_knowledge_query,
 )
 from agents.customer_support_guard import sanitize_customer_output
@@ -566,6 +568,8 @@ def test_browser_capture_page_text_reuses_one_session(monkeypatch):
 
     def fake_run_agent_browser(*args, timeout=25, session=""):
         calls.append({"args": args, "timeout": timeout, "session": session})
+        if args == ("get", "url"):
+            return "https://www.hifleet.com/"
         if args == ("get", "title"):
             return "标题"
         if args == ("get", "text", "body"):
@@ -593,6 +597,8 @@ def test_browser_capture_page_text_retries_open_once(monkeypatch):
         calls.append({"args": args, "timeout": timeout, "session": session})
         if args == ("open", "https://www.hifleet.com/") and len([call for call in calls if call["args"] == args]) == 1:
             raise RuntimeError("cold start timeout")
+        if args == ("get", "url"):
+            return "https://www.hifleet.com/"
         if args == ("get", "title"):
             return "标题"
         if args == ("get", "text", "body"):
@@ -2223,3 +2229,134 @@ def test_sanitize_customer_output_rewrites_legacy_business_contacts():
     assert "400-963-6899" in cleaned
     assert "13167163653" not in cleaned
     assert "sales@hifleet.com" not in cleaned
+
+
+def test_planned_chain_browser_failure_continues_next_query():
+    calls = []
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps({"tool": "local_kb_search", "can_answer": False, "items": []}, ensure_ascii=False),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: calls.append(args["query"]) or json.dumps(
+            {"tool": "web_search", "query": args["query"], "can_answer": False, "should_continue": True, "continue_with": "agent_browser", "items": [], "best_urls": []},
+            ensure_ascii=False,
+        ),
+    )
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: json.dumps(
+            {"tool": "web_search_agent_browser", "status": "browser_empty_body", "can_answer": False, "pages": [], "trace": {"failure_code": "browser_empty_body", "raw_page_count": 0, "relevant_page_count": 0}},
+            ensure_ascii=False,
+        ),
+    )
+    question = "HiFleet 功能怎么操作"
+    entities = extract_entities(question)
+    decision = classify_message(question, entities)
+    trace = make_trace(decision, entities)
+    trace.reasoning_trace["understanding_result"] = {"evidence_required": True, "query_type": "hifleet_product", "should_limit_to_hifleet_sites": True}
+
+    _, _, summary = execute_planned_knowledge_chain(
+        question,
+        decision,
+        [
+                {"query": "HiFleet 功能入口", "depth": "normal", "hypothesis_id": "H1", "purpose": "入口"},
+                {"query": "HiFleet 权限设置保存", "depth": "normal", "hypothesis_id": "H2", "purpose": "完成条件"},
+        ],
+        {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser},
+        trace,
+    )
+
+    retrieval = trace.reasoning_trace["retrieval_trace"]
+    assert calls[:2] == ["HiFleet 功能入口", "HiFleet 权限设置保存"]
+    assert len(retrieval["query_traces"]) >= 2
+    assert retrieval["t2_attempted"] is True
+    assert retrieval["t2_can_answer"] is False
+    assert summary["confidence"] in {"low", "medium"}
+
+
+def test_three_layer_chain_uses_keyword_browser_fallback_without_urls():
+    local_kb = FakeTool("local_kb_search", lambda args: json.dumps({"tool": "local_kb_search", "can_answer": False, "items": []}, ensure_ascii=False))
+    web_search = FakeTool(
+        "web_search",
+        lambda args: json.dumps({"tool": "web_search", "query": args["query"], "can_answer": False, "should_continue": True, "continue_with": "agent_browser", "items": [], "best_urls": []}, ensure_ascii=False),
+    )
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: json.dumps({"tool": "web_search_agent_browser", "status": "browser_no_candidates", "can_answer": False, "pages": [], "trace": {"failure_code": "browser_no_candidates"}}, ensure_ascii=False),
+    )
+    text = "HiFleet 智能视频监控功能"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+    trace.reasoning_trace["understanding_result"] = {"evidence_required": True, "query_type": "hifleet_product", "should_limit_to_hifleet_sites": True}
+
+    execute_knowledge_chain(text, decision, {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser}, trace)
+
+    assert browser.calls
+    assert browser.calls[0]["target_urls"] == ""
+    assert browser.calls[0]["site_hint"] == "hifleet.com"
+
+
+def test_evidence_required_browser_failure_returns_conservative_answer():
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps({"tool": "local_kb_search", "can_answer": True, "items": [{"title": "无关区域标注", "content": "区域标注报警设置"}]}, ensure_ascii=False),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: json.dumps({"tool": "web_search", "query": args["query"], "can_answer": True, "continue_with": "none", "items": [{"title": "CCTV 接入", "url": "https://www.hifleet.com/wp/communities/fleet/cctv", "snippet": "CCTV 接入"}], "best_urls": ["https://www.hifleet.com/wp/communities/fleet/cctv"]}, ensure_ascii=False),
+    )
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: json.dumps({"tool": "web_search_agent_browser", "status": "browser_irrelevant_page", "can_answer": False, "pages": [], "trace": {"failure_code": "browser_irrelevant_page"}}, ensure_ascii=False),
+    )
+    question = "HiFleet CCTV 接入入口在哪，提交后是否立即生效？"
+    entities = extract_entities(question)
+    decision = classify_message(question, entities)
+    trace = make_trace(decision, entities)
+    trace.reasoning_trace["understanding_result"] = {"evidence_required": True, "query_type": "hifleet_product", "should_limit_to_hifleet_sites": True}
+
+    answer, _, _ = execute_planned_knowledge_chain(
+        question,
+        decision,
+        [{"query": question, "depth": "normal", "hypothesis_id": "H1", "purpose": "核验"}],
+        {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser},
+        trace,
+    )
+
+    assert "暂未核验到足够可靠" in answer
+    assert "区域标注" not in answer
+    assert trace.fallback_reason == "evidence_required_browser_not_verified"
+
+
+def test_knowledge_search_plan_default_budget_is_three():
+    text = "HiFleet CCTV GB28181 视频接入入口、配置、价格、异常怎么处理？"
+    entities = extract_entities(text)
+    decision = classify_message(text, entities)
+    trace = make_trace(decision, entities)
+    trace.reasoning_trace["understanding_result"] = {
+        "query_type": "hifleet_product",
+        "search_query_candidates": ["q1", "q2", "q3", "q4"],
+        "rewritten_user_need": text,
+    }
+    plan = _merge_knowledge_search_plan(text, decision, [{"query": "p1"}, {"query": "p2"}, {"query": "p3"}, {"query": "p4"}], trace.reasoning_trace["understanding_result"], "normal")
+
+    assert len(plan) == 3
+
+
+def test_browser_capture_blocks_redirect_to_internal_url(monkeypatch):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("get", "url"):
+            return "http://127.0.0.1/private"
+        return ""
+
+    monkeypatch.setattr("skills.browser_verify.tools._run_agent_browser", fake_run)
+    monkeypatch.setattr("skills.browser_verify.tools._is_public_http_url", lambda url: not url.startswith("http://127."))
+
+    with pytest.raises(RuntimeError, match="browser_redirect_blocked"):
+        _browser_capture_page_text("https://public.example/page")

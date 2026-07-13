@@ -83,6 +83,7 @@ TaskType = str
 Route = str
 
 KNOWLEDGE_BUNDLE = ["local_kb_search", "web_search", "web_search_agent_browser"]
+MAX_KNOWLEDGE_QUERY_COUNT = 3
 MULTIMODAL_BUNDLE = ["inspect_media_attachment", "smart_search"]
 FILE_BUNDLE = ["inspect_customer_file", "upload_customer_artifact"]
 BROWSER_VERIFY_BUNDLE = ["verify_public_page", "smart_search", "agent_browser_deep_search"]
@@ -1372,21 +1373,21 @@ def _merge_knowledge_search_plan(
             purpose=str(item.get("purpose") or "回答当前问题"),
             source_priority=list(item.get("source_priority") or []),
         )
-        if len(merged) >= 5:
+        if len(merged) >= MAX_KNOWLEDGE_QUERY_COUNT:
             break
 
-    for query in _knowledge_query_candidates_from_understanding(understanding_result, question, limit=5):
+    for query in _knowledge_query_candidates_from_understanding(understanding_result, question, limit=MAX_KNOWLEDGE_QUERY_COUNT):
         add(query, depth=default_depth, hypothesis_id="H1", purpose="多关键词补充检索")
-        if len(merged) >= 5:
+        if len(merged) >= MAX_KNOWLEDGE_QUERY_COUNT:
             break
 
     expansion_query = _generate_knowledge_expansion_query(question, decision, understanding_result)
-    if len(merged) < 5:
+    if len(merged) < MAX_KNOWLEDGE_QUERY_COUNT:
         add(expansion_query, depth="normal", hypothesis_id="H2", purpose="补充产品能力、步骤或常见问题")
 
     if not merged:
         add(_rewrite_hifleet_knowledge_query(question), depth=default_depth)
-    return merged[:5]
+    return merged[:MAX_KNOWLEDGE_QUERY_COUNT]
 
 
 def _try_direct_hifleet_knowledge_answer(question: str) -> str:
@@ -2026,8 +2027,14 @@ def _new_knowledge_retrieval_trace(understanding_summary: dict[str, Any], query:
         "t1_eval_decision": "",
         "t1_eval_reason": "",
         "t2_triggered": False,
+        "t2_attempted": False,
         "t2_tool": "",
         "t2_target_urls": [],
+        "t2_status": "not_attempted",
+        "t2_can_answer": False,
+        "t2_page_count": 0,
+        "t2_relevant_page_count": 0,
+        "t2_failure_code": "",
         "layers": [],
     }
 
@@ -2108,6 +2115,18 @@ def _ensure_step_answer_completeness(question: str, answer: str, evidence_items:
     if _has_high_confidence_step_evidence(evidence_items):
         return answer
     return _build_conservative_step_answer(question, evidence_items)
+
+
+def _conservative_evidence_required_answer(question: str) -> str:
+    if _question_needs_step_complete_answer(question):
+        return (
+            "我暂未核验到足够可靠的官方页面证据，不能确认具体入口、操作步骤或提交后的生效规则。\n\n"
+            "请补充一个最关键的信息：您当前所在的页面截图或页面地址，我再继续核查。"
+        )
+    return (
+        "我暂未核验到足够可靠的官方页面证据，因此不能确认该功能是否支持或作出具体承诺。\n\n"
+        "请补充一个最关键的信息：您要操作的页面截图或具体功能名称，我再继续核查。"
+    )
 
 
 def _invoke_three_layer_knowledge_chain(
@@ -2213,11 +2232,12 @@ def _invoke_three_layer_knowledge_chain(
 
     should_browser = (
         (str(web_payload.get("continue_with") or "") == "agent_browser" or require_full_evidence)
-        and bool(web_payload.get("best_urls"))
         and "web_search_agent_browser" in tool_map
+        and (bool(web_payload) or require_full_evidence)
     )
     if should_browser:
         retrieval_trace["t2_triggered"] = True
+        retrieval_trace["t2_attempted"] = True
         retrieval_trace["t2_tool"] = "web_search_agent_browser"
         browser_output_raw = _invoke_tool(
             tool_map,
@@ -2243,6 +2263,16 @@ def _invoke_three_layer_knowledge_chain(
             )
         )
         _append_layer(retrieval_trace, "T2", browser_payload)
+        browser_trace = dict(browser_payload.get("trace") or {})
+        retrieval_trace.update(
+            {
+                "t2_status": str(browser_payload.get("status") or "unknown"),
+                "t2_can_answer": bool(browser_payload.get("can_answer")),
+                "t2_page_count": int(browser_trace.get("raw_page_count") or len(list(browser_payload.get("pages") or []))),
+                "t2_relevant_page_count": int(browser_trace.get("relevant_page_count") or len(list(browser_payload.get("pages") or []))),
+                "t2_failure_code": str(browser_trace.get("failure_code") or ""),
+            }
+        )
         retrieval_trace["t1_eval_decision"] = "browser_escalated"
         retrieval_trace["t1_eval_reason"] = str(web_payload.get("summary") or "web_search requested agent_browser")
         return outputs, evidence_items, retrieval_trace
@@ -2464,7 +2494,7 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
         retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
-        if chain_trace.get("t2_triggered") or (
+        if (chain_trace.get("t2_can_answer") and int(chain_trace.get("t2_relevant_page_count") or 0) > 0) or (
             not understanding_summary.get("evidence_required")
             and (chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"))
         ):
@@ -2549,7 +2579,7 @@ def execute_planned_knowledge_chain(
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
         retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
-        if chain_trace.get("t2_triggered") or (
+        if (chain_trace.get("t2_can_answer") and int(chain_trace.get("t2_relevant_page_count") or 0) > 0) or (
             not understanding_summary.get("evidence_required")
             and (chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"))
         ):
@@ -2557,8 +2587,9 @@ def execute_planned_knowledge_chain(
             chain_trace["query_traces"] = list(retrieval_trace.get("query_traces") or [])
             retrieval_trace = chain_trace
             break
-        if len(chain_evidence) > len(retrieval_trace.get("layers", [])):
-            retrieval_trace = chain_trace
+        chain_trace["query_plan"] = [item.get("query", "") for item in queries]
+        chain_trace["query_traces"] = list(retrieval_trace.get("query_traces") or [])
+        retrieval_trace = chain_trace
 
     output = _select_best_evidence_output(outputs, evidence_items)
     if retrieval_trace.get("t2_triggered"):
@@ -2592,6 +2623,13 @@ def execute_planned_knowledge_chain(
     )
     trace.reasoning_trace["understanding_summary"] = understanding_summary
     trace.reasoning_trace["retrieval_trace"] = retrieval_trace
+    if (
+        understanding_summary.get("evidence_required")
+        and retrieval_trace.get("t2_attempted")
+        and not retrieval_trace.get("t2_can_answer")
+    ):
+        trace.fallback_reason = "evidence_required_browser_not_verified"
+        return _conservative_evidence_required_answer(question), evidence_items, evidence_summary
     if "上传" in question and "航线" in question and any(marker in question for marker in ["不了", "失败", "怎么办", "无法"]):
         return _format_route_upload_troubleshooting(output), evidence_items, evidence_summary
     if decision.task_type == "platform_troubleshooting":

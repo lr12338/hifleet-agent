@@ -2,20 +2,24 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import os
 import re
+import shutil
+import socket
 import subprocess
 import threading
 import uuid
 from hashlib import md5
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 from langchain.tools import tool
 
 from skills.employee_workspace.tools import ARTIFACT_ROOT, _prepare_job_dir, _run_in_docker
+from skills.knowledge_qa.web_search_runtime import has_specific_fact, is_directory_page, is_specific_page, operation_evidence_count
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +72,49 @@ def _is_public_http_url(url: str) -> bool:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return False
     host = (parsed.hostname or "").lower()
-    return host not in {"localhost", "127.0.0.1"} and not host.endswith(".local")
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
+        return False
+    return _resolve_public_host(host)
+
+
+def _resolve_public_host(host: str) -> bool:
+    """Reject private, loopback, link-local, and otherwise non-public DNS answers."""
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+    except socket.gaierror:
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        if not parsed.is_global:
+            return False
+    return True
+
+
+def _safe_public_get(url: str, *, timeout: int = 8, max_redirects: int = 3) -> requests.Response:
+    """Fetch a public URL while validating every redirect hop before requesting it."""
+    current_url = url
+    for _ in range(max_redirects + 1):
+        if not _is_public_http_url(current_url):
+            raise ValueError("internal_url_blocked")
+        response = requests.get(
+            current_url,
+            timeout=timeout,
+            headers=REQUESTS_HEADERS,
+            allow_redirects=False,
+        )
+        if response.is_redirect:
+            location = response.headers.get("Location", "").strip()
+            if not location:
+                return response
+            current_url = urljoin(current_url, location)
+            continue
+        return response
+    raise ValueError("redirect_limit_exceeded")
 
 
 def _sanitize_query(query: str) -> str:
@@ -128,6 +174,32 @@ def _run_agent_browser(*args: str, timeout: int = AGENT_BROWSER_TIMEOUT_SEC, ses
     return (result.stdout or "").strip()
 
 
+def _agent_browser_availability() -> dict[str, str | bool]:
+    binary = shutil.which("agent-browser")
+    if not binary:
+        return {"available": False, "failure_code": "browser_cli_missing"}
+    try:
+        result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=5, shell=False)
+    except subprocess.TimeoutExpired:
+        return {"available": False, "failure_code": "browser_doctor_failed"}
+    if result.returncode != 0:
+        return {"available": False, "failure_code": "browser_doctor_failed"}
+    return {"available": True, "version": (result.stdout or "").strip()[:80]}
+
+
+def _browser_failure_code(exc: Exception) -> str:
+    if isinstance(exc, FileNotFoundError):
+        return "browser_cli_missing"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "browser_open_timeout"
+    message = str(exc).lower()
+    if "timeout" in message or "timed out" in message:
+        return "browser_open_timeout"
+    if "not found" in message or "no such file" in message:
+        return "browser_cli_missing"
+    return "browser_unknown_error"
+
+
 def _query_contains_visual_markers(query: str) -> bool:
     lowered = (query or "").lower()
     return any(marker in lowered for marker in IMAGE_HEAVY_QUERY_MARKERS)
@@ -171,6 +243,12 @@ def _browser_capture_page_text(url: str, query: str = "", session: str = "") -> 
     except RuntimeError:
         logger.debug("agent-browser open retry for %s", url)
         _run_agent_browser("open", url, timeout=AGENT_BROWSER_OPEN_TIMEOUT_SEC, session=browser_session)
+    try:
+        final_url = _run_agent_browser("get", "url", timeout=10, session=browser_session)
+    except Exception as exc:
+        raise RuntimeError("browser_parse_error") from exc
+    if not _is_public_http_url(final_url):
+        raise RuntimeError("browser_redirect_blocked")
     try:
         _run_agent_browser("wait", "--load", "networkidle", timeout=min(AGENT_BROWSER_TIMEOUT_SEC, 12), session=browser_session)
     except Exception:
@@ -562,6 +640,23 @@ def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
         excerpt = _normalize_page_text(body or summary)[:800].rstrip()
         if not excerpt:
             continue
+        specific_page = is_specific_page(url)
+        directory_page = is_directory_page(url, title, excerpt)
+        query_tokens = [token for token in _query_keywords(query) if len(_normalize_keyword_token(token)) >= 2]
+        normalized_haystack = _normalize_keyword_token(f"{title} {excerpt} {url}")
+        matched_tokens = [token for token in query_tokens if _normalize_keyword_token(token) in normalized_haystack]
+        coverage = len(matched_tokens) / max(1, len(query_tokens))
+        fact_count = 1 if has_specific_fact(excerpt) else 0
+        step_count = operation_evidence_count(excerpt)
+        body_quality = "good" if len(body.strip()) >= 120 else "partial" if body.strip() else "empty"
+        can_support_answer = bool(
+            _is_hifleet_official_url(url)
+            and specific_page
+            and not directory_page
+            and body_quality != "empty"
+            and coverage > 0
+            and (fact_count > 0 or step_count >= 2)
+        )
         evidence_pages.append(
             {
                 "title": title,
@@ -574,6 +669,13 @@ def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
                 "used_snapshot": bool(page.get("used_snapshot")),
                 "image_count": int(page.get("image_count", 0) or 0),
                 "screenshot_path": page.get("screenshot_path", ""),
+                "specific_page": specific_page,
+                "query_term_coverage": round(coverage, 3),
+                "body_quality": body_quality,
+                "fact_evidence_count": fact_count,
+                "step_evidence_count": step_count,
+                "relevance_score": round(min(1.0, coverage + (0.2 if can_support_answer else 0.0)), 3),
+                "can_support_answer": can_support_answer,
             }
         )
     if not evidence_pages:
@@ -581,6 +683,7 @@ def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
     return json.dumps(
         {
             "type": "hifleet_browser_evidence",
+            "status": "ok" if any(page["can_support_answer"] for page in evidence_pages) else "browser_irrelevant_page",
             "query": query,
             "source_scope": "hifleet_official_public_pages",
             "search_strategy": {
@@ -598,12 +701,14 @@ def _format_browser_result(query: str, pages: list[dict[str, str]]) -> str:
 @tool
 def verify_public_page(url: str) -> str:
     """Fetch a public HTTP(S) page title/snippet for customer-safe verification."""
-    parsed = urlparse(url or "")
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if not _is_public_http_url(url):
         return json.dumps({"ok": False, "reason": "invalid_url"}, ensure_ascii=False)
-    if parsed.hostname in {"localhost", "127.0.0.1"} or (parsed.hostname or "").endswith(".local"):
-        return json.dumps({"ok": False, "reason": "internal_url_blocked"}, ensure_ascii=False)
-    resp = requests.get(url, timeout=8, headers=REQUESTS_HEADERS)
+    try:
+        resp = _safe_public_get(url)
+    except ValueError as exc:
+        return json.dumps({"ok": False, "reason": str(exc)}, ensure_ascii=False)
+    except requests.RequestException:
+        return json.dumps({"ok": False, "reason": "fetch_failed"}, ensure_ascii=False)
     ok = 200 <= resp.status_code < 400
     text = resp.text[:5000] if ok else ""
     title_match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
@@ -618,7 +723,20 @@ def agent_browser_deep_search(query: str, target_urls: str = "", site_hint: str 
     """最后一轮网页验证工具：关键词扩展、候选链接筛选、正文解析、必要时截图取证。"""
     sanitized_query = _sanitize_query(query)
     if not sanitized_query:
-        return NO_HIT_TEXT
+        return json.dumps({"type": "hifleet_browser_evidence", "status": "invalid_query", "summary": NO_HIT_TEXT, "pages": []}, ensure_ascii=False)
+
+    availability = _agent_browser_availability()
+    if not availability.get("available"):
+        return json.dumps(
+            {
+                "type": "hifleet_browser_evidence",
+                "status": str(availability["failure_code"]),
+                "summary": NO_HIT_TEXT,
+                "pages": [],
+                "runtime": availability,
+            },
+            ensure_ascii=False,
+        )
 
     explicit_targets = _explicit_target_url_candidates(target_urls)
     has_hifleet_scope = "hifleet" in sanitized_query.lower() or "hifleet" in (site_hint or "").lower() or _needs_specific_hifleet_page(sanitized_query)
@@ -629,33 +747,54 @@ def agent_browser_deep_search(query: str, target_urls: str = "", site_hint: str 
     if not candidates and has_hifleet_scope:
         candidates = _sandbox_hifleet_candidates(sanitized_query)
     if not candidates:
-        return NO_HIT_TEXT
+        return json.dumps({"type": "hifleet_browser_evidence", "status": "no_candidate", "summary": NO_HIT_TEXT, "pages": []}, ensure_ascii=False)
 
     pages: list[dict[str, str]] = []
+    failures: list[str] = []
     browser_session = _new_agent_browser_session()
-    for candidate in candidates:
+    try:
+        for candidate in candidates:
+            try:
+                title, body, capture_meta = _browser_capture_page_text(candidate["url"], sanitized_query, session=browser_session)
+            except Exception as exc:
+                code = _browser_failure_code(exc)
+                logger.warning("agent_browser_deep_search capture %s for %s", code, candidate["url"])
+                failures.append(code)
+                continue
+            if not body.strip() and not candidate.get("summary"):
+                failures.append("browser_empty_body")
+                continue
+            pages.append(
+                {
+                    "title": title or candidate.get("title", ""),
+                    "url": candidate["url"],
+                    "body": body,
+                    "summary": candidate.get("summary", ""),
+                    "source": candidate.get("source", ""),
+                    "query": candidate.get("query", sanitized_query),
+                    "used_snapshot": bool(capture_meta.get("used_snapshot")),
+                    "image_count": int(capture_meta.get("image_count", 0) or 0),
+                    "screenshot_path": str(capture_meta.get("screenshot_path", "") or ""),
+                }
+            )
+            if len(pages) >= 2:
+                break
+    finally:
         try:
-            title, body, capture_meta = _browser_capture_page_text(candidate["url"], sanitized_query, session=browser_session)
-        except FileNotFoundError:
-            logger.warning("agent-browser CLI not found")
-            break
-        except Exception as exc:
-            logger.warning("agent_browser_deep_search capture error for %s: %s", candidate["url"], exc)
-            continue
-        pages.append(
-            {
-                "title": title or candidate.get("title", ""),
-                "url": candidate["url"],
-                "body": body,
-                "summary": candidate.get("summary", ""),
-                "source": candidate.get("source", ""),
-                "query": candidate.get("query", sanitized_query),
-                "used_snapshot": bool(capture_meta.get("used_snapshot")),
-                "image_count": int(capture_meta.get("image_count", 0) or 0),
-                "screenshot_path": str(capture_meta.get("screenshot_path", "") or ""),
-            }
-        )
-        if len(pages) >= 2:
-            break
+            _run_agent_browser("close", timeout=5, session=browser_session)
+        except Exception:
+            logger.debug("agent-browser close failed for session %s", browser_session)
 
+    if not pages:
+        return json.dumps(
+            {
+                "type": "hifleet_browser_evidence",
+                "status": failures[0] if failures else "browser_no_candidates",
+                "pages": [],
+                "failure_count": len(failures),
+                "failure_codes": failures[:3],
+                "runtime": availability,
+            },
+            ensure_ascii=False,
+        )
     return _format_browser_result(sanitized_query, pages)

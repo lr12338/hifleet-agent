@@ -111,8 +111,8 @@ agent-browser get text body
 
 预期：
 
-- `route_trace.route=lightweight_skills_agent`。
-- `generated_tool_calls` 可看到 browser/knowledge 相关工具。
+- 强证据纯文本请求通常可见 `route_trace.route=knowledge` 和 `route_source=understanding_to_knowledge_chain`；其他请求可能由 `lightweight_skills_agent` 处理。
+- `generated_tool_calls` 可看到 browser/knowledge 相关工具；browser 失败时 trace 应保留 `t2_attempted/t2_status/t2_can_answer`，而不是把失败伪装成成功。
 - 最终回复引用具体公开页面，不只给首页。
 - 最终回复不出现 `agent-browser`、`reasoning_trace`、原始 JSON、内部路径或 key/token。
 

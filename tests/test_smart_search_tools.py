@@ -6,6 +6,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from skills.knowledge_qa.browser_bridge import build_browser_bridge_payload
 from skills.knowledge_qa import tools
+from skills.knowledge_qa.web_search_runtime import rewrite_web_search_query
+from skills.browser_verify import tools as browser_tools
 
 
 def test_build_volc_web_search_payload_for_web_summary():
@@ -98,6 +100,74 @@ def test_web_search_falls_back_to_ark_when_structured_search_fails(monkeypatch):
 
     assert result["summary"] == "fallback"
     assert result["items"][0]["title"] == "ark"
+
+
+def test_rewrite_web_search_query_preserves_technical_qualifiers():
+    rewritten = rewrite_web_search_query("HiFleet CCTV GB28181 接入价格异常怎么处理")
+
+    assert "hifleet" in rewritten.lower()
+    for phrase in ("CCTV", "GB28181", "接入", "价格", "异常"):
+        assert phrase in rewritten
+
+
+def test_verify_public_page_blocks_private_dns_result(monkeypatch):
+    monkeypatch.setattr(browser_tools, "_resolve_public_host", lambda host: False)
+
+    payload = json.loads(browser_tools.verify_public_page.invoke({"url": "https://public.example/path"}))
+
+    assert payload == {"ok": False, "reason": "invalid_url"}
+
+
+def test_verify_public_page_blocks_redirect_to_private_target(monkeypatch):
+    class FakeResponse:
+        status_code = 302
+        headers = {"Location": "http://127.0.0.1/private"}
+        text = ""
+
+        @property
+        def is_redirect(self):
+            return True
+
+    monkeypatch.setattr(browser_tools, "_resolve_public_host", lambda host: host == "public.example")
+    monkeypatch.setattr(browser_tools.requests, "get", lambda *args, **kwargs: FakeResponse())
+
+    payload = json.loads(browser_tools.verify_public_page.invoke({"url": "https://public.example/start"}))
+
+    assert payload == {"ok": False, "reason": "internal_url_blocked"}
+
+
+def test_browser_bridge_preserves_unavailable_status():
+    payload = build_browser_bridge_payload(
+        "HiFleet 轨迹",
+        "",
+        "HiFleet",
+        {"type": "hifleet_browser_evidence", "status": "browser_unavailable", "pages": []},
+    )
+
+    assert payload["status"] == "browser_unavailable"
+    assert payload["can_answer"] is False
+
+
+def test_browser_bridge_rejects_generic_official_pages_as_evidence():
+    payload = build_browser_bridge_payload(
+        "HiFleet 筛选船队记忆功能",
+        "",
+        "HiFleet",
+        {
+            "type": "hifleet_browser_evidence",
+            "pages": [
+                {
+                    "title": "HiFleet 官方社区",
+                    "url": "https://www.hifleet.com/wp/communities",
+                    "excerpt": "官方社区入口",
+                    "official": True,
+                }
+            ],
+        },
+    )
+
+    assert payload["status"] == "generic_or_irrelevant_page"
+    assert payload["can_answer"] is False
 
 
 def test_volc_web_search_accepts_existing_ark_websearch_env_name(monkeypatch):
@@ -395,3 +465,74 @@ def test_agent_browser_keyword_fallback_prompt_rules_are_documented():
     assert "无有效命中" in profile_text
     assert "短关键词" in profile_text
     assert "3–5 组短关键词" in profile_text
+
+
+def test_web_search_passes_and_enforces_block_hosts(monkeypatch):
+    captured = {}
+
+    def fake_web_search(query, **kwargs):
+        captured.update(kwargs)
+        return {
+            "query": query,
+            "summary": "results",
+            "items": [
+                {"title": "blocked", "url": "https://cars.example.com/fleet", "snippet": "汽车车队", "authority_level": 1},
+                {"title": "official", "url": "https://www.hifleet.com/wp/communities/fleet/article", "snippet": "HiFleet 功能", "authority_level": 1},
+            ],
+            "payload_meta": {"Filter": {"Sites": tools.HIFLEET_SITES, "NeedUrl": True}},
+            "used_ark_fallback": False,
+        }
+
+    monkeypatch.setattr(tools, "_web_search", fake_web_search)
+    payload = json.loads(tools.web_search.invoke({"query": "HiFleet 船队功能", "block_hosts": "cars.example.com"}))
+
+    assert captured["block_hosts"] == "cars.example.com"
+    assert payload["trace"]["request_profile"]["Filter"]["BlockHosts"] == "cars.example.com"
+    assert payload["trace"]["block_hosts_applied_locally"] is True
+    assert payload["trace"]["blocked_result_count"] == 1
+    assert [item["title"] for item in payload["items"]] == ["official"]
+
+
+def test_web_search_excludes_automotive_fleet_noise_from_citable_items(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_web_search",
+        lambda query, **kwargs: {
+            "query": query,
+            "summary": "mixed results",
+            "items": [
+                {"title": "汽车车队司机管理平台", "url": "https://example.com/fleet", "summary": "车辆管理与司机调度", "authority_level": 1},
+                {"title": "HIFLEET 船舶 CCTV 接入平台指南", "url": "https://www.hifleet.com/wp/communities/fleet/cctv", "summary": "船舶 CCTV 接入支持 GB28181", "authority_level": 1},
+            ],
+            "payload_meta": {"Filter": {"Sites": tools.HIFLEET_SITES}},
+            "used_ark_fallback": False,
+        },
+    )
+
+    payload = json.loads(tools.web_search.invoke({"query": "HiFleet 船舶 CCTV 接入"}))
+
+    assert [item["title"] for item in payload["items"]] == ["HIFLEET 船舶 CCTV 接入平台指南"]
+    assert payload["items"][0]["authority"] == 1.0
+
+
+def test_web_search_reranks_and_filters_unrelated_official_product_pages(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "_web_search",
+        lambda query, **kwargs: {
+            "query": query,
+            "summary": "mixed official results",
+            "items": [
+                {"title": "HIFLEET 上线船舶进入目的港 PSC 检查窗口期智能提醒", "url": "https://www.hifleet.com/wp/communities/fleet/psc", "summary": "PSC 检查提醒", "authority_level": 1, "rank_score": 0.99},
+                {"title": "船队筛选记忆功能", "url": "https://www.hifleet.com/wp/communities/fleet/filter-memory", "summary": "浏览器记忆船队筛选功能", "authority_level": 1, "rank_score": 0.8},
+                {"title": "HiFleet 官方社区", "url": "https://www.hifleet.com/wp/communities/recent", "summary": "最近文章", "authority_level": 1, "rank_score": 1.0},
+            ],
+            "payload_meta": {"Filter": {"Sites": tools.HIFLEET_SITES}},
+            "used_ark_fallback": False,
+        },
+    )
+
+    payload = json.loads(tools.web_search.invoke({"query": "HiFleet 筛选船队记忆功能"}))
+
+    assert [item["title"] for item in payload["items"]] == ["船队筛选记忆功能"]
+    assert payload["best_urls"] == ["https://www.hifleet.com/wp/communities/fleet/filter-memory"]

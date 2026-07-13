@@ -52,12 +52,12 @@
 ## 使用规则
 
 1. 先调用 `local_kb_search`
-2. 若 `can_answer=true`，直接基于知识库回答
+2. 普通问题若 `can_answer=true`，可直接基于知识库回答；`evidence_required=true` 时不得因此提前结束
 3. 若 `should_continue=true`，调用 `web_search`
-4. 若 `web_search.can_answer=true`，直接回答
-5. 若 `web_search.continue_with=agent_browser` 且存在 `best_urls`，传入 `target_urls` 调用 `web_search_agent_browser`
-6. 若 `web_search` 无有效命中但问题可能属于 HiFleet 平台/产品/社区/帮助内容，可用关键词 `query` 调用 `web_search_agent_browser`，让 browser 用 Bing 找官方候选页
-7. 最终回答时优先引用本地知识库或官方页面
+4. 普通问题若 `web_search.can_answer=true`，可直接回答；`evidence_required=true` 时继续完成页面核验
+5. `web_search.continue_with=agent_browser` 或强证据链需要核验时：有 `best_urls` 则传入 `target_urls`；没有 URL 时传空 `target_urls` 与短关键词，让 browser 通过 Bing 寻找 HiFleet 官方候选页面
+6. browser 只有抓到官方、具体、相关且有事实/步骤证据的正文时才可 `can_answer=true`；目录、首页、空正文、超时和无关页必须继续后续 query 或保守收口
+7. 默认最多执行 3 组高质量 query，避免重复检索；最终回答时优先引用本地知识库或官方页面
 
 ## 输出要求
 

@@ -269,6 +269,7 @@ def _build_volc_web_search_payload(
     need_url: bool = True,
     query_rewrite: bool = False,
     auth_info_level: int = 0,
+    block_hosts: str = "",
     time_range: str = "",
     content_format: str = "text",
 ) -> dict:
@@ -284,6 +285,8 @@ def _build_volc_web_search_payload(
     filter_payload = {"NeedContent": bool(need_content), "NeedUrl": bool(need_url)}
     if sites:
         filter_payload["Sites"] = sites
+    if block_hosts.strip():
+        filter_payload["BlockHosts"] = block_hosts.strip()
     if auth_info_level in (0, 1):
         filter_payload["AuthInfoLevel"] = auth_info_level
     payload["Filter"] = filter_payload
@@ -387,6 +390,7 @@ def _volc_web_search(
     need_url: bool = True,
     query_rewrite: bool = False,
     auth_info_level: int = 0,
+    block_hosts: str = "",
     time_range: str = "",
     content_format: str = "markdown",
 ) -> dict:
@@ -403,6 +407,7 @@ def _volc_web_search(
         need_url=need_url,
         query_rewrite=query_rewrite,
         auth_info_level=auth_info_level,
+        block_hosts=block_hosts,
         time_range=time_range,
         content_format=content_format,
     )
@@ -467,9 +472,14 @@ def _ark_web_search(query: str, site_hint: str = "", count: int = 5) -> dict:
 def _web_search(query: str, **kwargs) -> dict:
     try:
         return _volc_web_search(query, **kwargs)
-    except Exception as e:
-        logger.warning(f"Structured web search failed, fallback to Ark: {e}")
-        fallback = _ark_web_search(query=query, site_hint=kwargs.get("sites", ""), count=kwargs.get("count", VOLC_WEB_SEARCH_DEFAULT_COUNT))
+    except Exception as primary_error:
+        logger.warning("Structured web search failed, fallback to Ark: %s", primary_error)
+        try:
+            fallback = _ark_web_search(query=query, site_hint=kwargs.get("sites", ""), count=kwargs.get("count", VOLC_WEB_SEARCH_DEFAULT_COUNT))
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"web_search_unavailable:primary={type(primary_error).__name__};fallback={type(fallback_error).__name__}"
+            ) from fallback_error
         payload = _build_volc_web_search_payload(
             query,
             search_type=str(kwargs.get("search_type") or "web"),
@@ -480,10 +490,31 @@ def _web_search(query: str, **kwargs) -> dict:
             need_url=bool(kwargs.get("need_url", True)),
             query_rewrite=bool(kwargs.get("query_rewrite", False)),
             auth_info_level=int(kwargs.get("auth_info_level", 0) or 0),
+            block_hosts=str(kwargs.get("block_hosts", "")),
             time_range=str(kwargs.get("time_range", "")),
             content_format=str(kwargs.get("content_format", "text")),
         )
         return _build_structured_web_search_response(query, _build_search_payload_meta(payload), fallback, source_scope="web", used_ark_fallback=True)
+
+
+def _blocked_hostnames(block_hosts: str) -> set[str]:
+    return {part.strip().lower().lstrip(".") for part in re.split(r"[|,\s]+", block_hosts or "") if part.strip()}
+
+
+def _is_blocked_result_url(url: str, blocked_hosts: set[str]) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    return bool(host) and any(host == blocked or host.endswith(f".{blocked}") for blocked in blocked_hosts)
+
+
+def _apply_local_block_hosts(raw_result: dict[str, Any], block_hosts: str) -> tuple[dict[str, Any], int]:
+    blocked_hosts = _blocked_hostnames(block_hosts)
+    if not blocked_hosts:
+        return raw_result, 0
+    filtered = dict(raw_result)
+    items = list(filtered.get("items") or [])
+    kept = [item for item in items if not _is_blocked_result_url(str(item.get("url") or ""), blocked_hosts)]
+    filtered["items"] = kept
+    return filtered, len(items) - len(kept)
 
 
 def _search_hifleet_site(query: str, ctx, *, return_trace: bool = False) -> list | tuple[list, dict[str, Any]]:
@@ -703,22 +734,46 @@ def web_search(
         resolved_sites = HIFLEET_SITES
     if query_type == "authoritative_public_data":
         resolved_sites = ""
-    raw_result = _web_search(
-        rewritten_query,
-        count=count,
-        search_type=search_type,
-        sites=resolved_sites,
-        need_summary=True,
-        need_content=False,
-        need_url=True,
-        query_rewrite=query_rewrite,
-        auth_info_level=0,
-        content_format="text",
-    )
+    try:
+        raw_result = _web_search(
+            rewritten_query,
+            count=count,
+            search_type=search_type,
+            sites=resolved_sites,
+            need_summary=True,
+            need_content=False,
+            need_url=True,
+            query_rewrite=query_rewrite,
+            auth_info_level=0,
+            block_hosts=block_hosts,
+            content_format="text",
+        )
+    except RuntimeError as exc:
+        return json.dumps(
+            {
+                "tool": "web_search",
+                "query": rewritten_query,
+                "status": "unavailable",
+                "can_answer": False,
+                "should_continue": True,
+                "continue_with": "agent_browser",
+                "confidence": "low",
+                "summary": "联网检索当前不可用，未将其视为无结果",
+                "items": [],
+                "best_urls": [],
+                "recommended_next_action": "尝试页面核验或返回保守回复",
+                "trace": {
+                    "query_type": query_type,
+                    "failure_code": str(exc),
+                    "used_ark_fallback": False,
+                },
+            },
+            ensure_ascii=False,
+        )
+    raw_result, locally_blocked_count = _apply_local_block_hosts(raw_result, block_hosts)
     request_profile = dict(raw_result.get("payload_meta") or {})
-    if block_hosts:
-        request_profile.setdefault("Filter", {})
-        request_profile["Filter"]["BlockHosts"] = block_hosts
+    request_profile.setdefault("Filter", {})
+    request_profile["Filter"]["BlockHosts"] = block_hosts
     analysis = analyze_web_search_result(rewritten_query, request_profile, raw_result)
     payload = {
         "tool": "web_search",
@@ -740,6 +795,8 @@ def web_search(
             "risk_flags": list(analysis["analysis"]["risk_flags"]),
             "web_answerability_reason": str(analysis["analysis"].get("reason") or ""),
             "used_ark_fallback": bool(raw_result.get("used_ark_fallback")),
+            "block_hosts_applied_locally": bool(block_hosts),
+            "blocked_result_count": locally_blocked_count,
         },
     }
     return json.dumps(payload, ensure_ascii=False)
