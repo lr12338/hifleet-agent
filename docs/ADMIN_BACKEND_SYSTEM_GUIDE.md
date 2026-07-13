@@ -173,6 +173,7 @@ curl "http://127.0.0.1:10123/admin/logs?page=1&page_size=20&agent_profile=custom
 - `source_channel`：渠道。
 - `agent_profile`：从 request JSON 派生。
 - `route` / `task_type`：客服 phase graph 在 `plan` 阶段的意图结果。
+- `status=degraded_success`：外部客服递归超限时的受控业务兜底；HTTP 为 200，但同一 `run_id` 仍应在 `agent_errors` 中看到原始异常。
 
 ## 8. 排障流程
 
@@ -190,12 +191,14 @@ flowchart TD
 
 客服 Agent 重点检查：
 
-- `phase_history` 是否按预期经过 `route -> plan -> act -> check`。
-- `route` 是否符合问题类型。
+- `phase_history` 是否按预期经过 `preprocess -> knowledge|delegate|ship_update -> finalize`。
+- `route` 是否符合问题类型；`understanding_to_knowledge_chain` 表示需求理解直接触发知识检索。
 - `tool_bundle` 是否收缩正确。
 - `entity_resolution` 是否抽到了 MMSI/IMO/船名/区域/日期。
 - `tool_call_sequence` 是否有不必要调用。
 - `fallback_reason` 是否暴露授权、无数据或校验失败。
+- `reasoning_trace.understanding_result.evidence_required` 是否要求三层证据核验；此类请求不应因单层 `can_answer=true` 提前结束。
+- 出现 `degraded_success` 时，同时检查 `agent_errors.stack_trace`、`fallback_reason=graph_recursion_limit` 与 delegate 的 `recursion_limit`，不要因为 API 状态为 200 而忽略异常。
 
 ## 9. 新增 Profile 或工具后的检查
 

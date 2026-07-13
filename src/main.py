@@ -88,6 +88,24 @@ except Exception as obs_import_err:
 # 超时配置常量
 TIMEOUT_SECONDS = 900  # 15分钟
 HEADER_X_INTENT_HINT = "x-intent-hint"
+EXTERNAL_CUSTOMER_SUPPORT_PROFILES = {"customer_support", "customer_ceshi"}
+RECURSION_FALLBACK_MESSAGE = "抱歉，当前问题未能在有限步骤内确认。请补充您想查询的具体目标，以及关联的船名、MMSI、IMO 或业务场景，我会继续为您核查。"
+
+
+def _normalize_stack_trace(stack_trace: Any) -> str:
+    if isinstance(stack_trace, str):
+        return stack_trace
+    if isinstance(stack_trace, (list, tuple)):
+        return "\n".join(str(item) for item in stack_trace)
+    return str(stack_trace or "")
+
+
+def _is_graph_recursion_error(exc: BaseException) -> bool:
+    return "GraphRecursionError" in f"{type(exc).__name__}: {exc}"
+
+
+def _is_external_customer_recursion_error(exc: BaseException, profile_id: str) -> bool:
+    return profile_id in EXTERNAL_CUSTOMER_SUPPORT_PROFILES and _is_graph_recursion_error(exc)
 
 
 def _ensure_context_headers(ctx: Optional[Context]) -> Dict[str, Any]:
@@ -678,7 +696,7 @@ def _log_agent_error_event(
             "route": route,
             "error_code": error_code,
             "error_message": error_message,
-            "stack_trace": stack_trace,
+            "stack_trace": _normalize_stack_trace(stack_trace),
             "error_category": error_category or None,
             "node_name": node_name,
         }
@@ -899,8 +917,39 @@ async def http_run(request: Request) -> Dict[str, Any]:
             f"Unexpected error in http_run: [{error_response['error_code']}] {error_response['error_message']}, "
             f"traceback: {traceback.format_exc()}", exc_info=True
         )
-        stack_trace = extract_core_stack()
+        stack_trace = _normalize_stack_trace(extract_core_stack())
         latency_ms = int((time.perf_counter() - started) * 1000)
+        if _is_external_customer_recursion_error(e, agent_profile):
+            fallback_result = {
+                "status": "degraded_success",
+                "run_id": run_id,
+                "message": RECURSION_FALLBACK_MESSAGE,
+                "agent_profile": agent_profile,
+                "fallback_reason": "graph_recursion_limit",
+            }
+            _log_api_call_event(
+                run_id=run_id,
+                route="/run",
+                status="degraded_success",
+                http_status_code=200,
+                latency_ms=latency_ms,
+                payload=payload,
+                response_json=fallback_result,
+                session_id=session_id,
+                user_id=user_id,
+                source_channel=source_channel,
+                intent_hint=intent_hint,
+            )
+            _log_agent_error_event(
+                run_id=run_id,
+                route="/run",
+                error_code=error_response["error_code"],
+                error_message=error_response["error_message"],
+                stack_trace=stack_trace,
+                node_name="http_run",
+                error_category=error_response.get("error_category", ""),
+            )
+            return fallback_result
         _log_api_call_event(
             run_id=run_id,
             route="/run",
@@ -1065,7 +1114,38 @@ async def http_stream_run(request: Request):
         return response
     except Exception as e:
         error_response = service.error_classifier.get_error_response(e, {"node_name": "http_stream_run", "run_id": run_id})
-        stack_trace = extract_core_stack()
+        stack_trace = _normalize_stack_trace(extract_core_stack())
+        if _is_external_customer_recursion_error(e, agent_profile):
+            fallback_result = {
+                "status": "degraded_success",
+                "run_id": run_id,
+                "message": RECURSION_FALLBACK_MESSAGE,
+                "agent_profile": agent_profile,
+                "fallback_reason": "graph_recursion_limit",
+            }
+            _log_api_call_event(
+                run_id=run_id,
+                route="/stream_run",
+                status="degraded_success",
+                http_status_code=200,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                payload=payload,
+                response_json=fallback_result,
+                session_id=session_id,
+                user_id=user_id,
+                source_channel=source_channel,
+                intent_hint=intent_hint,
+            )
+            _log_agent_error_event(
+                run_id=run_id,
+                route="/stream_run",
+                error_code=error_response["error_code"],
+                error_message=error_response["error_message"],
+                stack_trace=stack_trace,
+                node_name="http_stream_run",
+                error_category=error_response.get("error_category", ""),
+            )
+            return JSONResponse(status_code=200, content=fallback_result)
         _log_api_call_event(
             run_id=run_id,
             route="/stream_run",

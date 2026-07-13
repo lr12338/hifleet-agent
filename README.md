@@ -11,6 +11,8 @@
 详细架构请优先阅读：`docs/AGENT_TECHNICAL_DOCUMENTATION.md`。
 客服知识检索、平台操作类收口和授权写库请看：`docs/CUSTOMER_SUPPORT_KB_OPERATIONS.md`。
 如果是在其他服务器上部署联调，先看：`docs/CUSTOMER_SUPPORT_REMOTE_DEPLOYMENT_RUNBOOK.md`。
+
+当前客服会先使用结构化需求理解结果决定路径：明确写入请求走 `ship_update`；纯文本且需要证据确认的知识/排障请求直接复用“本地知识库 → 网页搜索 → 页面核验”链路；其余复杂请求才委派给标准 agent。未知编号不会按格式固定拒绝，而是先检索确认能力边界；外部客服递归超限会返回受控业务回复并保留后台错误记录。
 如果需要让远端代码 Agent 快速接手检查和烟测，可直接使用：`docs/CUSTOMER_SUPPORT_REMOTE_AGENT_PROMPT.md`。
 
 ## 1. 核心目录

@@ -24,6 +24,8 @@
 4. 需要正文核验时，升级 `web_search_agent_browser` 或公开页面核验工具。
 5. 最终回答前检查证据是否覆盖关键块；缺关键块时只回答已确认内容，并说明需要进一步核验或追问一个关键细节。
 
+对编号、代码、简称等语义不完整输入，不根据格式直接判定编号类型或支持性。需求理解 agent 应先给出 `user_goal`、`rewritten_user_need`、`search_query_candidates` 和 `evidence_required`；当 `evidence_required=true` 时，轻量客服 graph 直接进入知识链。此类请求在工具可用时不会因本地 KB 或网页单层命中提前结束，而是继续完成网页与页面核验。证据不足或冲突时，只使用 `missing_slot` 追问一个关键问题，不能把“未命中”说成“不支持”。
+
 平台教程类完整回答至少需要：
 
 - 入口位置
@@ -118,6 +120,10 @@ Agent 不应做：
 - `generated_tool_calls`
 - `route_trace.route`
 - `route_trace.reasoning_trace.pipeline`
+- `route_trace.reasoning_trace.understanding_result.user_goal`
+- `route_trace.reasoning_trace.understanding_result.evidence_required`
+- `route_trace.reasoning_trace.understanding_result.search_query_candidates`
+- `route_trace.reasoning_trace.route_source`（`understanding_to_knowledge_chain` 表示由需求理解直接进入知识链）
 - `retrieval_trace`
 - `question_class`
 - `web_answerability_reason`

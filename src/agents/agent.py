@@ -12,6 +12,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -109,6 +110,8 @@ CUSTOMER_SUPPORT_UNDERSTANDING_PROMPT = """你是 HiFleet 客服系统的需求�
 6. 判断联网检索时是否应限制到 HiFleet 官方站点
 7. 如果信息不足，只指出一个最关键缺失项
 
+对编号、代码、OCR 文本、简称等语义不完整的短输入：先结合上下文推断用户可能目标，不能仅凭外观断言编号类型。只要涉及“能否查询/是否支持/如何使用/编号含义”等能力确认，必须设置 evidence_required=true，将待确认能力改写为 rewritten_user_need，并生成用于知识库和网页核验的 search_query_candidates。知识库未命中不等于不支持；证据不足时才通过 missing_slot 追问一个关键问题。
+
 可选 intent:
 - conversation: 总结上文、回看上一条问题、询问上一个船舶
 - knowledge: 平台功能、产品、业务、故障排查、行业知识
@@ -198,7 +201,7 @@ Few-shot:
 - 不要补充任何 JSON 之外的文本
 
 JSON 格式:
-{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true,"operation_type":"none|ship_query|position_update|static_update|mixed_update|ambiguous_update|frontend_capability_question|data_delay_troubleshooting","ship_update_candidate":false,"ship_write_request":false,"pending_action":"resume|hold|cancel|pause|none","non_write_reason":"none|frontend_capability_question|data_delay_troubleshooting","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{},"ship_update_confidence":"high|medium|low"}
+{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","user_goal":"用户想完成的动作","evidence_required":true,"use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true,"operation_type":"none|ship_query|position_update|static_update|mixed_update|ambiguous_update|frontend_capability_question|data_delay_troubleshooting","ship_update_candidate":false,"ship_write_request":false,"pending_action":"resume|hold|cancel|pause|none","non_write_reason":"none|frontend_capability_question|data_delay_troubleshooting","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{},"ship_update_confidence":"high|medium|low"}
 """
 
 
@@ -535,9 +538,24 @@ def _normalize_ship_update_understanding_result(raw: dict[str, Any], *, fallback
     if operation_type in SHIP_UPDATE_OPERATION_HINTS and non_write_reason == "none":
         ship_candidate = ship_candidate or intent == "ship_update"
         ship_write = ship_write or ship_candidate
+    knowledge_result = _normalize_customer_support_understanding_result(
+        data,
+        text=str(data.get("rewritten_user_need") or fallback.get("user_goal") or ""),
+        intent=intent or str(fallback.get("intent") or "knowledge"),
+        route="knowledge",
+    )
+    missing_slot = data.get("missing_slot") if isinstance(data.get("missing_slot"), dict) else fallback.get("missing_slot") or {}
     return {
         **fallback,
         **data,
+        **knowledge_result,
+        "intent": intent or str(fallback.get("intent") or "knowledge"),
+        "user_goal": str(data.get("user_goal") or fallback.get("user_goal") or "").strip(),
+        "evidence_required": bool(data.get("evidence_required", fallback.get("evidence_required", False))),
+        "missing_slot": {
+            "field": str(missing_slot.get("field") or "").strip(),
+            "question": str(missing_slot.get("question") or "").strip(),
+        },
         "operation_type": operation_type,
         "pending_action": pending_action,
         "non_write_reason": non_write_reason,
@@ -586,7 +604,12 @@ def _run_lightweight_customer_understanding(
     )
     if not raw:
         return fallback
-    return _normalize_ship_update_understanding_result(raw, fallback=fallback)
+    normalized = _normalize_ship_update_understanding_result(raw, fallback=fallback)
+    if not normalized.get("rewritten_user_need"):
+        normalized["rewritten_user_need"] = str(text or "").strip()
+    if not normalized.get("search_query_candidates") and text:
+        normalized["search_query_candidates"] = [str(text).strip()]
+    return normalized
 
 
 def _normalize_perception(raw: dict[str, Any], fallback_type: str = "") -> dict[str, Any]:
@@ -1993,7 +2016,7 @@ class LightweightCustomerSupportState(TypedDict, total=False):
     agent_profile: str
     intent_hint: str
     status: str
-    phase: Literal["preprocess", "delegate", "finalize", "done"]
+    phase: Literal["preprocess", "knowledge", "delegate", "finalize", "done"]
     phase_history: list[str]
     task_goal: str
     perception_result: dict[str, Any]
@@ -2058,11 +2081,24 @@ def classify_intent_fast(user_text: str, has_media: bool = False) -> str:
 
 SENSITIVE_DISCLOSURE_REFUSAL = "抱歉，这部分属于系统内部安全信息，不能提供。我可以继续协助您处理 HiFleet 平台使用、船舶查询或业务问题。"
 STANDARD_AGENT_MESSAGE_STATE_FALLBACK = "抱歉，当前会话上下文状态暂时不稳定，我已停止继续处理以避免给出错误结果。请您重新发送当前问题，我会继续协助处理。"
+STANDARD_AGENT_RECURSION_FALLBACK = "抱歉，当前问题未能在有限步骤内确认。请补充您想查询的具体目标，以及关联的船名、MMSI、IMO 或业务场景，我会继续为您核查。"
 
 
 def _is_standard_agent_message_state_error(exc: BaseException) -> bool:
     text = f"{type(exc).__name__}: {exc}"
     return "last_ai_index" in text or "cannot access local variable" in text
+
+
+def _is_standard_agent_recursion_error(exc: BaseException) -> bool:
+    return isinstance(exc, GraphRecursionError) or "GraphRecursionError" in f"{type(exc).__name__}: {exc}"
+
+
+def _standard_agent_run_config(profile: AgentProfile, thread_id: str) -> dict[str, Any]:
+    max_iterations = max(1, int(profile.max_iterations or 6))
+    return {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": max(3, 2 * max_iterations + 1),
+    }
 
 
 def is_sensitive_internal_request(user_text: str) -> bool:
@@ -2507,7 +2543,7 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
             try:
                 delegated = standard_agent.invoke(
                     payload,
-                    config={"configurable": {"thread_id": delegate_thread_id}},
+                    config=_standard_agent_run_config(profile, delegate_thread_id),
                     context=ctx,
                 )
             except TypeError as type_exc:
@@ -2515,17 +2551,23 @@ def _build_employee_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile
                     raise
                 delegated = standard_agent.invoke(payload, context=ctx)
         except Exception as exc:
-            if not _is_standard_agent_message_state_error(exc):
+            if not (_is_standard_agent_message_state_error(exc) or _is_standard_agent_recursion_error(exc)):
                 raise
+            fallback_reason = "standard_agent_recursion_limit" if _is_standard_agent_recursion_error(exc) else "standard_agent_message_state_error"
+            fallback_answer = STANDARD_AGENT_RECURSION_FALLBACK if fallback_reason == "standard_agent_recursion_limit" else STANDARD_AGENT_MESSAGE_STATE_FALLBACK
             return {
                 "phase": "done",
                 "status": "success",
                 "phase_history": list(state.get("phase_history", [])) + ["delegated", "fallback"],
                 "workspace_task": False,
-                "messages": [AIMessage(content=STANDARD_AGENT_MESSAGE_STATE_FALLBACK)],
-                "generated_answer": STANDARD_AGENT_MESSAGE_STATE_FALLBACK,
+                "messages": [AIMessage(content=fallback_answer)],
+                "generated_answer": fallback_answer,
                 "generated_tool_calls": [],
-                "route_trace": {"fallback_reason": "standard_agent_message_state_error"},
+                "route_trace": {
+                    "fallback_reason": fallback_reason,
+                    "max_iterations": profile.max_iterations,
+                    "recursion_limit": _standard_agent_run_config(profile, delegate_thread_id)["recursion_limit"],
+                },
             }
         delegated["phase"] = "delegated"
         delegated["status"] = delegated.get("status", "delegated")
@@ -2966,7 +3008,12 @@ def _build_customer_support_agent(ctx, cfg: dict[str, Any], workspace_path: str,
             "agent_profile": state.get("agent_profile", profile.profile_id),
             "intent_hint": state.get("intent_hint", intent_hint),
         }
-        delegated = standard_agent.invoke(payload, context=ctx)
+        delegate_thread_id = f"{state.get('session_id', '') or getattr(ctx, 'run_id', '')}:standard_agent"
+        delegated = standard_agent.invoke(
+            payload,
+            config=_standard_agent_run_config(profile, delegate_thread_id),
+            context=ctx,
+        )
         route_trace = dict(state.get("route_trace", {}) or {})
         route_trace["tool_call_sequence"] = _extract_tool_sequence(list(delegated.get("messages", []) or []))
         delegated["phase"] = "delegated"
@@ -3295,6 +3342,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     def preprocess_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
         messages = list(state.get("messages", []) or [])
         text = _latest_user_text(messages)
+        has_multimodal_input = _has_current_multimodal_media(messages)
         route_trace = {
             "run_id": str(getattr(ctx, "run_id", "") or ""),
             "session_id": str(state.get("session_id", "")),
@@ -3336,7 +3384,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         }
 
         perception: dict[str, Any] = {}
-        if _has_current_multimodal_media(messages):
+        if has_multimodal_input:
             perception = _run_direct_multimodal_perception(ctx=ctx, cfg=cfg, messages=messages)
             if _multimodal_perception_has_signal(perception):
                 text = _objective_multimodal_text(perception, text)
@@ -3514,6 +3562,44 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "route_trace": route_trace,
                 "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
             }
+        understanding_intent = str(understanding.get("intent") or "").strip().lower()
+        needs_evidence = bool(understanding.get("evidence_required"))
+        query_candidates = list(understanding.get("search_query_candidates") or [])
+        if (
+            understanding_intent in {"knowledge", "troubleshooting"}
+            and needs_evidence
+            and query_candidates
+            and not has_multimodal_input
+        ):
+            route_trace["route"] = "knowledge"
+            route_trace["task_type"] = "platform_knowledge"
+            route_trace["tool_bundle"] = list(KNOWLEDGE_BUNDLE)
+            route_trace["reasoning_trace"] = {
+                **dict(route_trace.get("reasoning_trace", {}) or {}),
+                "route_source": "understanding_to_knowledge_chain",
+                "evidence_required": True,
+                "missing_slot": dict(understanding.get("missing_slot") or {}),
+            }
+            return {
+                "phase": "knowledge",
+                "phase_history": ["preprocess", "knowledge"],
+                "status": "running",
+                "task_goal": text,
+                "messages": messages,
+                "perception_result": perception,
+                "generated_answer": "",
+                "delegate_answer": "",
+                "generated_tool_calls": [],
+                "delegate_input_message_count": len(messages),
+                "output_assets": [],
+                "check_result": {},
+                "intent_hint": understanding_intent,
+                "route_trace": route_trace,
+                "pending_update_state": pending_after,
+                "ship_update_draft": draft_after,
+                "_pending_before": pending_before,
+                "response_modalities": ["text", "link"],
+            }
         return {
             "phase": "preprocess",
             "phase_history": ["preprocess"],
@@ -3535,6 +3621,47 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "response_modalities": ["text", "link"],
         }
 
+    def knowledge_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
+        messages = list(state.get("messages", []) or [])
+        question = str(state.get("task_goal") or _latest_user_text(messages) or "").strip()
+        route_trace = dict(state.get("route_trace", {}) or {})
+        reasoning_trace = dict(route_trace.get("reasoning_trace", {}) or {})
+        understanding = dict(reasoning_trace.get("understanding_result", {}) or {})
+        answer, trace, _evidence_items, evidence_summary = _execute_customer_support_planner(
+            question=question,
+            route="knowledge",
+            task_type="platform_knowledge",
+            tool_bundle=KNOWLEDGE_BUNDLE,
+            entities=extract_entities(question),
+            context=build_conversation_context(messages),
+            understanding_result=understanding,
+            session_id=str(state.get("session_id", "")),
+            run_id=str(getattr(ctx, "run_id", "") or ""),
+        )
+        trace["reasoning_trace"] = {
+            **dict(trace.get("reasoning_trace", {}) or {}),
+            "route_source": "understanding_to_knowledge_chain",
+            "evidence_required": bool(understanding.get("evidence_required")),
+            "missing_slot": dict(understanding.get("missing_slot") or {}),
+        }
+        trace["evidence_summary"] = dict(evidence_summary or {})
+        return {
+            "phase": "knowledge",
+            "status": "success",
+            "phase_history": list(state.get("phase_history", [])) + ["knowledge_complete"],
+            "task_goal": question,
+            "messages": [AIMessage(content=sanitize_customer_output(answer))],
+            "generated_answer": sanitize_customer_output(answer),
+            "delegate_answer": "",
+            "generated_tool_calls": list(trace.get("tool_call_sequence", []) or []),
+            "perception_result": dict(state.get("perception_result", {}) or {}),
+            "route_trace": trace,
+            "pending_update_state": dict(state.get("pending_update_state", {}) or {}),
+            "ship_update_draft": dict(state.get("ship_update_draft", {}) or {}),
+            "_pending_before": dict(state.get("_pending_before", {}) or {}),
+            "response_modalities": ["text", "link"],
+        }
+
     def delegate_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
         if state.get("phase") == "done" and state.get("messages"):
             return dict(state)
@@ -3552,7 +3679,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             try:
                 delegated = standard_agent.invoke(
                     payload,
-                    config={"configurable": {"thread_id": delegate_thread_id}},
+                    config=_standard_agent_run_config(profile, delegate_thread_id),
                     context=ctx,
                 )
             except TypeError as exc:
@@ -3560,19 +3687,23 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                     raise
                 delegated = standard_agent.invoke(payload, context=ctx)
         except Exception as exc:
-            if not _is_standard_agent_message_state_error(exc):
+            if not (_is_standard_agent_message_state_error(exc) or _is_standard_agent_recursion_error(exc)):
                 raise
             route_trace = dict(state.get("route_trace", {}) or {})
-            route_trace["fallback_reason"] = "standard_agent_message_state_error"
+            fallback_reason = "standard_agent_recursion_limit" if _is_standard_agent_recursion_error(exc) else "standard_agent_message_state_error"
+            fallback_answer = STANDARD_AGENT_RECURSION_FALLBACK if fallback_reason == "standard_agent_recursion_limit" else STANDARD_AGENT_MESSAGE_STATE_FALLBACK
+            route_trace["fallback_reason"] = fallback_reason
+            route_trace["max_iterations"] = profile.max_iterations
+            route_trace["recursion_limit"] = _standard_agent_run_config(profile, delegate_thread_id)["recursion_limit"]
             return {
                 "phase": "delegate",
                 "status": "success",
                 "phase_history": list(state.get("phase_history", [])) + ["delegate", "fallback"],
                 "task_goal": state.get("task_goal", ""),
                 "delegate_input_message_count": len(input_messages),
-                "messages": [AIMessage(content=STANDARD_AGENT_MESSAGE_STATE_FALLBACK)],
-                "generated_answer": STANDARD_AGENT_MESSAGE_STATE_FALLBACK,
-                "delegate_answer": STANDARD_AGENT_MESSAGE_STATE_FALLBACK,
+                "messages": [AIMessage(content=fallback_answer)],
+                "generated_answer": fallback_answer,
+                "delegate_answer": fallback_answer,
                 "generated_tool_calls": [],
                 "perception_result": dict(state.get("perception_result", {}) or {}),
                 "route_trace": route_trace,
@@ -3696,14 +3827,18 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     def route_after_preprocess(state: LightweightCustomerSupportState) -> str:
         if state.get("phase") == "done":
             return "finalize"
+        if state.get("phase") == "knowledge":
+            return "knowledge"
         return "delegate"
 
     graph = StateGraph(LightweightCustomerSupportState)
     graph.add_node("preprocess", preprocess_node)
+    graph.add_node("knowledge", knowledge_node)
     graph.add_node("delegate", delegate_node)
     graph.add_node("finalize", finalize_node)
     graph.add_edge(START, "preprocess")
-    graph.add_conditional_edges("preprocess", route_after_preprocess, {"delegate": "delegate", "finalize": "finalize"})
+    graph.add_conditional_edges("preprocess", route_after_preprocess, {"knowledge": "knowledge", "delegate": "delegate", "finalize": "finalize"})
+    graph.add_edge("knowledge", "finalize")
     graph.add_edge("delegate", "finalize")
     graph.add_edge("finalize", END)
     try:

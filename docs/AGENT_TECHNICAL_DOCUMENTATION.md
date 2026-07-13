@@ -23,11 +23,14 @@ flowchart TD
     Understanding --> ShipUpdate[ship_update subagent]
     ShipUpdate --> WriteBoundary[tool whitelist + skills parameter formatting]
     WriteBoundary --> WriteTools[upload_ship_position / update_ship_static_info]
-    Pre --> Standard[standard tool-calling skills agent]
+    Understanding --> Knowledge{纯文本且需要证据?}
+    Knowledge -->|是| KnowledgeChain[local KB -> web -> browser verification]
+    Knowledge -->|否| Standard[standard tool-calling skills agent fallback]
     Standard --> ReadTools[knowledge / browser / ship read tools]
     Build --> EMP[legacy employee/workspace graph]
     EMP --> EmployeeLoop[legacy knowledge or workspace loop]
     WriteTools --> Finalize[finalize + guards]
+    KnowledgeChain --> Finalize
     ReadTools --> Finalize
     Main --> Obs[observability]
 ```
@@ -36,14 +39,14 @@ flowchart TD
 
 | 文件 | 责任 |
 | --- | --- |
-| `src/main.py` | HTTP 入口、`/run`/`/stream_run`、微信旧格式归一化、模型路由、观测写入 |
+| `src/main.py` | HTTP 入口、`/run`/`/stream_run`、微信旧格式归一化、模型路由、观测写入、外部客服递归超限兜底 |
 | `src/agents/profiles.py` | profile 配置、请求体/header 解析、权限边界 |
-| `src/agents/agent.py` | `build_agent()`、`customer_support` / `customer_ceshi` 轻量 graph、ship_update 子 agent 调度 |
+| `src/agents/agent.py` | `build_agent()`、轻量 graph、需求理解到知识链分流、ship_update 子 agent 调度、standard agent 递归预算 |
 | `config/agent_profiles.json` | `customer_support` / `customer_ceshi` skills、工具权限和别名 |
 | `config/profiles/customer_support.md` | 外部客服轻量 skills agent 的业务规则和安全边界 |
 | `config/agent_llm_config.json` | 默认模型、thinking、工具配置 |
 | `src/agents/customer_support_guard.py` | 客服最终输出脱敏、拒答、链接清洗 |
-| `src/agents/customer_support_understanding.py` | 需求处理 agent 的结构化理解，包括 ship_update 候选、pending 动作和非写入原因 |
+| `src/agents/customer_support_understanding.py` | 需求处理 agent 的结构化理解，包括 `user_goal`、`evidence_required`、ship_update 候选、pending 动作和非写入原因 |
 | `src/agents/ship_update_subagent.py` | prompt-driven 船舶更新子 agent、`ship_update_draft`、旧 pending 兼容和 fallback |
 | `src/skills/knowledge_qa/tools.py` | `local_kb_search / web_search / web_search_agent_browser` |
 | `src/skills/knowledge_admin/tools.py` | 授权写入本地结构化客服知识库 |
@@ -51,7 +54,7 @@ flowchart TD
 | `src/skills/multimodal_support/tools.py` | 附件 metadata 辅助 |
 | `src/skills/browser_verify/tools.py` | 公开网页核验、`agent_browser_deep_search` |
 
-`src/agents/customer_support_router.py` 和旧 `_build_customer_support_agent()` 不再承担当前 `customer_support` 的通用知识主链。ship_update 写请求当前由 `ship_update` 子 agent 输出结构化计划，主 graph 只负责工具白名单、真实工具调用、工具结果判定和 trace。`customer_support_router.py` 主要保留为 legacy/fallback/test compatibility。
+`src/agents/customer_support_router.py` 的知识链当前由轻量 graph 直接复用：当 JSON 需求理解结果为纯文本 `knowledge` / `troubleshooting` 且 `evidence_required=true` 时，主 graph 将请求交给该模块执行本地知识库、网页搜索和浏览器核验。`_build_customer_support_agent()` 仍主要用于兼容与测试。ship_update 写请求继续由 `ship_update` 子 agent 输出结构化计划，主 graph 负责工具白名单、真实工具调用、工具结果判定和 trace。
 
 Profile 解析规则：
 
@@ -59,13 +62,33 @@ Profile 解析规则：
 - 未提供合法 Profile 时，默认使用 `customer_support`。
 - `source_channel` 只用于日志、观测、后台筛选和调用来源记录，不参与 Profile 判断。
 
+### 1.1 需求理解驱动的知识检索
+
+轻量客服 graph 不根据箱号、订单号或其他编号格式写死路由。`preprocess` 会调用 JSON 需求理解 agent，统一使用以下既有字段决定是否进入知识链：
+
+- `intent`、`user_goal`：用户要解决的问题；
+- `rewritten_user_need`：可检索的问题改写；
+- `search_keywords`、`search_query_candidates`：检索关键词和 query 计划；
+- `evidence_required`：是否必须先取得证据；
+- `missing_slot`：证据不足时唯一允许追问的关键信息。
+
+纯文本请求同时满足 `intent in {knowledge, troubleshooting}`、`evidence_required=true` 且存在 query 计划时，走确定性的知识链而不委派给开放式 `standard_agent`。典型场景包括未知编号的可用查询方式、产品能力边界和需要证据确认的排障问题。多模态请求仍优先保持原有 perception/standard agent 专用处理，船舶写入继续优先走 ship_update 子 agent。
+
+`evidence_required=true` 时，知识链不会因本地 KB 或网页的单层 `can_answer=true` 提前结束；在工具可用且网页给出候选页面时，将继续浏览器页面核验，再由现有 evidence review 生成结论或单一追问。
+
+### 1.2 递归预算与异常边界
+
+仍需委派给 `standard_agent` 的路径会把 profile 的 `max_iterations` 映射为 LangGraph `recursion_limit = 2 * max_iterations + 1`；当前客服默认 `max_iterations=6`，实际预算为 `13`，不再使用框架默认 25。
+
+`customer_support` 与 `customer_ceshi` 发生 `GraphRecursionError` 时，图级优先返回中文澄清回复，并在 `route_trace` 记录 `standard_agent_recursion_limit`、预算和降级原因。若异常越过图级保护，`/run` 与 `/stream_run` 仍会返回 HTTP 200 的 `degraded_success` 业务兜底；其他 profile 和非递归异常保持原有错误语义。异常仍写入 `observability.agent_errors`，其中 `stack_trace` 会统一存为文本。
+
 ## 2. Profile 边界
 
 | 维度 | `customer_support` | `customer_ceshi` |
 | --- | --- | --- |
 | 面向对象 | 外部客户、微信客服、WebSDK、CRM；兼容旧 `employee_assistant` 调用 | 回归、trace、后台客服链路验证 |
 | 主目标 | 直接回复客户，并在需要时调用 allowed skills | 验证同一客服 graph 下的高风险写入、可读 trace 和回归场景 |
-| 主执行方式 | 轻量 graph；默认 `preprocess -> delegate -> finalize`，ship_update 可在 preprocess 由子 agent 接管 | 同一 lightweight graph，profile prompt 更强调回归和审计 |
+| 主执行方式 | 轻量 graph；`preprocess` 后按需求理解进入 ship_update、证据知识链或 standard agent 兜底，再 `finalize` | 同一 lightweight graph，profile prompt 更强调回归和审计 |
 | 模型 | 文本模型默认 `deepseek-v4-flash-260425`，多模态默认 `doubao-seed-2-0-lite-260428` | 同后台配置 |
 | 多模态 | 支持文本、图片、语音、视频当前轮理解；perception 只客观整理上下文 | 同 customer_support |
 | 船舶工具 | 写工具不暴露给 standard agent；由 ship_update 子 agent 计划后主链路调用 | 同 customer_support |
@@ -387,4 +410,4 @@ flowchart TD
 - 改授权写库：改 `src/skills/knowledge_admin/tools.py`。
 - 改船舶读写工具接口或成功回复：改 `src/skills/hifleet_ship_service/tools.py`。
 - 改 ship_update 子 agent prompt、JSON 结构、draft 兼容或执行前参数格式化：改 `src/agents/ship_update_subagent.py`。
-- 旧 `customer_support_router.py` 不再承载当前 customer 的通用知识主链；保留为 legacy/fallback/test compatibility，不能作为新写入审核中心扩展。
+- `customer_support_router.py` 的知识检索链由轻量客服 graph 直接复用；旧的完整 customer graph 装配仍仅用于兼容和测试，不能作为新写入审核中心扩展。

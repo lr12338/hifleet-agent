@@ -7,8 +7,16 @@
 当前主链为：
 
 ```text
-preprocess -> delegate standard skills agent -> finalize
+preprocess -> ship_update | knowledge | delegate -> finalize
 ```
+
+其中纯文本请求的 `intent=knowledge|troubleshooting`、`evidence_required=true` 且存在 `search_query_candidates` 时，直接进入已有知识链：
+
+```text
+preprocess -> CustomerUnderstanding JSON -> local_kb_search -> web_search -> web_search_agent_browser -> evidence review -> finalize
+```
+
+该路径不根据箱号、订单号或其他编号格式写死路由；短输入由需求理解 agent 生成可检索需求与 query。多模态输入继续优先保留原有 perception/standard-agent 处理，ship_update 继续优先于知识链。
 
 其中 ship_update 是轻量 graph 的 prompt-driven 子 agent 特殊分支：
 
@@ -32,7 +40,7 @@ preprocess -> multimodal perception -> ship_update subagent -> tool whitelist ->
 12. 最终输出脱敏、链接抽取和 `output_assets`。
 13. `/run`、`/stream_run` 和微信旧 `content.query.prompt` 兼容。
 
-旧 `customer_support_router.py`、旧 planner/review/harness 和旧 `_build_customer_support_agent()` 不再承载当前 customer 的通用知识主链。ship_update 写请求当前由 `ship_update` 子 agent 生成结构化计划，主链路只负责工具白名单、真实工具调用、工具结果判定和 trace。
+`customer_support_router.py` 的既有三层知识链现由 lightweight graph 直接复用；旧 `_build_customer_support_agent()` 仍主要用于兼容和测试。ship_update 写请求当前由 `ship_update` 子 agent 生成结构化计划，主链路只负责工具白名单、真实工具调用、工具结果判定和 trace。
 
 Profile 选择只看请求体 `agent_profile` 或请求头 `x-agent-profile`；`source_channel` 只用于日志和后台筛选，不参与运行时 Profile 判断。未传合法 Profile 时默认 `customer_support`。
 
@@ -72,8 +80,8 @@ npm run build
 
 一次成功客服请求通常应满足：
 
-1. `route_trace.route` 为 `lightweight_skills_agent`。
-2. `phase_history` 包含 `preprocess`、`delegate`、`finalize`。
+1. `route_trace.route` 为 `lightweight_skills_agent`、`knowledge` 或 `ship_update`，与实际处理链一致。
+2. `phase_history` 包含 `preprocess`、`finalize`，并根据路径包含 `knowledge` 或 `delegate`。
 3. 多模态输入时，`route_trace.reasoning_trace.pipeline` 包含 `multimodal_input_parse`。
 4. `generated_tool_calls` 与真实执行工具一致。
 5. `check_result` 能反映输出清洗、链接安全和旧 router bypass 状态。
@@ -81,6 +89,13 @@ npm run build
 7. `output_assets` 只包含可给客户看的公开链接或图文链接。
 8. 最终 `messages[-1].content` 已经过 `sanitize_customer_output(...)`。
 9. 普通用户回复中不能出现 prompt、tool registry、reasoning trace、JSON、内部路径、key/token。
+
+如果是 `evidence_required=true` 的纯文本知识请求，还应满足：
+
+1. `route_trace.reasoning_trace.route_source=understanding_to_knowledge_chain`。
+2. `reasoning_trace.understanding_result` 保留 `user_goal`、`rewritten_user_need`、`search_query_candidates`、`evidence_required` 和 `missing_slot`。
+3. 工具齐备时，`retrieval_trace` 覆盖本地 KB、web 和 browser 三层，而不是在单层 `can_answer=true` 时提前结束。
+4. 无可靠证据或证据冲突时，只追问 `missing_slot` 中的一个关键信息；不得断言编号类型或“不支持”。
 
 如果是 ship_update 写请求，验收还应满足：
 
@@ -97,6 +112,8 @@ npm run build
 ### 4.1 知识问答
 
 - 本地 FAQ 强命中时，应优先使用 `local_kb_search`。
+- `ZGXU3108512`、`ZGXU3108512 查船位` 等短输入不应按编号格式固定拒绝；应由需求理解生成能力确认 query，检索后再回复或追问编号类型/关联船名、MMSI、IMO。
+- 对 `evidence_required=true` 的能力确认，即使本地 KB 或网页返回 `can_answer=true`，仍应在候选网页存在时完成 browser 核验。
 - `web_search` 命中具体事实页时，不应再触发不必要的 browser。
 - 用户要求验证官方/社区/今日/最新内容时，应触发 browser 或公开页面核验。
 - `agent_browser_deep_search` 返回结构化 evidence 后，最终回复不能暴露内部 CLI、日志、路径、JSON。
@@ -218,13 +235,13 @@ npm run build
 1. `llm_route`
    - 是否使用预期模型、模态和 thinking 配置。
 2. `route_trace.route`
-   - 是否为 `lightweight_skills_agent`。
+   - 是否与 `lightweight_skills_agent`、`knowledge`、`ship_update` 中的实际路径一致。
 3. `route_trace.reasoning_trace.pipeline`
    - 是否经过多模态预处理。
 4. `route_trace.reasoning_trace.perception_summary`
    - 附件识别是否为空或置信度过低。
 5. `phase_history`
-   - 是否包含 `preprocess/delegate/finalize`。
+   - 是否包含 `preprocess/finalize`，并与 `knowledge` 或 `delegate` 路径一致。
 6. `generated_tool_calls`
    - 是否调用了预期工具，是否误调写工具。
 7. `response_modalities` / `output_assets`
@@ -246,7 +263,13 @@ npm run build
 15. `route_trace.reasoning_trace.write_args`
     - 最终准备传给工具的参数是否完整。
 16. `route_trace.reasoning_trace.missing_required_fields`
-    - 是真实缺字段，还是误路由后自然缺字段。
+   - 是真实缺字段，还是误路由后自然缺字段。
+17. `route_trace.reasoning_trace.understanding_result`
+   - 短输入是否形成了有效的 `user_goal`、`evidence_required`、query 和唯一 `missing_slot`。
+18. `route_trace.reasoning_trace.route_source`
+   - 是否为 `understanding_to_knowledge_chain`；若未进入，应确认是否多模态、ship_update 或复杂兜底请求。
+19. `fallback_reason` / `recursion_limit`
+   - 是否发生 `standard_agent_recursion_limit`；确认 profile 预算是否已生效。
 
 知识链额外看：
 

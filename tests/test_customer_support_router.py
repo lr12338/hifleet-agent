@@ -131,6 +131,59 @@ def test_knowledge_chain_escalates_to_web_search_agent_browser():
     assert trace.reasoning_trace["retrieval_trace"]["t2_tool"] == "web_search_agent_browser"
 
 
+def test_evidence_required_knowledge_chain_does_not_short_circuit_before_browser():
+    calls = []
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: calls.append("local_kb_search") or json.dumps(
+            {"tool": "local_kb_search", "status": "ok", "can_answer": True, "items": [{"title": "帮助", "content": "本地说明"}]},
+            ensure_ascii=False,
+        ),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: calls.append("web_search") or json.dumps(
+            {
+                "tool": "web_search",
+                "status": "ok",
+                "can_answer": True,
+                "continue_with": "none",
+                "items": [{"title": "官方帮助", "url": "https://www.hifleet.com/helpcenter/", "snippet": "支持范围"}],
+                "best_urls": ["https://www.hifleet.com/helpcenter/"],
+                "trace": {"result_profile": {"result_count": 1, "official_count": 1}},
+            },
+            ensure_ascii=False,
+        ),
+    )
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: calls.append("web_search_agent_browser") or json.dumps(
+            {"tool": "web_search_agent_browser", "status": "ok", "can_answer": True, "pages": [{"title": "官方帮助", "url": "https://www.hifleet.com/helpcenter/", "excerpt": "核验内容", "official": True}]},
+            ensure_ascii=False,
+        ),
+    )
+    text = "某编号能否查询船位"
+    decision = classify_message(text, extract_entities(text))
+    trace = make_trace(decision, extract_entities(text))
+    trace.reasoning_trace["understanding_result"] = {
+        "rewritten_user_need": "确认 HiFleet 是否支持使用该编号查询船位",
+        "query_type": "hifleet_product",
+        "search_query_candidates": ["HiFleet 编号查询 船位 支持范围"],
+        "evidence_required": True,
+        "should_limit_to_hifleet_sites": True,
+    }
+
+    execute_planned_knowledge_chain(
+        text,
+        decision,
+        [],
+        {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser},
+        trace,
+    )
+
+    assert calls == ["local_kb_search", "web_search", "web_search_agent_browser"]
+
+
 def test_knowledge_chain_runs_multiple_understanding_queries_before_answering():
     local_kb = FakeTool(
         "local_kb_search",

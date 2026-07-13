@@ -1257,6 +1257,7 @@ def _understanding_summary_for_trace(understanding_result: dict[str, Any] | None
         "rewritten_user_need": str(result.get("rewritten_user_need", "")),
         "search_keywords": list(result.get("search_keywords", []) or []),
         "understanding_primary_query": str(candidates[0] if candidates else ""),
+        "evidence_required": bool(result.get("evidence_required")),
         "should_prefer_local_kb": bool(result.get("should_prefer_local_kb")),
         "should_limit_to_hifleet_sites": bool(result.get("should_limit_to_hifleet_sites")),
     }
@@ -2124,6 +2125,7 @@ def _invoke_three_layer_knowledge_chain(
     outputs: list[str] = []
     evidence_items: list[dict[str, Any]] = []
     retrieval_trace = _new_knowledge_retrieval_trace(understanding_summary, query)
+    require_full_evidence = bool(understanding_summary.get("evidence_required"))
     site_hint = "hifleet.com" if understanding_summary.get("should_limit_to_hifleet_sites") or _looks_like_hifleet_product_query(question) else ""
 
     local_payload: dict[str, Any] = {}
@@ -2147,7 +2149,7 @@ def _invoke_three_layer_knowledge_chain(
         retrieval_trace["t0_kb_hit"] = bool((local_payload.get("items") or []))
         retrieval_trace["t0_can_answer"] = bool(local_payload.get("can_answer"))
         retrieval_trace["t0_result_count"] = len(list(local_payload.get("items") or []))
-        if local_payload.get("can_answer"):
+        if local_payload.get("can_answer") and not require_full_evidence:
             retrieval_trace["t1_eval_decision"] = "short_circuit"
             retrieval_trace["t1_eval_reason"] = "local_kb_search can_answer=true"
             return outputs, evidence_items, retrieval_trace
@@ -2204,13 +2206,13 @@ def _invoke_three_layer_knowledge_chain(
                 "t2_target_urls": list(web_payload.get("best_urls") or []),
             }
         )
-        if web_payload.get("can_answer"):
+        if web_payload.get("can_answer") and not require_full_evidence:
             retrieval_trace["t1_eval_decision"] = "short_circuit"
             retrieval_trace["t1_eval_reason"] = "web_search can_answer=true"
             return outputs, evidence_items, retrieval_trace
 
     should_browser = (
-        str(web_payload.get("continue_with") or "") == "agent_browser"
+        (str(web_payload.get("continue_with") or "") == "agent_browser" or require_full_evidence)
         and bool(web_payload.get("best_urls"))
         and "web_search_agent_browser" in tool_map
     )
@@ -2462,7 +2464,10 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
         retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
-        if chain_trace.get("t2_triggered") or chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"):
+        if chain_trace.get("t2_triggered") or (
+            not understanding_summary.get("evidence_required")
+            and (chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"))
+        ):
             retrieval_trace.update(chain_trace)
             break
         if len(chain_evidence) > len(retrieval_trace.get("layers", [])):
@@ -2544,7 +2549,10 @@ def execute_planned_knowledge_chain(
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
         retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
-        if chain_trace.get("t2_triggered") or chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"):
+        if chain_trace.get("t2_triggered") or (
+            not understanding_summary.get("evidence_required")
+            and (chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"))
+        ):
             chain_trace["query_plan"] = [item.get("query", "") for item in queries]
             chain_trace["query_traces"] = list(retrieval_trace.get("query_traces") or [])
             retrieval_trace = chain_trace

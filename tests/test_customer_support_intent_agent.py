@@ -47,6 +47,7 @@ from skills.skill_loader import SkillLoader
 from skills.knowledge_qa.tools import HIFLEET_COMMUNITY_URL, HIFLEET_SITES
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from coze_coding_utils.runtime_ctx.context import new_context
+from langgraph.errors import GraphRecursionError
 
 
 class FakeTool:
@@ -519,6 +520,10 @@ def test_build_agent_customer_support_uses_lightweight_skills_graph(monkeypatch)
             }
 
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr(
+        "agents.agent._run_lightweight_customer_understanding",
+        lambda **kwargs: {"intent": "knowledge", "evidence_required": False, "search_query_candidates": []},
+    )
     set_current_agent_profile("customer_support")
     graph = build_agent(ctx=SimpleNamespace(headers={}, run_id="r-lightweight-entry"))
 
@@ -1224,6 +1229,84 @@ def test_lightweight_customer_support_handles_last_ai_index_fallback(monkeypatch
     assert result["status"] == "success"
     assert result["route_trace"]["fallback_reason"] == "standard_agent_message_state_error"
     assert "会话上下文状态暂时不稳定" in result["messages"][-1].content
+
+
+def test_lightweight_customer_support_routes_evidence_required_understanding_to_knowledge(monkeypatch):
+    class FakeStandardAgent:
+        def invoke(self, *args, **kwargs):
+            raise AssertionError("evidence-required request must not delegate to standard agent")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr(
+        "agents.agent._run_lightweight_customer_understanding",
+        lambda **kwargs: {
+            "intent": "knowledge",
+            "user_goal": "确认该编号可用于什么查询",
+            "evidence_required": True,
+            "missing_slot": {"field": "identifier_type", "question": "请确认该编号类型。"},
+            "rewritten_user_need": "确认 HiFleet 是否支持使用该编号查询，以及需要补充哪些信息",
+            "query_type": "hifleet_product",
+            "search_keywords": ["HiFleet", "编号查询"],
+            "search_query_candidates": ["HiFleet 编号查询 支持范围"],
+            "should_prefer_local_kb": True,
+            "should_limit_to_hifleet_sites": True,
+        },
+    )
+    smart_search = FakeTool("smart_search", lambda args: "【优先匹配 - FAQ/标准回复】\n请提供船名、MMSI 或 IMO。")
+    monkeypatch.setattr("agents.agent.SkillLoader.get_tools_by_names", lambda names: [smart_search])
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-understanding-knowledge"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="ZGXU3108512")],
+            "session_id": "s-understanding-knowledge",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-understanding-knowledge"}},
+    )
+
+    assert smart_search.calls
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "understanding_to_knowledge_chain"
+    assert result["route_trace"]["reasoning_trace"]["evidence_required"] is True
+
+
+def test_lightweight_customer_support_recursion_fallback_uses_profile_budget(monkeypatch):
+    calls = []
+
+    class BrokenStandardAgent:
+        def invoke(self, payload, context=None, config=None):
+            calls.append(config)
+            raise GraphRecursionError("recursion limit reached")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: BrokenStandardAgent())
+    monkeypatch.setattr(
+        "agents.agent._run_lightweight_customer_understanding",
+        lambda **kwargs: {"intent": "knowledge", "evidence_required": False, "search_query_candidates": []},
+    )
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-recursion-fallback"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", max_iterations=6, skills=["knowledge_qa"]),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content="一个复杂但无法确定的问题")],
+            "session_id": "s-recursion-fallback",
+            "agent_profile": "customer_support",
+        },
+        config={"configurable": {"thread_id": "s-recursion-fallback"}},
+    )
+
+    assert calls[0]["recursion_limit"] == 13
+    assert result["route_trace"]["fallback_reason"] == "standard_agent_recursion_limit"
+    assert "有限步骤内确认" in result["messages"][-1].content
 
 
 def test_hifleet_community_is_registered_as_official_search_source():

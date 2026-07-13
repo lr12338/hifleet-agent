@@ -10,8 +10,9 @@
 /run 或 /stream_run
 -> profile=customer_support
 -> preprocess 多模态感知
--> standard tool-calling skills agent
--> browser_verify / knowledge_qa / ship / multimodal tools
+-> CustomerUnderstanding JSON
+-> 纯文本 evidence_required 请求：knowledge_qa 三层检索
+-> 其他复杂请求：standard tool-calling skills agent 兜底
 -> finalize + customer output guard
 ```
 
@@ -22,7 +23,7 @@
 - 需要核验具体公开页面正文，而不是只依赖搜索摘要。
 - 模型根据 `config/profiles/customer_support.md` 约束判断需要升级核验。
 
-旧 `customer_support_router.py` 中的 browser fallback 只作为回滚和历史测试参考，不再是当前 customer 主入口。
+纯文本知识/排障请求的三层检索会直接复用 `customer_support_router.py` 中的知识链；旧的完整 customer graph 装配仍只作为回滚和历史测试参考，不再是当前 customer 主入口。
 
 ## 2. 工具边界
 
