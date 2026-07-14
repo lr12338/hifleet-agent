@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import time
+import base64
+import io
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
@@ -57,6 +59,7 @@ from agents.customer_support_router import (
     execute_planned_knowledge_chain,
     execute_planned_multimodal_chain,
     execute_simple_ship_chain,
+    execute_ship_tracking_incident_chain,
     execute_stats_chain,
     execute_update_chain,
     extract_attachments,
@@ -72,8 +75,10 @@ from agents.customer_support_router import (
     classify_write_tool_result,
 )
 from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
+from agents.customer_support_scenarios import DestinationEtaScenario, destination_eta_safe_response
 from agents.customer_support_evidence_guard import apply_high_risk_evidence_guard
 from agents.customer_support_understanding import build_customer_understanding
+from agents.multimodal_contracts import evidence_coverage, normalize_evidence_items
 from agents.ship_update_subagent import (
     ALLOWED_WRITE_TOOLS,
     default_ship_update_draft,
@@ -578,11 +583,13 @@ def _run_lightweight_customer_understanding(
     perception: dict[str, Any],
     draft: dict[str, Any],
     pending_update_state: dict[str, Any],
+    has_file_attachment: bool = False,
 ) -> dict[str, Any]:
     fallback = build_customer_understanding(
         text,
         entities=asdict(extract_entities(text)),
         has_media=bool(perception),
+        has_file_attachment=has_file_attachment,
         perception=perception,
         pending_update_state=pending_update_state,
     ).model_dump()
@@ -605,6 +612,29 @@ def _run_lightweight_customer_understanding(
     if not raw:
         return fallback
     normalized = _normalize_ship_update_understanding_result(raw, fallback=fallback)
+    # Audio/video envelopes and their deterministic business routes come from
+    # the perception + customer-text contract. Do not let an incomplete JSON
+    # understanding response erase that routing information.
+    fallback_scenario = str(fallback.get("multimodal_scenario") or "")
+    fallback_business_scenario = str(fallback.get("business_scenario") or "")
+    if fallback_scenario in {"audio_request", "video_request", "file_or_document_task"}:
+        normalized["multimodal_scenario"] = fallback_scenario
+        normalized["business_scenario"] = fallback_business_scenario or None
+    if fallback_business_scenario == "ship_update_from_media" and bool(fallback.get("ship_write_request")):
+        for key in (
+            "operation_type",
+            "ship_update_candidate",
+            "ship_write_request",
+            "ship_update_fields",
+            "ship_identity",
+            "required_fields",
+            "missing_fields",
+            "is_write_request",
+            "action_allowed",
+            "intent",
+            "task_type",
+        ):
+            normalized[key] = fallback.get(key)
     if not normalized.get("rewritten_user_need"):
         normalized["rewritten_user_need"] = str(text or "").strip()
     if not normalized.get("search_query_candidates") and text:
@@ -1476,17 +1506,25 @@ def _execute_customer_support_planner(
         route=route,
         task_type=task_type,
         tool_bundle=list(tool_bundle or []),
-        complexity="complex" if route in {"chart_symbol", "multimodal_understanding", "browser_verify"} else "simple",
-        search_depth="normal" if task_type == "platform_troubleshooting" else "quick",
+        complexity="complex" if route in {"chart_symbol", "multimodal_understanding", "browser_verify", "ship_tracking_incident"} else "simple",
+        search_depth="deep" if task_type in {"platform_troubleshooting", "platform_metric_definition", "platform_ui_explanation", "chart_symbol"} else "quick",
     )
     trace = make_trace(decision, entities, session_id=session_id, run_id=run_id)
     tool_map = {tool.name: tool for tool in SkillLoader.get_tools_by_names(decision.tool_bundle)}
+
+    def finalize_planner_result(answer: str, evidence_items: list[dict[str, Any]], evidence_summary: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        required_claims = list((understanding_result or {}).get("required_claims") or [])
+        normalized_items = normalize_evidence_items(evidence_items, required_claims=required_claims)
+        coverage = evidence_coverage(normalized_items, required_claims)
+        trace.reasoning_trace["evidence_coverage"] = coverage
+        final_summary = {**dict(evidence_summary or {}), "coverage": coverage}
+        return answer, asdict(trace), normalized_items, final_summary
 
     if route == "conversation":
         answer = answer_conversation_memory(question, context)
         trace.check_result = {"conversation_context_used": True}
         trace.answer_confidence = "high"
-        return answer, asdict(trace), [], {"confidence": "high", "can_answer_directly": True}
+        return finalize_planner_result(answer, [], {"confidence": "high", "can_answer_directly": True})
 
     if route == "knowledge":
         trace.reasoning_trace["understanding_result"] = dict(understanding_result or {})
@@ -1497,7 +1535,7 @@ def _execute_customer_support_planner(
             tool_map=tool_map,
             trace=trace,
         )
-        return answer, asdict(trace), evidence_items, evidence_summary
+        return finalize_planner_result(answer, evidence_items, evidence_summary)
 
     if route in {"chart_symbol", "multimodal_understanding"}:
         answer, evidence_items, evidence_summary = execute_planned_multimodal_chain(
@@ -1509,10 +1547,68 @@ def _execute_customer_support_planner(
             tool_map=tool_map,
             trace=trace,
         )
-        return answer, asdict(trace), evidence_items, evidence_summary
+        return finalize_planner_result(answer, evidence_items, evidence_summary)
+
+    if route == "ship_tracking_incident":
+        answer = execute_ship_tracking_incident_chain(question, dict(perception or {}), tool_map, trace)
+        packet = dict(trace.reasoning_trace.get("incident_packet") or {})
+        incident_evidence: list[dict[str, Any]] = []
+        if str(perception or {}).strip("{} "):
+            incident_evidence.append(
+                {
+                    "source_type": "visual",
+                    "source_name": "multimodal_perception",
+                    "claim": "附件中可见的受影响船舶与船位页面信息",
+                    "snippet": str((perception or {}).get("summary") or (perception or {}).get("recognized_text") or "")[:500],
+                    "authority": 0.7,
+                    "relevance": 0.9,
+                    "verified": True,
+                    "supports": ["ship_identity"],
+                    "conflicts": [],
+                }
+            )
+        for label, value in (("船端 AIS 状态", packet.get("onboard_ais_status")), ("周边船状态", packet.get("nearby_ships_status"))):
+            if isinstance(value, dict) and value.get("value"):
+                incident_evidence.append(
+                    {
+                        "source_type": "user_reported",
+                        "source_name": "customer_report",
+                        "claim": label,
+                        "snippet": str(value.get("value")),
+                        "authority": 0.35,
+                        "relevance": 0.85,
+                        "verified": False,
+                        "supports": ["incident_packet"],
+                        "conflicts": [],
+                    }
+                )
+        for fact in list(packet.get("tool_verified_facts") or []):
+            if isinstance(fact, dict):
+                incident_evidence.append(
+                    {
+                        "source_type": "ship_tool",
+                        "source_name": str(fact.get("source") or "ship_tool"),
+                        "claim": "船舶工具返回的最近船位或档案信息",
+                        "snippet": str(fact.get("summary") or "")[:500],
+                        "authority": 0.95,
+                        "relevance": 0.95,
+                        "verified": True,
+                        "supports": ["last_position_evidence", "incident_packet"],
+                        "conflicts": [],
+                    }
+                )
+        return finalize_planner_result(answer, incident_evidence, {"confidence": trace.answer_confidence, "can_answer_directly": True})
+
+    if route == "ship_single":
+        answer = execute_simple_ship_chain(question, decision, entities, tool_map, trace)
+        return finalize_planner_result(answer, [], {"confidence": trace.answer_confidence, "can_answer_directly": True})
+
+    if route == "file_task":
+        answer = execute_file_chain(question, list(attachments or []), decision, tool_map, trace)
+        return finalize_planner_result(answer, [], {"confidence": trace.answer_confidence, "can_answer_directly": True})
 
     trace.fallback_reason = "unsupported_planner_route"
-    return "", asdict(trace), [], {"confidence": "low", "can_answer_directly": False}
+    return finalize_planner_result("", [], {"confidence": "low", "can_answer_directly": False})
 
 
 def _heuristic_image_perception(attachments: list[Attachment], text: str = "") -> dict[str, Any]:
@@ -1564,7 +1660,7 @@ def _sanitize_historical_multimodal_content(content: Any) -> Any:
         if not isinstance(seg, dict):
             continue
         seg_type = str(seg.get("type", "")).strip().lower()
-        if seg_type in {"input_audio", "image_url", "video_url"}:
+        if seg_type in {"input_audio", "image_url", "video_url", "file_url"}:
             continue
         kept.append(seg)
     if not kept:
@@ -1657,7 +1753,11 @@ def _message_text_segments(messages: list[AnyMessage] | list[Any] | None) -> lis
 
 
 def _has_current_multimodal_media(messages: list[AnyMessage] | list[Any] | None) -> bool:
-    return any(str(part.get("type", "")).strip().lower() in {"input_audio", "image_url", "video_url"} for part in _iter_latest_human_content_parts(messages))
+    return any(str(part.get("type", "")).strip().lower() in {"input_audio", "image_url", "video_url", "file_url"} for part in _iter_latest_human_content_parts(messages))
+
+
+def _has_current_file_attachment(messages: list[AnyMessage] | list[Any] | None) -> bool:
+    return any(str(part.get("type", "")).strip().lower() == "file_url" for part in _iter_latest_human_content_parts(messages))
 
 
 def _latest_human_content(messages: list[AnyMessage] | list[Any] | None) -> Any:
@@ -1678,6 +1778,8 @@ def _primary_multimodal_type(messages: list[AnyMessage] | list[Any] | None) -> s
             return "image"
         if part_type == "video_url":
             return "video"
+        if part_type == "file_url":
+            return "file"
     return "unknown"
 
 
@@ -1685,17 +1787,30 @@ def _fallback_multimodal_perception(messages: list[AnyMessage] | list[Any] | Non
     user_text = "\n".join(_message_text_segments(messages)).strip()
     return {
         "attachment_type": attachment_type or _primary_multimodal_type(messages),
+        "source": "fallback",
+        "confidence": "low",
         "recognized_text": "",
+        "visible_text_blocks": [],
+        "page_type": "",
+        "application_context": "unknown",
         "summary": "",
         "visible_features": "",
         "visible_text": "",
+        "highlighted_regions": [],
+        "user_target_region": {},
+        "ship_entities": [],
+        "metric_entities": [],
+        "error_entities": [],
+        "visual_objects": [],
+        "audio_transcript": "",
+        "video_summary": "",
+        "needs_secondary_crop": False,
+        "uncertain_fields": [],
         "suspected_symbol": "",
         "suspected_issue": "",
         "visual_question_summary": "",
         "lookup_keywords": "",
         "needs_knowledge_lookup": False,
-        "confidence": "low",
-        "source": "fallback",
         "user_text": user_text,
     }
 
@@ -1708,7 +1823,7 @@ def _normalize_multimodal_perception(raw: dict[str, Any], fallback: dict[str, An
     if confidence not in {"high", "medium", "low"}:
         confidence = "low"
     value["confidence"] = confidence
-    for key in ("recognized_text", "summary", "visible_features", "visible_text", "suspected_symbol", "suspected_issue", "visual_question_summary", "lookup_keywords", "attachment_type"):
+    for key in ("recognized_text", "summary", "visible_features", "visible_text", "suspected_symbol", "suspected_issue", "visual_question_summary", "lookup_keywords", "attachment_type", "page_type", "application_context", "audio_transcript", "video_summary"):
         if isinstance(value.get(key), list):
             value[key] = "，".join(str(item).strip() for item in value.get(key) or [] if str(item).strip())
         value[key] = str(value.get(key) or "").strip()
@@ -1720,7 +1835,74 @@ def _normalize_multimodal_perception(raw: dict[str, Any], fallback: dict[str, An
     if not value["visible_features"] and value["summary"]:
         value["visible_features"] = value["summary"]
     value["source"] = str(value.get("source") or "direct_multimodal_model")
+    for key in ("visible_text_blocks", "highlighted_regions", "ship_entities", "metric_entities", "error_entities", "visual_objects", "uncertain_fields"):
+        value[key] = list(value.get(key) or []) if isinstance(value.get(key), list) else []
+    value["user_target_region"] = dict(value.get("user_target_region") or {}) if isinstance(value.get("user_target_region"), dict) else {}
+    value["needs_secondary_crop"] = bool(value.get("needs_secondary_crop"))
     return value
+
+
+def _center_detail_image_part(messages: list[AnyMessage] | list[Any]) -> dict[str, Any] | None:
+    """Create one generic detail montage for dense base64 screenshots.
+
+    The montage preserves three overlapping horizontal regions (left, center and
+    right) at the same scale. This is a content-agnostic second pass: it does
+    not use filenames, fixed case coordinates, OCR text, or route information.
+    """
+    content = _latest_human_content(messages)
+    if not isinstance(content, list):
+        return None
+    image_part = next((part for part in content if isinstance(part, dict) and str(part.get("type") or "").lower() == "image_url"), None)
+    url = str(((image_part or {}).get("image_url") or {}).get("url") or "")
+    if not url.startswith("data:image/") or ";base64," not in url:
+        return None
+    try:
+        from PIL import Image
+
+        encoded = url.split(";base64,", 1)[1]
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as original:
+            image = original.convert("RGB")
+            width, height = image.size
+            if width < 900 or height < 500:
+                return None
+            crop_width, crop_height = int(width * 0.48), int(height * 0.7)
+            top = max(0, (height - crop_height) // 2)
+            max_left = max(0, width - crop_width)
+            left_positions = (0, max_left // 2, max_left)
+            crops = [image.crop((left, top, left + crop_width, top + crop_height)) for left in left_positions]
+            montage = Image.new("RGB", (crop_width * len(crops), crop_height), "white")
+            for index, crop in enumerate(crops):
+                montage.paste(crop, (index * crop_width, 0))
+            buffer = io.BytesIO()
+            montage.save(buffer, format="PNG")
+        return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")}}
+    except Exception:
+        return None
+
+
+def _merge_multimodal_perceptions(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(primary or {})
+    for key, value in dict(secondary or {}).items():
+        if key in {"ship_entities", "metric_entities", "error_entities", "visible_text_blocks", "visual_objects"}:
+            continue
+        if not merged.get(key) and value:
+            merged[key] = value
+    for key in ("ship_entities", "metric_entities", "error_entities", "visible_text_blocks", "visual_objects"):
+        combined: list[Any] = []
+        seen: set[str] = set()
+        for item in list(primary.get(key) or []) + list(secondary.get(key) or []):
+            if not isinstance(item, dict):
+                continue
+            identity = "|".join(str(item.get(name) or "").strip().lower() for name in ("mmsi", "imo", "name", "text", "error_text"))
+            if identity and identity in seen:
+                continue
+            if identity:
+                seen.add(identity)
+            combined.append(item)
+        merged[key] = combined
+    if str(secondary.get("confidence") or "").lower() == "high":
+        merged["confidence"] = "high"
+    return merged
 
 
 def _run_direct_multimodal_perception(
@@ -1751,8 +1933,12 @@ def _run_direct_multimodal_perception(
     )
     prompt = (
         "你是 HiFleet 多模态感知层。只输出 JSON，不要解释。\n"
-        "字段：attachment_type(audio|image|video|unknown), recognized_text, summary, visible_features, visible_text, "
-        "suspected_symbol, suspected_issue, visual_question_summary, lookup_keywords, needs_knowledge_lookup, confidence(high|medium|low)。\n"
+        "字段：attachment_type(image|audio|video|file|unknown), source, confidence(high|medium|low), recognized_text, "
+        "visible_text_blocks([{text,region:{x1,y1,x2,y2}}]), page_type, application_context(HiFleet|ECDIS|unknown), "
+        "visible_features, highlighted_regions, user_target_region, ship_entities([{name,mmsi,imo,callsign,position,last_update_time,source_region}]), "
+        "metric_entities([{name,display_value,unit,time_range,source_region}]), error_entities([{error_text,error_code,page,source_region}]), "
+        "visual_objects([{object_type,color,shape,line_style,text,location_relation,source_region}]), audio_transcript, video_summary, "
+        "needs_secondary_crop, uncertain_fields, summary, visible_text, suspected_symbol, suspected_issue, visual_question_summary, lookup_keywords, needs_knowledge_lookup。\n"
         "音频：尽量转写语音内容到 recognized_text。\n"
         "图片：只客观描述可见文字、界面元素、颜色、形状、位置关系、图标外观或报错文字。\n"
         "图标/海图符号/平台按钮场景：visible_features 只写客观特征，例如“红色圆形、中心黑点、无文字”；"
@@ -1771,6 +1957,22 @@ def _run_direct_multimodal_perception(
         return fallback
     parsed = _json_object_from_text(getattr(result, "content", ""))
     normalized = _normalize_multimodal_perception(parsed, fallback)
+    user_text = " ".join(_message_text_segments(messages))
+    reports_multiple_ships = bool(re.search(r"(?:两|2)艘船", user_text))
+    needs_entity_detail = reports_multiple_ships and len(list(normalized.get("ship_entities") or [])) < 2
+    if normalized["attachment_type"] == "image" and (normalized["confidence"] == "low" or needs_entity_detail):
+        detail = _center_detail_image_part(messages)
+        if detail:
+            retry_prompt = prompt + "\n这是同一截图自动生成的左/中/右细节拼图。优先逐区域提取全部可见船名、MMSI、IMO、最后更新时间、报错和用户圈选附近对象；仍只输出客观 JSON。"
+            text_part = next((part for part in _iter_latest_human_content_parts(messages) if str(part.get("type") or "").lower() == "text"), {"type": "text", "text": ""})
+            try:
+                retry = llm.invoke([SystemMessage(content=retry_prompt), HumanMessage(content=[detail, text_part])])
+                retried = _normalize_multimodal_perception(_json_object_from_text(getattr(retry, "content", "")), fallback)
+                if _multimodal_perception_has_signal(retried):
+                    normalized = _merge_multimodal_perceptions(normalized, retried)
+                normalized["needs_secondary_crop"] = True
+            except Exception as exc:
+                logger.warning("[DirectMultimodalPerception] detail crop retry failed: %s", exc)
     normalized["source"] = "direct_multimodal_model"
     return normalized
 
@@ -1931,6 +2133,18 @@ def _messages_with_text_replacement(messages: list[AnyMessage] | list[Any], repl
         else:
             replaced.append(msg)
     return list(reversed(replaced))
+
+
+def _delegate_messages_with_perception(messages: list[AnyMessage] | list[Any], perception: dict[str, Any]) -> list[Any]:
+    """Give the generic delegate an objective textual briefing without dropping state media."""
+    if not _multimodal_perception_has_signal(perception):
+        return list(messages or [])
+    attachment_type = str(perception.get("attachment_type") or "").lower()
+    if attachment_type == "audio":
+        briefing = _text_from_multimodal_perception(perception, latest_customer_user_text(messages))
+    else:
+        briefing = _objective_multimodal_text(perception, latest_customer_user_text(messages))
+    return _messages_with_text_replacement(messages, briefing)
 
 
 class AgentState(TypedDict, total=False):
@@ -3340,9 +3554,15 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         return answer, pending, [str(plan.tool_name)], check
 
     def preprocess_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
-        messages = list(state.get("messages", []) or [])
+        original_messages = list(state.get("messages", []) or [])
+        messages = list(original_messages)
         text = _latest_user_text(messages)
         has_multimodal_input = _has_current_multimodal_media(messages)
+        if has_multimodal_input:
+            # Retain the current attachment and only the two most recent preceding
+            # messages so stale conversation context cannot override visual evidence.
+            messages = messages[-3:]
+            text = _latest_user_text(messages)
         route_trace = {
             "run_id": str(getattr(ctx, "run_id", "") or ""),
             "session_id": str(state.get("session_id", "")),
@@ -3386,12 +3606,9 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         perception: dict[str, Any] = {}
         if has_multimodal_input:
             perception = _run_direct_multimodal_perception(ctx=ctx, cfg=cfg, messages=messages)
-            if _multimodal_perception_has_signal(perception):
-                text = _objective_multimodal_text(perception, text)
-                messages = _messages_with_text_replacement(messages, text)
-            else:
-                # Keep the original media for the standard multimodal model if perception was weak.
-                text = text or _latest_user_text(messages)
+            # Keep the raw current-turn media. Perception is structured evidence, not a
+            # substitute for the customer's text or the original attachment.
+            text = text or _latest_user_text(messages)
         route_trace["reasoning_trace"]["perception_summary"] = {
             "attachment_type": str(perception.get("attachment_type") or ""),
             "recognized_text": str(perception.get("recognized_text") or "")[:200],
@@ -3404,6 +3621,10 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "lookup_keywords": str(perception.get("lookup_keywords") or "")[:200],
             "needs_knowledge_lookup": bool(perception.get("needs_knowledge_lookup")),
             "confidence": str(perception.get("confidence") or ""),
+            "current_media_preserved": bool(has_multimodal_input),
+            "input_message_count": len(original_messages),
+            "retained_context_count": max(0, len(messages) - 1),
+            "dropped_irrelevant_context_count": max(0, len(original_messages) - len(messages)),
         }
         raw_pending_before = dict(state.get("pending_update_state", {}) or {})
         draft_before = dict(state.get("ship_update_draft", {}) or legacy_pending_to_draft(raw_pending_before))
@@ -3411,11 +3632,13 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         pending_before = draft_to_pending_compat(draft_before)
         pending_after = draft_to_pending_compat(draft_after)
         pending_used = False
+        has_file_attachment = _has_current_file_attachment(messages)
         understanding = _run_lightweight_customer_understanding(
             ctx=ctx,
             cfg=cfg,
             text=text,
             perception=perception,
+            has_file_attachment=has_file_attachment,
             draft=draft_after,
             pending_update_state=pending_after,
         )
@@ -3563,21 +3786,59 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "response_modalities": ["text", "link"] if _extract_output_assets(answer) else ["text"],
             }
         understanding_intent = str(understanding.get("intent") or "").strip().lower()
+        multimodal_scenario = str(understanding.get("multimodal_scenario") or "")
+        business_scenario = str(understanding.get("business_scenario") or multimodal_scenario)
         needs_evidence = bool(understanding.get("evidence_required"))
         query_candidates = list(understanding.get("search_query_candidates") or [])
-        if (
-            understanding_intent in {"knowledge", "troubleshooting"}
-            and needs_evidence
-            and query_candidates
-            and not has_multimodal_input
-        ):
+        if "reports@hifleet.com" in text.lower() and str(understanding.get("non_write_reason") or "") == "frontend_capability_question":
+            answer = destination_eta_safe_response(DestinationEtaScenario.EMAIL_UPDATE_QUESTION)
             route_trace["route"] = "knowledge"
-            route_trace["task_type"] = "platform_knowledge"
-            route_trace["tool_bundle"] = list(KNOWLEDGE_BUNDLE)
+            route_trace["task_type"] = "platform_capability"
+            route_trace["check_result"] = {"blocked_unsupported_email_update_claim": True}
+            route_trace["evidence_guard"] = {"triggered": True, "blocked_claims": ["reports@hifleet.com 可更新 ETA"], "fallback_reason": "unsupported_high_risk_platform_claim"}
+            return {
+                "phase": "done",
+                "phase_history": ["preprocess", "safe_capability_response", "done"],
+                "status": "success",
+                "task_goal": text,
+                "messages": [AIMessage(content=answer)],
+                "perception_result": perception,
+                "generated_answer": answer,
+                "delegate_answer": answer,
+                "generated_tool_calls": [],
+                "delegate_input_message_count": len(messages),
+                "output_assets": [],
+                "check_result": dict(route_trace["check_result"]),
+                "pending_update_state": pending_after,
+                "ship_update_draft": draft_after,
+                "_pending_before": pending_before,
+                "intent_hint": "knowledge",
+                "route_trace": route_trace,
+                "response_modalities": ["text"],
+            }
+        scenario_chain: tuple[str, str, list[str]] | None = None
+        if has_multimodal_input:
+            scenario_chain = {
+                "chart_symbol_explanation": ("chart_symbol", "chart_symbol", MULTIMODAL_BUNDLE),
+                "platform_ui_explanation": ("knowledge", "platform_ui_explanation", KNOWLEDGE_BUNDLE),
+                "platform_metric_definition": ("knowledge", "platform_metric_definition", KNOWLEDGE_BUNDLE),
+                "platform_troubleshooting": ("knowledge", "platform_troubleshooting", KNOWLEDGE_BUNDLE),
+                "ship_tracking_incident": ("ship_tracking_incident", "ship_tracking_incident", SHIP_VOYAGE_BUNDLE),
+                "ship_query_from_media": ("ship_single", "ship_single_query", SHIP_QUERY_BUNDLE),
+                "file_or_document_task": ("file_task", "file_task", FILE_BUNDLE),
+            }.get(business_scenario)
+        should_run_knowledge = understanding_intent in {"knowledge", "troubleshooting"} and needs_evidence and bool(query_candidates)
+        if scenario_chain or should_run_knowledge:
+            planned_route, planned_task_type, planned_bundle = scenario_chain or ("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE)
+            route_trace["route"] = planned_route
+            route_trace["task_type"] = planned_task_type
+            route_trace["tool_bundle"] = list(planned_bundle)
             route_trace["reasoning_trace"] = {
                 **dict(route_trace.get("reasoning_trace", {}) or {}),
-                "route_source": "understanding_to_knowledge_chain",
-                "evidence_required": True,
+                "route_source": "multimodal_scenario_dispatch" if scenario_chain else "understanding_to_knowledge_chain",
+                "multimodal_scenario": multimodal_scenario,
+                "business_scenario": business_scenario,
+                "evidence_required": bool(needs_evidence),
                 "missing_slot": dict(understanding.get("missing_slot") or {}),
             }
             return {
@@ -3627,24 +3888,48 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         route_trace = dict(state.get("route_trace", {}) or {})
         reasoning_trace = dict(route_trace.get("reasoning_trace", {}) or {})
         understanding = dict(reasoning_trace.get("understanding_result", {}) or {})
-        answer, trace, _evidence_items, evidence_summary = _execute_customer_support_planner(
+        planned_route = str(route_trace.get("route") or "knowledge")
+        planned_task_type = str(route_trace.get("task_type") or "platform_knowledge")
+        planned_bundle = list(route_trace.get("tool_bundle") or KNOWLEDGE_BUNDLE)
+        attachments = extract_attachments(messages)
+        entities = extract_entities(question)
+        if planned_route == "ship_single":
+            media_entities = list((state.get("perception_result") or {}).get("ship_entities") or [])
+            first = next((item for item in media_entities if isinstance(item, dict)), {})
+            entities = MessageEntities(
+                mmsi=str(first.get("mmsi") or entities.mmsi),
+                imo=str(first.get("imo") or entities.imo),
+                ship_name=str(first.get("name") or entities.ship_name),
+            )
+        answer, trace, evidence_items, evidence_summary = _execute_customer_support_planner(
             question=question,
-            route="knowledge",
-            task_type="platform_knowledge",
-            tool_bundle=KNOWLEDGE_BUNDLE,
-            entities=extract_entities(question),
+            route=planned_route,
+            task_type=planned_task_type,
+            tool_bundle=planned_bundle,
+            entities=entities,
             context=build_conversation_context(messages),
+            attachments=attachments,
+            perception=dict(state.get("perception_result", {}) or {}),
             understanding_result=understanding,
             session_id=str(state.get("session_id", "")),
             run_id=str(getattr(ctx, "run_id", "") or ""),
         )
+        trace = {
+            **route_trace,
+            **trace,
+            "ship_update_gate": dict(route_trace.get("ship_update_gate", {}) or {}),
+            "ship_update_subagent_gate": dict(route_trace.get("ship_update_subagent_gate", {}) or {}),
+        }
         trace["reasoning_trace"] = {
+            **dict(reasoning_trace or {}),
             **dict(trace.get("reasoning_trace", {}) or {}),
-            "route_source": "understanding_to_knowledge_chain",
+            "route_source": str(reasoning_trace.get("route_source") or "understanding_to_knowledge_chain"),
+            "multimodal_scenario": str(understanding.get("multimodal_scenario") or ""),
             "evidence_required": bool(understanding.get("evidence_required")),
             "missing_slot": dict(understanding.get("missing_slot") or {}),
         }
         trace["evidence_summary"] = dict(evidence_summary or {})
+        trace["evidence_items"] = list(evidence_items or [])
         return {
             "phase": "knowledge",
             "status": "success",
@@ -3665,7 +3950,11 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     def delegate_node(state: LightweightCustomerSupportState) -> dict[str, Any]:
         if state.get("phase") == "done" and state.get("messages"):
             return dict(state)
-        input_messages = list(state.get("messages", []) or [])
+        state_messages = list(state.get("messages", []) or [])
+        input_messages = _delegate_messages_with_perception(
+            state_messages,
+            dict(state.get("perception_result", {}) or {}),
+        )
         delegate_thread_id = f"{state.get('session_id', '') or getattr(ctx, 'run_id', '')}:standard_agent"
         payload = {
             "messages": input_messages,
@@ -3751,10 +4040,25 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             sanitized = guard_fallback
         route_trace = dict(state.get("route_trace", {}) or {})
         understanding_result = dict((route_trace.get("reasoning_trace") or {}).get("understanding_result") or {})
+        guard_scenario = str(understanding_result.get("scenario") or "")
+        if not guard_scenario:
+            guard_scenario = str(understanding_result.get("non_write_reason") or "")
+        if str(understanding_result.get("operation_type") or "") == "frontend_capability_question":
+            guard_scenario = "frontend_capability_question"
+        current_goal_text = str(state.get("task_goal") or "")
+        forced_capability_guard = False
+        if "reports@hifleet.com" in current_goal_text.lower() and any(marker in current_goal_text.lower() for marker in ("eta", "目的港", "预抵", "更新")):
+            sanitized = destination_eta_safe_response(DestinationEtaScenario.EMAIL_UPDATE_QUESTION)
+            forced_capability_guard = True
+        elif any(marker in current_goal_text for marker in ("网页端", "前台", "手动更新", "自助", "编辑按钮")) and any(marker in current_goal_text.lower() for marker in ("eta", "目的港", "预抵")):
+            sanitized = destination_eta_safe_response(DestinationEtaScenario.FRONTEND_CAPABILITY_QUESTION)
+            forced_capability_guard = True
+        if "reports@hifleet.com" in current_goal_text.lower() or "发邮件" in current_goal_text or "邮件" in current_goal_text:
+            guard_scenario = "email_update_question"
         guard_result = apply_high_risk_evidence_guard(
             sanitized,
             route_trace=route_trace,
-            scenario=str(understanding_result.get("scenario") or ""),
+            scenario=guard_scenario,
         )
         sanitized = guard_result.text
         blocked_write_success_claim = False
@@ -3779,12 +4083,12 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         }
         if blocked_write_success_claim:
             check_result["post_guard_applied"] = True
-        if guard_result.triggered:
+        if guard_result.triggered or forced_capability_guard:
             check_result["post_guard_applied"] = True
             route_trace["evidence_guard"] = {
                 "triggered": True,
-                "blocked_claims": list(guard_result.blocked_claims),
-                "fallback_reason": guard_result.fallback_reason,
+                "blocked_claims": list(guard_result.blocked_claims) or ["unsupported_platform_capability"],
+                "fallback_reason": guard_result.fallback_reason or "forced_capability_safe_response",
             }
         else:
             route_trace.setdefault(

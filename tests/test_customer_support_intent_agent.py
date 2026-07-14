@@ -382,12 +382,12 @@ def test_customer_support_image_direct_perception_feeds_multimodal_route(monkeyp
 
     assert result["route"] == "chart_symbol"
     assert result["route"] == "chart_symbol"
-    assert "初步识别" in result["messages"][-1].content
-    assert "未检索到准确官方内容" in result["messages"][-1].content
+    assert "截图特征" in result["messages"][-1].content
+    assert "地名、坐标或图层名称" in result["messages"][-1].content
     assert "安全水域浮标" not in result["messages"][-1].content
 
 
-def test_lightweight_chart_symbol_delegates_objective_features_to_standard_agent(monkeypatch):
+def test_lightweight_chart_symbol_uses_deterministic_multimodal_chain(monkeypatch):
     class FakeStandardAgent:
         def __init__(self):
             self.calls = []
@@ -440,16 +440,15 @@ def test_lightweight_chart_symbol_delegates_objective_features_to_standard_agent
         config={"configurable": {"thread_id": "s-chart-verified"}},
     )
 
-    delegated_text = standard_agent.calls[0]["messages"][-1].content
-    assert "附件可见特征：红色圆形、中心黑点" in delegated_text
-    assert "附件问题摘要：用户想确认全球海图中红色圆形中心黑点图标的含义" in delegated_text
-    assert "建议检索关键词：HiFleet 海图 红色圆形 中心黑点 图标含义" in delegated_text
-    assert "安全水域浮标" in result["messages"][-1].content
-    assert "chart_symbol_verify" not in result["phase_history"]
-    assert result["generated_tool_calls"] == []
+    assert standard_agent.calls == []
+    assert result["route_trace"]["route"] == "chart_symbol"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "multimodal_scenario_dispatch"
+    assert result["route_trace"]["reasoning_trace"]["perception_summary"]["current_media_preserved"] is True
+    assert "upload_ship_position" not in result["generated_tool_calls"]
+    assert "update_ship_static_info" not in result["generated_tool_calls"]
 
 
-def test_lightweight_chart_symbol_weak_perception_still_delegates_without_fixed_branch(monkeypatch):
+def test_lightweight_chart_symbol_weak_perception_still_uses_deterministic_chain(monkeypatch):
     class FakeStandardAgent:
         def __init__(self):
             self.calls = []
@@ -496,9 +495,10 @@ def test_lightweight_chart_symbol_weak_perception_still_delegates_without_fixed_
         config={"configurable": {"thread_id": "s-chart-unverified"}},
     )
 
-    assert standard_agent.calls
-    assert "chart_symbol_verify" not in result["phase_history"]
-    assert result["messages"][-1].content == "请补充一张更清晰的截图或圈出要确认的图标。"
+    assert standard_agent.calls == []
+    assert result["route_trace"]["route"] == "chart_symbol"
+    assert result["route_trace"]["reasoning_trace"]["route_source"] == "multimodal_scenario_dispatch"
+    assert "更清晰" in result["messages"][-1].content
 
 
 def test_customer_support_agent_imports_guard_refusal_constant():
@@ -547,6 +547,21 @@ def test_build_agent_customer_support_uses_lightweight_skills_graph(monkeypatch)
 def test_lightweight_customer_support_rewrites_audio_before_tool_agent(monkeypatch):
     captured = {}
 
+    monkeypatch.setattr(
+        "agents.agent._run_lightweight_customer_understanding",
+        lambda **kwargs: {
+            "intent": "knowledge",
+            "evidence_required": False,
+            "search_query_candidates": [],
+            "operation_type": "none",
+            "pending_action": "none",
+            "non_write_reason": "none",
+            "ship_update_candidate": False,
+            "ship_write_request": False,
+            "multimodal_scenario": "audio_request",
+        },
+    )
+
     class FakeStandardAgent:
         def invoke(self, payload, context=None):
             captured["content"] = payload["messages"][-1].content
@@ -594,6 +609,20 @@ def test_lightweight_customer_support_rewrites_audio_before_tool_agent(monkeypat
 
 def test_lightweight_customer_support_uses_current_delegate_answer_over_stale_fallback(monkeypatch):
     captured = {}
+
+    monkeypatch.setattr(
+        "agents.agent._run_lightweight_customer_understanding",
+        lambda **kwargs: {
+            "intent": "knowledge",
+            "evidence_required": False,
+            "search_query_candidates": [],
+            "operation_type": "none",
+            "pending_action": "none",
+            "non_write_reason": "none",
+            "ship_update_candidate": False,
+            "ship_write_request": False,
+        },
+    )
 
     class FakeStandardAgent:
         def invoke(self, payload, config=None, context=None):
@@ -744,8 +773,8 @@ def test_customer_support_graph_uses_light_agent_after_perception(monkeypatch):
     assert result["route"] == "chart_symbol"
     assert result["route_trace"]["reasoning_trace"]["route_source"] == "direct_multimodal_model"
     assert result["route_trace"]["reasoning_trace"]["perception_summary"]["suspected_symbol"] == "安全水域浮标"
-    assert "初步识别" in result["messages"][-1].content
-    assert "未检索到准确官方内容" in result["messages"][-1].content
+    assert "截图特征" in result["messages"][-1].content
+    assert "地名、坐标或图层名称" in result["messages"][-1].content
     assert "安全水域浮标" not in result["messages"][-1].content
 
 
@@ -1157,6 +1186,20 @@ def test_employee_assistant_standard_entrypoint_preserves_knowledge_hint(monkeyp
 
 
 def test_lightweight_customer_support_skips_metadata_only_final_answer(monkeypatch):
+    monkeypatch.setattr(
+        "agents.agent._run_lightweight_customer_understanding",
+        lambda **kwargs: {
+            "intent": "knowledge",
+            "evidence_required": False,
+            "search_query_candidates": [],
+            "operation_type": "none",
+            "pending_action": "none",
+            "non_write_reason": "none",
+            "ship_update_candidate": False,
+            "ship_write_request": False,
+            "multimodal_scenario": "audio_request",
+        },
+    )
     class FakeStandardAgent:
         def invoke(self, payload, context=None):
             return {
@@ -1352,8 +1395,8 @@ def test_reference_01_harness_returns_customer_style_safe_water_answer(monkeypat
         perception=_heuristic_image_perception([attachment], text),
     )
 
-    assert "初步识别" in answer
-    assert "未检索到准确官方内容" in answer
+    assert "截图特征" in answer
+    assert "地名、坐标或图层名称" in answer
     assert "安全水域浮标" not in answer
     assert trace["tool_call_sequence"] == ["inspect_media_attachment", "smart_search"]
 
@@ -1377,8 +1420,8 @@ def test_reference_03_harness_returns_customer_style_anchor_area_answer(monkeypa
         perception=_heuristic_image_perception([attachment], text),
     )
 
-    assert "初步识别" in answer
-    assert "未检索到准确官方内容" in answer
+    assert "截图特征" in answer
+    assert "地名、坐标或图层名称" in answer
     assert "锚地" not in answer
     assert trace["tool_call_sequence"] == ["inspect_media_attachment", "smart_search"]
 
@@ -1632,3 +1675,118 @@ def test_customer_support_response_qa_and_repair_falls_back_to_one_question():
     assert qa["pass"] is False
     assert qa["repair_mode"] == "rewrite"
     assert repaired == _build_customer_support_followup_question("knowledge", {}, {"missing_key_fact": "请提供具体页面截图"})
+
+
+def test_secondary_detail_crop_builds_generic_left_center_right_montage():
+    import base64
+    import io
+    from PIL import Image
+
+    from agents.agent import _center_detail_image_part
+
+    original = Image.new("RGB", (1200, 700), "white")
+    for left, color in ((0, "red"), (400, "green"), (800, "blue")):
+        original.paste(Image.new("RGB", (400, 700), color), (left, 0))
+    buffer = io.BytesIO()
+    original.save(buffer, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    message = HumanMessage(content=[{"type": "image_url", "image_url": {"url": data_url}}, {"type": "text", "text": "two ships"}])
+
+    detail = _center_detail_image_part([message])
+
+    assert detail is not None
+    detail_data = detail["image_url"]["url"].split(";base64,", 1)[1]
+    with Image.open(io.BytesIO(base64.b64decode(detail_data))) as montage:
+        assert montage.size == (1728, 489)
+        assert montage.getpixel((10, 244))[0] > 200
+        assert montage.getpixel((864, 244))[1] > 100
+        assert montage.getpixel((1710, 244))[2] > 200
+
+
+def test_lightweight_understanding_preserves_audio_transcript_update_route_when_llm_json_is_incomplete(monkeypatch):
+    from agents.agent import _run_lightweight_customer_understanding
+
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {"intent": "knowledge", "operation_type": "none", "multimodal_scenario": "audio_request"},
+    )
+
+    result = _run_lightweight_customer_understanding(
+        ctx=SimpleNamespace(run_id="r-audio-update-contract"),
+        cfg={"config": {}},
+        text="",
+        perception={
+            "attachment_type": "audio",
+            "confidence": "high",
+            "recognized_text": "请更新该船船位，MMSI 123456789，经度 121.5，纬度 31.2，更新时间 2026-07-13 10:00:00。",
+        },
+        draft={},
+        pending_update_state={},
+    )
+
+    assert result["multimodal_scenario"] == "audio_request"
+    assert result["business_scenario"] == "ship_update_from_media"
+    assert result["operation_type"] == "position_update"
+    assert result["ship_write_request"] is True
+    assert result["ship_update_candidate"] is True
+
+
+def test_lightweight_graph_routes_audio_recognized_text_update_through_subagent_gate(monkeypatch):
+    calls = []
+
+    class FakeStandardAgent:
+        def invoke(self, payload, context=None, config=None):
+            raise AssertionError("audio update must not delegate to the standard agent")
+
+    monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
+    monkeypatch.setattr("agents.agent._load_all_tools", lambda profile: [])
+    monkeypatch.setattr(
+        "agents.agent._run_direct_multimodal_perception",
+        lambda **kwargs: {
+            "attachment_type": "audio",
+            "confidence": "high",
+            "recognized_text": "请更新该船船位，MMSI 123456789，经度 121.5，纬度 31.2，更新时间 2026-07-13 10:00:00。",
+        },
+    )
+
+    graph = _build_lightweight_customer_support_agent(
+        ctx=SimpleNamespace(run_id="r-audio-update-graph"),
+        cfg={"config": {}},
+        workspace_path=str(Path(__file__).resolve().parents[1]),
+        profile=AgentProfile(profile_id="customer_support", skills=["multimodal_support", "hifleet_ship_service"]),
+    )
+
+    # Patch the graph's closed-over update executor through the public subagent
+    # entrypoint so this test cannot call a real write tool.
+    monkeypatch.setattr(
+        "agents.agent.run_ship_update_subagent",
+        lambda *args, **kwargs: calls.append(kwargs) or __import__("agents.ship_update_subagent", fromlist=["ShipUpdateSubagentResult"]).ShipUpdateSubagentResult(
+            status="need_user_input",
+            operation_type="position_update",
+            tool_name=None,
+            tool_args={},
+            missing_fields=["确认执行"],
+            pending_action="create",
+            draft_action="create",
+            ship_update_draft={"active": True, "status": "awaiting_field_confirmation", "operation_type": "position_update", "tool_name": "upload_ship_position", "tool_args": {"mmsi": "123456789", "lon": "121.5", "lat": "31.2", "updatetime": "2026-07-13 10:00:00"}, "missing_fields": ["确认执行"], "target_identity": {"mmsi": "123456789", "imo": "", "ship_name": ""}, "evidence_sources": ["audio_transcript"]},
+            pending_update_state={},
+            reply_to_user="已识别语音中的船位更新字段，请确认执行后再写入。",
+            confidence="high",
+            source="test",
+            evidence_sources=["audio_transcript"],
+        ),
+    )
+
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(content=[{"type": "input_audio", "input_audio": {"url": "https://example.com/update.amr", "format": "amr"}}])],
+            "session_id": "s-audio-update-graph",
+        },
+        config={"configurable": {"thread_id": "s-audio-update-graph"}},
+    )
+
+    assert len(calls) == 1
+    assert result["route_trace"]["ship_update_subagent_gate"]["should_run_subagent"] is True
+    assert result["route_trace"]["ship_update_subagent"]["status"] == "need_user_input"
+    assert result["generated_tool_calls"] == []
+    assert "确认执行" in result["messages"][-1].content

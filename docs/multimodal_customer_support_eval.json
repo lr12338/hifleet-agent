@@ -1,0 +1,353 @@
+{
+  "run_date": "2026-07-13",
+  "repository_commit": "a826294",
+  "validation_mode": "real direct multimodal perception + local Graph execution + focused pytest",
+  "artifacts": {
+    "real_perception_trace": "artifacts/multimodal_real_perception_trace.json",
+    "graph_trace": "artifacts/multimodal_fixture_graph_trace.json",
+    "m05_jpeg_retry": "artifacts/m05_real_perception_retry.json",
+    "m05_normalized_retry": "artifacts/m05_real_perception_normalized.json",
+    "m05_center_crop_retry": "artifacts/m05_real_perception_center_crop.json",
+    "m05_graph_trace": "artifacts/m05_real_graph_trace.json",
+    "m04_current_direct_graph": "artifacts/m04_current_direct_graph.json",
+    "m05_current_direct_graph": "artifacts/m05_current_direct_graph.json"
+  },
+  "external_limitations": [
+    "The supplied local fixture paths are not accepted by the multimodal endpoint; base64 attachment execution is required for real perception.",
+    "The local tool registry does not register smart_search, so chart retrieval degrades to metadata-only in the local Graph trace.",
+    "Browser-backed retrieval was interrupted after repeated external page waits; no browser result is represented as verified evidence.",
+    "A dense screenshot may require the generic center-detail crop; the real crop pass recovered both affected ship names, but local Graph ship-tool availability remains limited."
+  ],
+  "cases": [
+    {
+      "case": "M01",
+      "fixture": "test/image/image01-这个在全球海图里是什么意思.png",
+      "available": true,
+      "real_perception": {
+        "latency_ms": 27900,
+        "confidence": "high",
+        "summary": "用户咨询截图中红色圆形中心带黑点的符号在全球海图中的含义"
+      },
+      "scenario": "chart_symbol_explanation",
+      "graph_route": "chart_symbol",
+      "tool_sequence": [
+        "inspect_media_attachment"
+      ],
+      "evidence": [
+        "visual: red circular symbol with central black point"
+      ],
+      "score": "partial: perception and route pass; local chart retrieval unavailable",
+      "failure_items": [
+        "No verified chart legend source in this local run"
+      ],
+      "before_response": "未归档可复放的旧版生成回复；已知旧链路会将图片转写后交给普通 Agent。",
+      "after_response": "仅确认红色圆形和中心黑点；无权威图例时不确认符号含义，并请求图例或图层细节。"
+    },
+    {
+      "case": "M02",
+      "fixture": "test/image/image02-图上紫色的波浪线是指的什么.png",
+      "available": true,
+      "real_perception": {
+        "latency_ms": 30940,
+        "confidence": "low",
+        "summary": ""
+      },
+      "scenario": "chart_symbol_explanation",
+      "graph_route": "chart_symbol",
+      "tool_sequence": [
+        "inspect_media_attachment"
+      ],
+      "evidence": [
+        "user text identifies purple wavy line as target"
+      ],
+      "score": "partial: route pass; visual feature extraction low confidence",
+      "failure_items": [
+        "Needs accessible chart legend or a higher-detail image"
+      ],
+      "before_response": "未归档可复放的旧版生成回复；线状符号没有专项处理。",
+      "after_response": "确认用户指向紫色波浪线；低置信时请求更清晰区域或图例，不猜测符号含义。"
+    },
+    {
+      "case": "M03",
+      "fixture": "test/image/image03-图中的小圈圈是什么意思？.png",
+      "available": true,
+      "real_perception": {
+        "latency_ms": 82176,
+        "confidence": "high",
+        "recognized_text": "HiFleet map UI and ship/event labels detected",
+        "summary": "用户咨询当前HiFleet海图界面上显示的小空心圆圈的含义"
+      },
+      "scenario": "chart_symbol_explanation",
+      "graph_route": "chart_symbol",
+      "tool_sequence": [
+        "inspect_media_attachment"
+      ],
+      "evidence": [
+        "visual: repeated hollow circles overlaying a map",
+        "ocr: HiFleet map UI"
+      ],
+      "score": "partial: scenario corrected to chart symbol based on user goal; retrieval unavailable",
+      "failure_items": [
+        "Meaning cannot be verified without layer/legend evidence"
+      ],
+      "before_response": "未归档可复放的旧版生成回复；UI OCR 容易覆盖用户的真实问题。",
+      "after_response": "以小圈圈含义为目标；无图层或图例证据时不固定解释为锚地。"
+    },
+    {
+      "case": "M04",
+      "fixture": "test/image/image-04请问这个平均航速，是否包含停航时段、进出港时间？.png",
+      "available": true,
+      "real_perception": {
+        "latency_ms": 90268,
+        "confidence": "high",
+        "ship": {
+          "name": "RAYHONG",
+          "mmsi": "636024656",
+          "imo": "9403073"
+        },
+        "metrics": [
+          {
+            "name": "平均航速",
+            "value": "9.73",
+            "unit": "kn"
+          },
+          {
+            "name": "总里程",
+            "value": "4201",
+            "unit": "海里"
+          }
+        ],
+        "time_range": "2026-03-28 09:44 至 2026-06-26 09:44"
+      },
+      "scenario": "platform_metric_definition",
+      "required_claims": [
+        "metric_denominator_time",
+        "metric_stationary_or_anchored_time",
+        "metric_port_low_speed_time",
+        "metric_vs_voyage_average_definition"
+      ],
+      "graph_route": "knowledge",
+      "tool_sequence": [
+        "local_kb_search"
+      ],
+      "evidence": [
+        "visual/ocr: screenshot values and time range",
+        "no verified product-definition source returned"
+      ],
+      "score": "partial: extraction and route pass; product rule intentionally not inferred",
+      "failure_items": [
+        "Whether stopped/port time is included remains unverified"
+      ],
+      "before_response": "未归档可复放的旧版回复；初次本地 trace 曾按弱 FAQ 推导产品口径，现作为回归缺陷记录。",
+      "after_response": "只确认截图中的 9.73 kn、4201 海里和时间范围；无官方产品定义时明确不能确认停航或进出港是否计入。",
+      "latest_direct_graph": {
+        "execution_mode": "direct_graph",
+        "latency_ms": 236153,
+        "failure_code": "metric_definition_without_product_evidence",
+        "current_media_preserved": true,
+        "tool_sequence": [
+          "local_kb_search",
+          "web_search",
+          "web_search_agent_browser",
+          "local_kb_search",
+          "web_search",
+          "web_search_agent_browser",
+          "local_kb_search",
+          "web_search",
+          "web_search_agent_browser"
+        ],
+        "final_confidence": "medium",
+        "final_answer_summary": "仅确认截图显示值与区间；无已验证产品定义时不确认停航、锚泊、静止或进出港低速是否计入。",
+        "note": "Official-looking search summaries are recorded as unverified until local product knowledge or browser body verification proves the claim."
+      }
+    },
+    {
+      "case": "M05",
+      "fixture": "test/image/Image05-我司2艘船舶航行连续2天都没有船位跟踪船长讲船上AIS工况也正常我查周边其他船舶的船为跟踪都是正常的请指导们后台看看什么问题.png.png.png",
+      "available": true,
+      "real_perception": {
+        "jpeg_retry_latency_ms": 39171,
+        "normalized_retry_latency_ms": 46012,
+        "center_crop_latency_ms": 54540,
+        "confidence": "high",
+        "ships": [
+          {
+            "name": "GOLDEN LILY",
+            "mmsi": "370731000",
+            "imo": "9216468",
+            "last_update": "2026-06-27 05:44:25 UTC+8"
+          },
+          {
+            "name": "禾盛东方",
+            "mmsi": "",
+            "imo": ""
+          }
+        ]
+      },
+      "scenario": "ship_tracking_incident",
+      "graph_route": "ship_tracking_incident",
+      "tool_sequence": [
+        "ship_search"
+      ],
+      "evidence": [
+        "visual/ocr: two circled ships Golden Lily and 禾盛东方",
+        "visual/ocr: GOLDEN LILY MMSI 370731000 / IMO 9216468 / last update 2026-06-27 05:44:25 UTC+8",
+        "user_reported: AIS normal and nearby ships normal",
+        "incident packet: no write tools called"
+      ],
+      "score": "partial: crop perception identifies two ships; local graph resolves only a name because ship data tools did not return a resolvable result",
+      "failure_items": [
+        "Second vessel MMSI/IMO remains absent",
+        "No live ship position result in local tool environment"
+      ],
+      "before_response": "未归档可复放的旧版生成回复；容易误进更新或普通问答。",
+      "after_response": "创建只读 IncidentPacket，逐船解析并标记用户陈述；不调用任何写工具。",
+      "latest_direct_graph": {
+        "execution_mode": "direct_graph",
+        "latency_ms": 114771,
+        "current_media_preserved": true,
+        "tool_sequence": [
+          "get_ship_position",
+          "get_ship_archive",
+          "ship_search",
+          "get_ship_position",
+          "get_ship_archive"
+        ],
+        "identified_ships": [
+          {
+            "name": "GOLDEN LILY",
+            "mmsi": "370731000",
+            "imo": "9216468"
+          },
+          {
+            "name": "禾盛东方",
+            "mmsi": "413228060",
+            "imo": "9465320"
+          }
+        ],
+        "write_tools_called": false,
+        "tool_returned_status": [
+          {
+            "name": "GOLDEN LILY",
+            "updated_at": "2026-07-13 18:54:57 UTC+8",
+            "navigation_status": "锚泊",
+            "speed": "0.1 节"
+          },
+          {
+            "name": "禾盛东方",
+            "updated_at": "2026-07-13 18:57:35 UTC+8",
+            "navigation_status": "系泊",
+            "speed": "0 节"
+          }
+        ],
+        "note": "Tool-returned current status differs from the screenshot historical update time; no backend root-cause claim is made.",
+        "time_discrepancy": {
+          "name": "GOLDEN LILY",
+          "screenshot_last_update_time": "2026-06-27 05:44:25 UTC+8",
+          "tool_last_update_time": "2026-07-13 18:54:57 UTC+8",
+          "interpretation": "Only a data-view time difference; not a backend root-cause diagnosis."
+        }
+      }
+    },
+    {
+      "case": "M06",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M07",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M08",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M09",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M10",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M11",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M12",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M13",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M14",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    },
+    {
+      "case": "M15",
+      "available": false,
+      "status": "missing_fixture",
+      "before_response": "未提供 fixture，无法生成或复放基线回复。",
+      "after_response": "未执行：missing_fixture。"
+    }
+  ],
+  "automation": {
+    "command": ".venv/bin/python -m pytest -q tests/test_customer_support_router.py tests/test_customer_support_intent_agent.py tests/test_multimodal_payloads.py tests/test_customer_support_p0_optimization.py tests/test_multimodal_customer_support_eval.py",
+    "passed": 208,
+    "failed": 0,
+    "warnings": 2
+  },
+  "fixture_manifest": "tests/fixtures/multimodal_customer_support/cases.json",
+  "evaluator": {
+    "script": "scripts/eval_multimodal_customer_support.py",
+    "default_mode": "contract_only",
+    "live_mode": "--direct-graph",
+    "missing_fixture_behavior": "missing_fixture",
+    "note": "contract_only results are not represented as live Graph or API execution."
+  },
+  "synthetic_missing_fixture_coverage": {
+    "cases": [
+      "M06",
+      "M07",
+      "M08",
+      "M09",
+      "M10",
+      "M11",
+      "M12",
+      "M13",
+      "M14",
+      "M15"
+    ],
+    "mode": "understanding_contract_only",
+    "note": "Uses synthetic user text and structured perception; does not represent a real attachment/model/tool run."
+  }
+}

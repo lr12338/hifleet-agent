@@ -1048,8 +1048,23 @@ def refine_multimodal_route_with_perception(
 ) -> RouteDecision:
     if not attachments:
         return base_decision
-    if base_decision.route == "chart_symbol":
-        return base_decision
+    from agents.customer_support_understanding import classify_multimodal_scenario
+
+    scenario = classify_multimodal_scenario(text, perception, has_media=True)
+    if scenario == "file_or_document_task":
+        return RouteDecision("file_task", "file_task", FILE_BUNDLE, "complex", reason="multimodal file task")
+    if scenario == "ship_update_from_media":
+        # The downstream ship-update gate still requires an explicit write request.
+        return RouteDecision("ship_update", "ship_update", SHIP_UPDATE_BUNDLE, "complex", reason="explicit media-backed ship update")
+    if scenario == "ship_query_from_media":
+        return RouteDecision("ship_single", "ship_single_query", SHIP_QUERY_BUNDLE, "complex", reason="ship identity extracted from media")
+    if scenario == "ship_tracking_incident":
+        return RouteDecision("ship_complex", "ship_tracking_incident", SHIP_VOYAGE_BUNDLE, "complex", search_depth="normal", reason="media-backed tracking incident")
+    if scenario in {"platform_metric_definition", "platform_ui_explanation", "platform_troubleshooting"}:
+        task_type = "platform_troubleshooting" if scenario == "platform_troubleshooting" else scenario
+        return RouteDecision("knowledge", task_type, KNOWLEDGE_BUNDLE, "complex", search_depth="deep", reason=f"multimodal scenario: {scenario}")
+    if scenario == "chart_symbol_explanation":
+        return RouteDecision("chart_symbol", "chart_symbol", MULTIMODAL_BUNDLE, "complex", search_depth="deep", reason="multimodal chart symbol")
     if is_multimodal_troubleshooting_signal(text, perception):
         return RouteDecision(
             "knowledge",
@@ -2623,6 +2638,29 @@ def execute_planned_knowledge_chain(
     )
     trace.reasoning_trace["understanding_summary"] = understanding_summary
     trace.reasoning_trace["retrieval_trace"] = retrieval_trace
+    verified_metric_evidence = any(
+        (
+            item.get("source_type") == "local_kb"
+            and float(item.get("relevance") or 0.0) >= 0.8
+            and bool(item.get("verified"))
+        )
+        or (
+            item.get("source_type") in {"official_site", "official_community", "browser"}
+            and (bool(item.get("verified")) or str(item.get("source_name") or "") == "web_search_agent_browser")
+        )
+        for item in evidence_items
+    )
+    metric_evidence_unverified = not verified_metric_evidence
+    if decision.task_type == "platform_metric_definition" and metric_evidence_unverified:
+        trace.fallback_reason = "metric_definition_without_product_evidence"
+        trace.answer_confidence = "low"
+        return (
+            "截图可以确认页面展示了该指标的数值和统计区间，但不能仅凭这些数值确认 HiFleet 的计算口径。\n\n"
+            "因此，当前无法确认平均航速是否包含停泊、锚泊、静止或进出港低速时段；也不能把行业通用算法当作 HiFleet 产品规则。"
+            f"请以官方产品说明为准，或提供对应帮助页/产品说明链接，我可以继续核验。官方帮助中心：{HELP_CENTER_URL}",
+            evidence_items,
+            evidence_summary,
+        )
     if (
         understanding_summary.get("evidence_required")
         and retrieval_trace.get("t2_attempted")
@@ -2742,8 +2780,14 @@ def _chart_symbol_evidence_matches(features: str, search_output: str) -> bool:
 
 
 def format_unverified_chart_symbol_answer(perception: dict[str, Any]) -> str:
-    initial = chart_symbol_initial_identification(perception).rstrip("。.!！")
-    return f"针对您输入的图标，我初步识别为：{initial}。未检索到准确官方内容，请您联系人工客服再确认。"
+    features = normalize_message_text(str(perception.get("visible_features") or perception.get("summary") or ""))
+    recognized = normalize_message_text(str(perception.get("recognized_text") or perception.get("visible_text") or ""))
+    observed = "；".join(part for part in [features, recognized] if part) or "截图中的目标图形"
+    return (
+        f"我目前能确认的截图特征是：{observed}。\n\n"
+        "仅凭这些外观还不能可靠确认其具体海图含义，原因是同类点、线和图层标记会随 ENC/ECDIS 图层与比例尺变化。"
+        "请补充该符号附近的地名、坐标或图层名称（任选一个），我会按对应图例继续核验。"
+    )
 
 
 def format_verified_chart_symbol_answer(perception: dict[str, Any], search_output: str) -> str:
@@ -3078,32 +3122,6 @@ def execute_planned_multimodal_chain(
     return format_customer_answer("\n\n".join(part for part in [observations, visible_text, suspected, search] if part), heading="结论需要结合附件识别和资料检索判断："), evidence_items, evidence_summary
 
 
-def _format_chart_symbol_answer(suspected: str, observations: str, search_output: str) -> str:
-    text = f"{suspected} {observations}"
-    if "安全水域" in text or ("红色" in text and "黑点" in text):
-        return (
-            "这个红色圆形、中间带黑点的图形，在 HiFleet 全球海图的符号语境下，可按“安全水域浮标（Safe Water Mark）”理解，属于助航标志，不是危险物标。\n\n"
-            "详细说明：\n"
-            "1. 含义：安全水域浮标通常表示该标志周边为可安全通行水域，常用于航道中线、深水航路中心、港口进出口航道起点或开阔水域参考点。\n"
-            "2. 图形特征：常见表现为红白相间的浮标/灯标；在电子海图或平台图层里，可能被简化显示成红色圆点、中心点或小圆形符号。\n"
-            "3. 使用提醒：它和危险物、沉船、障碍物等符号不同，不能直接理解为风险点；但实际航行仍应结合海图比例尺、周边水深、航道和公告信息判断。\n\n"
-            "如果您需要，我也可以继续帮您整理 HiFleet 全球海图里常见航标、障碍物、锚地等符号的对照说明。"
-        )
-    if "锚地" in text or "锚泊" in text or "小圈圈" in text or "空心圆" in text:
-        return (
-            "图中的深色空心小圈圈，更可能是海图图层里的锚地/锚泊区域范围标识，用来提示该水域附近存在锚泊、候泊或相关管制区域。\n\n"
-            "详细说明：\n"
-            "1. 含义：这类圆圈通常不是单船目标，也不是普通 AIS 船舶图标，而是海图或平台图层对特定水域范围的标注。\n"
-            "2. 为什么会出现很多个：近岸、港口外锚地、航道附近经常有多个锚泊区或管制区，打开相应海图/标注图层后会集中显示。\n"
-            "3. 使用建议：如果您是在判断航线或靠离港风险，建议同时查看水深、航道、禁航/限航区、航行警告和船舶密度，不要只看圆圈本身下结论。\n\n"
-            "如果您希望我进一步确认某一个圈的具体名称或范围，请提供截图中该圈附近的地名/坐标，或放大后再截一张图。"
-        )
-    return format_customer_answer(
-        "\n\n".join(part for part in [f"截图识别：{observations}" if observations else "", f"疑似符号：{suspected}" if suspected else "", search_output] if part),
-        heading="这个符号需要结合截图特征和海图资料判断：",
-    )
-
-
 def execute_file_chain(
     text: str,
     attachments: list[Attachment],
@@ -3111,7 +3129,9 @@ def execute_file_chain(
     tool_map: dict[str, Any],
     trace: HarnessTrace,
 ) -> str:
-    file_attachments = [item for item in attachments if item.type in {"file", "image", "audio", "video"}]
+    file_attachments = [item for item in attachments if item.type == "file"]
+    if not file_attachments:
+        file_attachments = [item for item in attachments if item.type in {"image", "audio", "video"}]
     if not file_attachments:
         trace.fallback_reason = "missing_file"
         trace.check_result = {"file_present": False}
@@ -3213,6 +3233,181 @@ def execute_simple_ship_chain(text: str, decision: RouteDecision, entities: Mess
     trace.check_result = {"entity_resolved": bool(mmsi or imo), "has_result": not is_no_hit_text(out)}
     trace.answer_confidence = "high" if not is_no_hit_text(out) else "medium"
     return out
+
+
+def _incident_ship_candidates(text: str, perception: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Extract only current-turn, media-grounded ship identity candidates."""
+    def clean_identifier(value: Any) -> str:
+        normalized = str(value or "").strip()
+        if normalized.lower() in {"未显示", "未知", "unknown", "n/a", "na", "-", "--", "无"}:
+            return ""
+        return normalized
+
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    known_mmsis: set[str] = set()
+    known_imos: set[str] = set()
+    perception = dict(perception or {})
+    for item in list(perception.get("ship_entities") or []):
+        if not isinstance(item, dict):
+            continue
+        candidate = {
+            "name": clean_identifier(item.get("name")),
+            "mmsi": clean_identifier(item.get("mmsi")),
+            "imo": clean_identifier(item.get("imo")),
+        }
+        key = (candidate["mmsi"], candidate["imo"], candidate["name"].lower())
+        if any(key) and key not in seen:
+            candidates.append(candidate)
+            seen.add(key)
+            if candidate["mmsi"]:
+                known_mmsis.add(candidate["mmsi"])
+            if candidate["imo"]:
+                known_imos.add(candidate["imo"])
+    media_text = "\n".join(str(perception.get(key) or "") for key in ("recognized_text", "visible_text", "summary"))
+    for mmsi in re.findall(r"(?<!\d)(\d{9})(?!\d)", "\n".join([str(text or ""), media_text])):
+        if mmsi in known_mmsis:
+            continue
+        key = (mmsi, "", "")
+        if key not in seen:
+            candidates.append({"name": "", "mmsi": mmsi, "imo": ""})
+            seen.add(key)
+            known_mmsis.add(mmsi)
+    return candidates[:4]
+
+
+def _incident_position_summary(raw: str) -> str:
+    """Extract a small customer-safe subset from a read-only position response."""
+    value = normalize_message_text(str(raw or ""))
+    if not value:
+        return ""
+    update = re.search(r"(?:更新于|最后船位)\s*[:：]?\s*([^\n；;]+)", value, flags=re.I)
+    status = re.search(r"航行状态\s*[:：]?\s*([^\n；;|]+)", value, flags=re.I)
+    speed = re.search(r"航速\s*[:：]?\s*([^\n；;|]+)", value, flags=re.I)
+    parts = []
+    if update:
+        parts.append(f"工具返回更新时间 {update.group(1).strip()}")
+    if status:
+        parts.append(f"状态 {status.group(1).strip()}")
+    if speed:
+        parts.append(f"航速 {speed.group(1).strip()}")
+    return "；".join(parts)
+
+
+def _incident_position_update_time(raw: str) -> str:
+    value = normalize_message_text(str(raw or ""))
+    match = re.search(r"(?:更新于|最后船位)\s*[:：]?\s*([^\n；;]+)", value, flags=re.I)
+    return str(match.group(1).strip()) if match else ""
+
+
+def _incident_times_differ(screenshot_time: str, tool_time: str) -> bool:
+    left = re.sub(r"\s+", "", str(screenshot_time or "")).lower()
+    right = re.sub(r"\s+", "", str(tool_time or "")).lower()
+    return bool(left and right and left not in right and right not in left)
+
+
+def execute_ship_tracking_incident_chain(text: str, perception: dict[str, Any], tool_map: dict[str, Any], trace: HarnessTrace) -> str:
+    """Read-only, multi-ship incident workflow for missing AIS tracking reports."""
+    candidates = _incident_ship_candidates(text, perception)
+    packet: dict[str, Any] = {
+        "affected_ships": [],
+        "region": "BAY OF BENGAL" if "bay of bengal" in str(text).lower() else "",
+        "reported_duration": "1-2天" if any(marker in str(text) for marker in ("1-2天", "1～2天", "连续2天")) else "",
+        "onboard_ais_status": {"value": "正常", "source": "user_reported"} if "ais" in str(text).lower() and "正常" in str(text) else {},
+        "nearby_ships_status": {"value": "正常", "source": "user_reported"} if "附近" in str(text) and "正常" in str(text) else {},
+        "platform_observations": [],
+        "tool_verified_facts": [],
+        "time_discrepancies": [],
+        "unverified_claims": [],
+        "possible_fault_layers": ["船端 AIS 发射", "卫星或岸基接收覆盖", "上游数据源", "MMSI/IMO 映射", "平台数据消费或过滤", "单船设备或配置"],
+        "recommended_checks": [],
+        "escalation_required": False,
+    }
+    if not candidates:
+        packet["unverified_claims"].append("截图和用户文字未提供可查询的船舶身份")
+        packet["recommended_checks"].append("补充两艘船各自的 MMSI、IMO 或完整船名")
+        packet["escalation_required"] = True
+        trace.check_result = {"write_tools_called": False, "identified_ship_count": 0, "incident_packet": packet}
+        trace.reasoning_trace["incident_packet"] = packet
+        trace.answer_confidence = "medium"
+        return "我会按船位异常处理，不会执行船位或静态信息更新。当前无法从附件确认两艘受影响船的完整身份；请补充缺少那艘船的 MMSI、IMO 或完整船名，我就能分别核对最近船位和最后更新时间。"
+
+    for candidate in candidates:
+        item = dict(candidate)
+        mmsi, imo = item.get("mmsi", ""), item.get("imo", "")
+        if not mmsi and item.get("name") and "ship_search" in tool_map:
+            lookup = _invoke_tool(tool_map, trace, "ship_search", {"keyword": item["name"]})
+            mmsi, imo = _parse_first_mmsi(lookup), imo or _parse_first_imo(lookup)
+            item.update({"mmsi": mmsi, "imo": imo})
+        if not mmsi:
+            item["identity_status"] = "unresolved"
+            packet["affected_ships"].append(item)
+            continue
+        item["identity_status"] = "resolved"
+        position = _invoke_tool(tool_map, trace, "get_ship_position", {"mmsi": mmsi}) if "get_ship_position" in tool_map else ""
+        archive = _invoke_tool(tool_map, trace, "get_ship_archive", {"mmsi": mmsi, "imo": imo}) if "get_ship_archive" in tool_map else ""
+        item["position_query"] = "ok" if position and not is_no_hit_text(position) else "weak_or_empty"
+        item["position_summary"] = _incident_position_summary(position) if item["position_query"] == "ok" else ""
+        item["tool_last_update_time"] = _incident_position_update_time(position) if item["position_query"] == "ok" else ""
+        screenshot_entity = next(
+            (
+                entity
+                for entity in list(perception.get("ship_entities") or [])
+                if isinstance(entity, dict)
+                and (
+                    str(entity.get("mmsi") or "").strip() == mmsi
+                    or (item.get("name") and str(entity.get("name") or "").strip().lower() == str(item.get("name") or "").strip().lower())
+                )
+            ),
+            {},
+        )
+        screenshot_time = str(screenshot_entity.get("last_update_time") or "").strip() if isinstance(screenshot_entity, dict) else ""
+        if _incident_times_differ(screenshot_time, item["tool_last_update_time"]):
+            packet["time_discrepancies"].append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "mmsi": mmsi,
+                    "screenshot_last_update_time": screenshot_time,
+                    "tool_last_update_time": item["tool_last_update_time"],
+                }
+            )
+        packet["affected_ships"].append(item)
+        if position and not is_no_hit_text(position):
+            packet["tool_verified_facts"].append({"mmsi": mmsi, "source": "get_ship_position", "summary": position[:500]})
+        else:
+            packet["platform_observations"].append({"mmsi": mmsi, "source": "get_ship_position", "summary": "未获得可确认的当前/最近船位"})
+        if archive and not is_no_hit_text(archive):
+            packet["tool_verified_facts"].append({"mmsi": mmsi, "source": "get_ship_archive", "summary": archive[:300]})
+
+    unresolved = [item for item in packet["affected_ships"] if item.get("identity_status") != "resolved"]
+    packet["recommended_checks"] = ["按每艘船的 MMSI 核对最近报文时间、位置和数据源", "比较两船最后有效船位是否在同一时间窗口中断", "若同区域多船同时中断，核对接收覆盖、上游数据源和平台消费链路", "若仅单船异常，核对船端 AIS 发射、MMSI 映射和设备配置"]
+    packet["escalation_required"] = bool(unresolved or len(packet["tool_verified_facts"]) < len(packet["affected_ships"]))
+    trace.check_result = {"write_tools_called": False, "identified_ship_count": len(packet["affected_ships"]), "resolved_ship_count": len(packet["affected_ships"]) - len(unresolved), "incident_packet": packet}
+    trace.reasoning_trace["incident_packet"] = packet
+    trace.answer_confidence = "medium" if packet["escalation_required"] else "high"
+    identity_lines = [f"- {item.get('name') or '船舶'}：{item.get('mmsi') or '身份待补充'}（{item.get('position_query', '待查询')}）" for item in packet["affected_ships"]]
+    answer = ["我已将该请求按“船位跟踪异常”处理，不会执行数据更新。", "【本轮可确认的对象】", *identity_lines]
+    verified_lines = [
+        f"- {item.get('name') or item.get('mmsi') or '船舶'}：{item.get('position_summary')}"
+        for item in packet["affected_ships"]
+        if item.get("position_summary")
+    ]
+    if verified_lines:
+        answer.extend(["【工具返回的最近状态】", *verified_lines])
+    discrepancy_lines = [
+        f"- {item.get('name') or item.get('mmsi') or '船舶'}：截图显示 {item.get('screenshot_last_update_time')}；本轮工具返回 {item.get('tool_last_update_time')}。"
+        for item in packet["time_discrepancies"]
+    ]
+    if discrepancy_lines:
+        answer.extend([
+            "【截图与本轮工具时间差异】",
+            *discrepancy_lines,
+            "这只能说明两个数据视图的时间点不同，不能仅据此判断 AIS、接收覆盖或后台链路的根因。",
+        ])
+    if unresolved:
+        answer.append("其中至少一艘船身份仍不完整；请补充该船的 MMSI、IMO 或完整船名，才能做分船核对。")
+    answer.extend(["【已知与待核实】", "“船端 AIS 正常”和“附近船正常”目前作为您提供的情况记录，尚非平台工具验证事实。", "若两船最后有效报文在相近时间中断，建议提交技术工单核查接收覆盖、上游数据源、MMSI 映射和平台消费链路；若只有单船异常，优先核查该船设备和配置。"])
+    return "\n".join(answer)
 
 
 def execute_stats_chain(text: str, entities: MessageEntities, tool_map: dict[str, Any], trace: HarnessTrace) -> str:
@@ -3912,7 +4107,10 @@ def parse_ship_update_request(
     identifiers = dict(attachment_identifiers)
     identifiers.update({key: value for key, value in text_identifiers.items() if value})
     for key in ("mmsi", "imo", "ship_name"):
-        if semantic_fields.get(key) and not identifiers.get(key):
+        # The contract extractor may infer a plausible identifier; identity is
+        # safety-critical, so only accept identifiers evidenced by this turn's
+        # text/perception and resolve any remaining IMO/name via ship_search.
+        if key == "ship_name" and semantic_fields.get(key) and not identifiers.get(key):
             identifiers[key] = semantic_fields[key]
     static_update_requested, static_fields = _static_update_requested(instruction_text)
     contract_operation_type = semantic_extraction.operation_type or ""

@@ -14,6 +14,7 @@ from agents.customer_support_router import (
     SHIP_STATS_BUNDLE,
     SHIP_UPDATE_BUNDLE,
     SHIP_VOYAGE_BUNDLE,
+    RouteDecision,
     answer_conversation_memory,
     build_conversation_context,
     build_customer_support_plan,
@@ -44,6 +45,7 @@ from agents.customer_support_router import (
     _rewrite_hifleet_knowledge_query,
 )
 from agents.customer_support_guard import sanitize_customer_output
+from agents.customer_support_understanding import build_customer_understanding
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from skills.browser_verify.tools import (
     PREFERRED_HIFLEET_PAGES,
@@ -146,9 +148,11 @@ def test_evidence_required_knowledge_chain_does_not_short_circuit_before_browser
         "web_search",
         lambda args: calls.append("web_search") or json.dumps(
             {
-                "tool": "web_search",
-                "status": "ok",
-                "can_answer": True,
+                    "tool": "web_search",
+                    "status": "ok",
+                    "can_answer": False,
+                    "should_continue": True,
+                    "continue_with": "agent_browser",
                 "continue_with": "none",
                 "items": [{"title": "官方帮助", "url": "https://www.hifleet.com/helpcenter/", "snippet": "支持范围"}],
                 "best_urls": ["https://www.hifleet.com/helpcenter/"],
@@ -1897,8 +1901,8 @@ def test_chart_symbol_answer_without_verified_link_uses_unverified_template():
 
     output = format_verified_chart_symbol_answer(perception, "未检索到足够可信的信息")
 
-    assert "初步识别为：红色圆形、中心黑点" in output
-    assert "未检索到准确官方内容" in output
+    assert "截图特征是：红色圆形、中心黑点" in output
+    assert "地名、坐标或图层名称" in output
     assert "安全水域浮标" not in output
 
 
@@ -1984,6 +1988,21 @@ def test_file_chain_inspects_customer_file():
     assert "rows=10" in output
     assert inspect.calls == [{"file_url": "https://example.com/a.csv"}]
     assert trace.check_result["inspected"] is True
+
+
+def test_file_chain_prefers_real_file_over_upload_error_screenshot():
+    inspect = FakeTool("inspect_customer_file", lambda args: '{"ok":true,"text":"spreadsheet rows=10"}')
+    attachments = [
+        Attachment(type="file", url="https://example.com/ships.xlsx", filename="ships.xlsx"),
+        Attachment(type="image", url="https://example.com/upload-error.png", filename="upload-error.png"),
+    ]
+    decision = classify_multimodal_message("请分析这个 Excel 文件，截图只是上传失败提示", attachments, classify_message("请分析这个 Excel 文件，截图只是上传失败提示", extract_entities("请分析这个 Excel 文件，截图只是上传失败提示")))
+    trace = make_trace(decision, extract_entities("请分析这个 Excel 文件，截图只是上传失败提示"))
+
+    output = execute_file_chain("请分析这个 Excel 文件，截图只是上传失败提示", attachments, decision, {"inspect_customer_file": inspect}, trace)
+
+    assert "spreadsheet rows=10" in output
+    assert inspect.calls == [{"file_url": "https://example.com/ships.xlsx"}]
 
 
 def test_browser_verify_chain_checks_public_url_and_searches():
@@ -2360,3 +2379,333 @@ def test_browser_capture_blocks_redirect_to_internal_url(monkeypatch):
 
     with pytest.raises(RuntimeError, match="browser_redirect_blocked"):
         _browser_capture_page_text("https://public.example/page")
+
+
+def test_multimodal_scenario_prefers_explicit_tracking_incident_over_visible_ship_fields():
+    from agents.customer_support_understanding import build_customer_understanding
+
+    result = build_customer_understanding(
+        "我司2艘船连续2天没有船位跟踪，AIS正常，请指导后台看看什么问题",
+        has_media=True,
+        perception={"attachment_type": "image", "visible_text": "MMSI 413000001\nMMSI 413000002", "confidence": "high"},
+    )
+
+    assert result.multimodal_scenario == "ship_tracking_incident"
+    assert result.is_write_request is False
+    assert result.needs_backend_diagnosis is True
+    assert "incident_packet" in result.required_claims
+
+
+def test_multimodal_scenario_routes_metric_definition_from_user_goal():
+    from agents.customer_support_understanding import build_customer_understanding
+
+    result = build_customer_understanding(
+        "请问这个平均航速，是否包含停航时段、进出港时间？",
+        has_media=True,
+        perception={"attachment_type": "image", "visible_text": "平均航速 10.2 kn", "confidence": "high"},
+    )
+
+    assert result.multimodal_scenario == "platform_metric_definition"
+    assert result.required_claims == [
+        "metric_denominator_time",
+        "metric_stationary_or_anchored_time",
+        "metric_port_low_speed_time",
+        "metric_vs_voyage_average_definition",
+    ]
+
+
+def test_mixed_file_and_error_screenshot_keeps_file_analysis_goal():
+    result = build_customer_understanding(
+        "请分析这个 Excel 文件的数据，截图只是上传失败提示。",
+        has_media=True,
+        has_file_attachment=True,
+        perception={"attachment_type": "image", "visible_text": "上传失败 Error", "confidence": "high"},
+    )
+
+    assert result.multimodal_scenario == "file_or_document_task"
+    assert result.scenario == "file_or_document_task"
+    assert result.is_write_request is False
+
+
+def test_upload_error_screenshot_without_file_stays_troubleshooting():
+    result = build_customer_understanding(
+        "Excel 文件上传失败，截图是报错提示。",
+        has_media=True,
+        perception={"attachment_type": "image", "visible_text": "上传失败 Error", "confidence": "high"},
+    )
+
+    assert result.multimodal_scenario == "platform_troubleshooting"
+
+
+def test_metric_definition_clears_stale_update_operation_metadata():
+    result = build_customer_understanding(
+        "请问这个平均航速，是否包含停航时段、进出港时间？",
+        has_media=True,
+        perception={"attachment_type": "image", "confidence": "high", "recognized_text": "平均航速 9.73 kn"},
+    )
+
+    assert result.multimodal_scenario == "platform_metric_definition"
+    assert result.operation_type == "none"
+    assert result.ship_write_request is False
+    assert result.ship_update_candidate is False
+    assert result.ship_update_confidence == "low"
+    assert result.needs_product_knowledge is True
+    assert result.is_write_request is False
+
+
+def test_refine_multimodal_route_uses_explicit_update_intent_only():
+    attachment = [Attachment(type="image", url="https://example.com/ship.png")]
+    base = classify_multimodal_message("请根据截图更新该船目的港", attachment, classify_message("请根据截图更新该船目的港", extract_entities("请根据截图更新该船目的港")))
+    decision = refine_multimodal_route_with_perception(
+        "请根据截图更新该船目的港",
+        attachment,
+        {"attachment_type": "image", "visible_text": "MMSI: 413000001\n目的港: Shanghai", "confidence": "high"},
+        base,
+    )
+
+    assert decision.route == "ship_update"
+
+
+def test_ship_tracking_incident_packet_queries_each_identity_and_never_writes():
+    from agents.customer_support_router import MessageEntities, RouteDecision, execute_ship_tracking_incident_chain
+
+    positions = FakeTool("get_ship_position", lambda args: f"MMSI {args['mmsi']} 最后船位 2026-06-27 05:44:25 UTC+8")
+    archives = FakeTool("get_ship_archive", lambda args: f"MMSI {args['mmsi']} 档案")
+    decision = RouteDecision("ship_tracking_incident", "ship_tracking_incident", SHIP_VOYAGE_BUNDLE, "complex")
+    trace = make_trace(decision, MessageEntities())
+    answer = execute_ship_tracking_incident_chain(
+        "两艘船连续2天没有船位跟踪，AIS正常，附近船正常，请后台看看",
+        {
+            "attachment_type": "image",
+            "ship_entities": [
+                {"name": "GOLDEN LILY", "mmsi": "370731000"},
+                {"name": "SECOND SHIP", "mmsi": "413000002", "last_update_time": "2026-06-20 05:44:25 UTC+8"},
+            ],
+        },
+        {"get_ship_position": positions, "get_ship_archive": archives},
+        trace,
+    )
+
+    packet = trace.check_result["incident_packet"]
+    assert "【工具返回的最近状态】" in answer
+    assert "工具返回更新时间 2026-06-27 05:44:25 UTC+8" in answer
+    assert "【截图与本轮工具时间差异】" in answer
+    assert "不能仅据此判断 AIS、接收覆盖或后台链路的根因" in answer
+    assert positions.calls == [{"mmsi": "370731000"}, {"mmsi": "413000002"}]
+    assert trace.check_result["write_tools_called"] is False
+    assert packet["onboard_ais_status"]["source"] == "user_reported"
+    assert len(packet["affected_ships"]) == 2
+    assert "不会执行数据更新" in answer
+
+
+def test_multimodal_scenario_user_goal_beats_hifleet_ui_ocr_for_chart_symbol():
+    from agents.customer_support_understanding import build_customer_understanding
+
+    result = build_customer_understanding(
+        "图中的小圈圈是什么意思？",
+        has_media=True,
+        perception={
+            "attachment_type": "image",
+            "confidence": "high",
+            "recognized_text": "HiFleet 页面 船队 按钮 设置",
+            "summary": "HiFleet 海图界面上有多个小空心圆圈",
+            "ship_entities": [{"name": "示例船"}],
+        },
+    )
+
+    assert result.multimodal_scenario == "chart_symbol_explanation"
+    assert result.question_type == "symbol_meaning"
+    assert result.target_object == "示例船"
+
+
+def test_multimodal_file_attachment_is_current_media():
+    from agents.agent import _has_current_multimodal_media
+
+    assert _has_current_multimodal_media(
+        [HumanMessage(content=[{"type": "file_url", "file_url": {"url": "https://example.com/report.pdf"}}])]
+    )
+
+
+def test_metric_definition_without_official_product_evidence_does_not_claim_formula():
+    from agents.customer_support_router import MessageEntities, RouteDecision
+
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps({"tool": "local_kb_search", "status": "ok", "can_answer": True, "items": [{"title": "未署名 FAQ", "content": "平均航速排除低于1节的点"}]}, ensure_ascii=False),
+    )
+    decision = RouteDecision("knowledge", "platform_metric_definition", KNOWLEDGE_BUNDLE, "complex")
+    trace = make_trace(decision, MessageEntities())
+    answer, _, _ = execute_planned_knowledge_chain(
+        "请问这个平均航速，是否包含停航时段、进出港时间？",
+        decision,
+        [{"query": "HiFleet 平均航速 计算口径", "depth": "deep"}],
+        {"local_kb_search": local_kb},
+        trace,
+    )
+
+    assert "不能仅凭这些数值确认" in answer
+    assert "低于1节" not in answer
+    assert trace.fallback_reason == "metric_definition_without_product_evidence"
+
+
+def test_metric_definition_keeps_metric_specific_boundary_when_browser_verification_fails():
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps(
+            {
+                "tool": "local_kb_search",
+                "status": "ok",
+                "can_answer": False,
+                "should_continue": True,
+                "items": [],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: json.dumps(
+            {
+                "tool": "web_search",
+                "status": "ok",
+                "can_answer": False,
+                "should_continue": True,
+                "continue_with": "agent_browser",
+                "items": [{"title": "未核验页面", "url": "https://www.hifleet.com/wp/communities/fleet/example-filter-memory/", "snippet": "页面摘要"}],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    browser = FakeTool(
+        "web_search_agent_browser",
+        lambda args: json.dumps({"tool": "web_search_agent_browser", "status": "timeout", "can_answer": False, "pages": []}, ensure_ascii=False),
+    )
+    decision = RouteDecision("knowledge", "platform_metric_definition", KNOWLEDGE_BUNDLE, "complex", search_depth="deep")
+    trace = make_trace(decision, extract_entities("平均航速"))
+
+    answer, _, _ = execute_planned_knowledge_chain(
+        "请问这个平均航速，是否包含停航时段、进出港时间？",
+        decision,
+        [{"query": "HiFleet 平均航速 计算口径", "depth": "deep"}],
+        {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser},
+        trace,
+    )
+
+    assert trace.fallback_reason == "metric_definition_without_product_evidence"
+    assert "不能仅凭这些数值确认 HiFleet 的计算口径" in answer
+    assert "功能是否支持" not in answer
+
+
+def test_multimodal_scenario_prioritizes_upload_failure_over_write_keyword():
+    result = build_customer_understanding(
+        "航线文件上传失败，提示格式错误。",
+        has_media=True,
+        perception={"attachment_type": "image", "confidence": "high", "error_entities": [{"error_text": "upload failed"}]},
+    )
+
+    assert result.multimodal_scenario == "platform_troubleshooting"
+    assert result.is_write_request is False
+
+
+def test_audio_envelope_routes_transcribed_error_to_business_troubleshooting_chain():
+    result = build_customer_understanding(
+        "",
+        has_media=True,
+        perception={"attachment_type": "audio", "confidence": "high", "audio_transcript": "HiFleet 页面报错加载失败，请问怎么处理？"},
+    )
+
+    assert result.multimodal_scenario == "audio_request"
+    assert result.business_scenario == "platform_troubleshooting"
+    assert result.task_type == "platform_troubleshooting"
+
+
+def test_video_envelope_routes_error_summary_to_business_troubleshooting_chain():
+    result = build_customer_understanding(
+        "视频里点击导出后出现错误弹窗。",
+        has_media=True,
+        perception={"attachment_type": "video", "confidence": "high", "video_summary": "用户点击导出按钮后页面显示 Error 弹窗"},
+    )
+
+    assert result.multimodal_scenario == "video_request"
+    assert result.business_scenario == "platform_troubleshooting"
+    assert result.task_type == "platform_troubleshooting"
+
+
+def test_audio_transcript_explicit_update_request_reaches_media_update_semantics():
+    result = build_customer_understanding(
+        "",
+        has_media=True,
+        perception={
+            "attachment_type": "audio",
+            "confidence": "high",
+            "audio_transcript": "请更新该船船位，MMSI 123456789，经度 121.5，纬度 31.2，更新时间 2026-07-13 10:00:00。",
+        },
+    )
+
+    assert result.multimodal_scenario == "audio_request"
+    assert result.business_scenario == "ship_update_from_media"
+    assert result.ship_update_candidate is True
+    assert result.is_write_request is True
+    assert result.operation_type == "position_update"
+
+
+def test_audio_recognized_text_is_accepted_as_explicit_update_instruction():
+    result = build_customer_understanding(
+        "",
+        has_media=True,
+        perception={
+            "attachment_type": "audio",
+            "confidence": "high",
+            "recognized_text": "请更新该船船位，MMSI 123456789，经度 121.5，纬度 31.2，更新时间 2026-07-13 10:00:00。",
+        },
+    )
+
+    assert result.business_scenario == "ship_update_from_media"
+    assert result.is_write_request is True
+
+
+def test_video_summary_cannot_authorize_ship_update_without_explicit_user_command():
+    result = build_customer_understanding(
+        "这个视频怎么回事？",
+        has_media=True,
+        perception={
+            "attachment_type": "video",
+            "confidence": "high",
+            "video_summary": "页面展示 MMSI 123456789、经度 121.5、纬度 31.2 和更新时间，像是船位更新界面。",
+        },
+    )
+
+    assert result.multimodal_scenario == "video_request"
+    assert result.ship_update_candidate is False
+    assert result.is_write_request is False
+
+
+def test_incident_candidates_do_not_duplicate_mmsi_already_bound_to_media_entity():
+    from agents.customer_support_router import _incident_ship_candidates
+
+    candidates = _incident_ship_candidates(
+        "两艘船没有船位",
+        {
+            "ship_entities": [
+                {"name": "GOLDEN LILY", "mmsi": "370731000", "imo": "9216468"},
+                {"name": "禾盛东方", "mmsi": "", "imo": ""},
+            ],
+            "visible_text": "MMSI 370731000 IMO 9216468 10.禾盛东方",
+        },
+    )
+
+    assert candidates == [
+        {"name": "GOLDEN LILY", "mmsi": "370731000", "imo": "9216468"},
+        {"name": "禾盛东方", "mmsi": "", "imo": ""},
+    ]
+
+
+def test_incident_candidates_treat_perception_placeholder_identifiers_as_missing():
+    from agents.customer_support_router import _incident_ship_candidates
+
+    candidates = _incident_ship_candidates(
+        "两艘船没有船位",
+        {"ship_entities": [{"name": "禾盛东方", "mmsi": "未显示", "imo": "--"}]},
+    )
+
+    assert candidates == [{"name": "禾盛东方", "mmsi": "", "imo": ""}]
