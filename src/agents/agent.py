@@ -87,8 +87,8 @@ from agents.ship_update_subagent import (
     legacy_pending_to_draft,
     run_ship_update_subagent,
 )
-from coze_coding_utils.runtime_ctx.context import default_headers
 from llm_config import DEFAULT_MULTIMODAL_MODEL, DEFAULT_TEXT_MODEL, build_thinking_payload, load_llm_config, resolve_thinking_settings
+from llm_gateway import build_chat_model, resolve_role_base_url as _shared_resolve_role_base_url, resolve_runtime_llm_settings as _shared_resolve_runtime_llm_settings, safe_default_headers as _shared_safe_default_headers
 from skills import SkillLoader
 from storage.memory.memory_saver import get_memory_saver
 from utils.llm_route_state import get_current_llm_route
@@ -211,12 +211,7 @@ JSON 格式:
 
 
 def _safe_default_headers(ctx) -> dict[str, str]:
-    if not ctx:
-        return {}
-    try:
-        return default_headers(ctx)
-    except Exception:
-        return {}
+    return _shared_safe_default_headers(ctx)
 
 CUSTOMER_SUPPORT_PERCEPTION_PROMPT = """你是 HiFleet 客服附件识别助手。
 只根据用户文字和附件内容做轻量识别，不回答用户问题，只返回 JSON。
@@ -355,41 +350,13 @@ def _state_dict_from_model(value: Any) -> dict[str, Any]:
 
 
 def _resolve_role_base_url(cfg: dict[str, Any], role: str) -> str:
-    config = dict(cfg.get("config") or {})
-    env_key_by_role = {
-        "text": "text_model_base_url_env",
-        "multimodal": "multimodal_model_base_url_env",
-        "json": "json_model_base_url_env",
-    }
-    env_name = str(config.get(env_key_by_role.get(role, "")) or "").strip()
-    if env_name:
-        value = os.getenv(env_name, "").strip()
-        if value:
-            return value
-    return os.getenv("COZE_INTEGRATION_MODEL_BASE_URL", "").strip()
+    return _shared_resolve_role_base_url(cfg, role)
 
 
 def _build_customer_support_json_llm(ctx, cfg: dict[str, Any], model_override: str = "") -> ChatOpenAI | None:
-    api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
-    base_url = _resolve_role_base_url(cfg, "json")
-    if not api_key or not base_url:
-        return None
     runtime_settings = _resolve_runtime_llm_settings(ctx, cfg, role="json")
     model = str(model_override or (cfg.get("config") or {}).get("customer_support_json_model") or (cfg.get("config") or {}).get("customer_support_reasoning_model") or runtime_settings["model"]).strip()
-    try:
-        headers = _safe_default_headers(ctx)
-    except Exception:
-        headers = {}
-    return ChatOpenAI(
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-        temperature=0.1,
-        streaming=False,
-        timeout=(cfg.get("config") or {}).get("timeout", 600),
-        extra_body={"thinking": build_thinking_payload(runtime_settings["thinking_type"], runtime_settings["reasoning_effort"])},
-        default_headers=headers,
-    )
+    return build_chat_model(ctx, cfg, role="json", model_override=model, temperature=0.1, chat_model_class=ChatOpenAI)
 
 
 def _invoke_customer_support_json_agent(ctx, cfg: dict[str, Any], system_prompt: str, payload: dict[str, Any], model_override: str = "") -> dict[str, Any]:
@@ -2430,31 +2397,10 @@ def _load_llm_config(workspace_path: str) -> dict[str, Any]:
 
 
 def _resolve_runtime_llm_settings(ctx, cfg: dict[str, Any], *, role: str = "text") -> dict[str, str]:
-    config = dict(cfg.get("config") or {})
-    route = get_current_llm_route()
-    requested_model = str(route.get("model", "")).strip()
-    requested_thinking = str(route.get("thinking_type", "")).strip()
-    requested_effort = str(route.get("reasoning_effort", "")).strip()
-    if role == "multimodal":
-        default_model = str(config.get("multimodal_model") or DEFAULT_MULTIMODAL_MODEL).strip()
-        default_thinking = config.get("multimodal_thinking_type") or config.get("thinking_type") or "enabled"
-    elif role == "json":
-        default_model = str(config.get("customer_support_json_model") or config.get("customer_support_reasoning_model") or config.get("text_model") or config.get("model") or DEFAULT_TEXT_MODEL).strip()
-        default_thinking = config.get("customer_support_json_thinking_type") or config.get("thinking_type") or "enabled"
-    else:
-        default_model = str(config.get("text_model") or config.get("model") or DEFAULT_TEXT_MODEL).strip()
-        default_thinking = config.get("text_thinking_type") or config.get("thinking_type") or "enabled"
-    model = requested_model or default_model
-    thinking = resolve_thinking_settings(
-        requested_thinking or default_thinking,
-        requested_effort or config.get("reasoning_effort") or "medium",
-    )
-    return {"model": model, **thinking}
+    return _shared_resolve_runtime_llm_settings(cfg, role=role)
 
 
 def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
-    api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY")
-    base_url = _resolve_role_base_url(cfg, "text")
     runtime_settings = _resolve_runtime_llm_settings(ctx, cfg, role="text")
     logger.info(
         "[MainAgent] Resolved model=%s thinking=%s effort=%s streaming=%s",
@@ -2463,16 +2409,10 @@ def _build_llm(ctx, cfg: dict[str, Any], *, streaming: bool) -> ChatOpenAI:
         runtime_settings["reasoning_effort"],
         streaming,
     )
-    return ChatOpenAI(
-        model=runtime_settings["model"],
-        api_key=api_key,
-        base_url=base_url,
-        temperature=cfg["config"].get("temperature", 0.7),
-        streaming=streaming,
-        timeout=cfg["config"].get("timeout", 600),
-        extra_body={"thinking": build_thinking_payload(runtime_settings["thinking_type"], runtime_settings["reasoning_effort"])},
-        default_headers=_safe_default_headers(ctx),
-    )
+    llm = build_chat_model(ctx, cfg, role="text", streaming=streaming, chat_model_class=ChatOpenAI)
+    if llm is None:
+        raise RuntimeError("Customer support model gateway is not configured.")
+    return llm
 
 
 def _build_standard_agent(ctx, cfg: dict[str, Any], workspace_path: str, profile: AgentProfile, intent_hint: str = ""):
@@ -4162,8 +4102,10 @@ def build_agent(ctx=None, intent: str = ""):
     intent_hint = _resolve_intent_hint(ctx, explicit_intent=intent)
     profile = _resolve_agent_profile(ctx)
     if profile.profile_id == "customer_ceshi":
-        agent = _build_lightweight_customer_support_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
-        logger.info("[MainAgent] Customer ceshi guarded customer-support graph built successfully")
+        from agents.customer_ceshi_v2 import build_customer_ceshi_v2_agent
+
+        agent = build_customer_ceshi_v2_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+        logger.info("[MainAgent] Customer ceshi v2 model-driven graph built successfully")
         return agent
     if profile.profile_id == "customer_support":
         agent = _build_lightweight_customer_support_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)

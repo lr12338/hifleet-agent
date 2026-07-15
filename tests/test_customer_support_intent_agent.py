@@ -821,13 +821,14 @@ def test_customer_support_graph_write_guard_overrides_light_agent(monkeypatch):
     assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_guard"
 
 
-def test_customer_ceshi_profile_uses_lightweight_guarded_graph(monkeypatch):
+def test_customer_ceshi_profile_uses_isolated_v2_graph(monkeypatch):
     built = {}
 
     class FakeGraph:
         pass
 
-    monkeypatch.setattr("agents.agent._build_lightweight_customer_support_agent", lambda *args, **kwargs: built.setdefault("graph", FakeGraph()))
+    monkeypatch.setattr("agents.customer_ceshi_v2.build_customer_ceshi_v2_agent", lambda *args, **kwargs: built.setdefault("graph", FakeGraph()))
+    monkeypatch.setattr("agents.agent._build_lightweight_customer_support_agent", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("customer_ceshi must not use the production builder")))
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("customer_ceshi must not use standard agent")))
     set_current_agent_profile("customer_ceshi")
 

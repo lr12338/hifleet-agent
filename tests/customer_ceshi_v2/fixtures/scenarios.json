@@ -1,0 +1,10 @@
+[
+  {"name":"typhoon_warning_line","claims":["HiFleet displays a warning line.","The authority that publishes the line is identified."],"facts":["HiFleet displays a warning line."],"expected_unsupported":["The authority that publishes the line is identified."]},
+  {"name":"average_speed_screenshot","claims":["The screenshot shows average speed.","The platform calculation formula is known."],"facts":["The screenshot shows average speed."],"expected_unsupported":["The platform calculation formula is known."]},
+  {"name":"multiple_ships_missing_positions","claims":["Two ship identifiers are confirmed.","The root cause is confirmed."],"facts":["The user reports missing positions."],"expected_unsupported":["Two ship identifiers are confirmed.","The root cause is confirmed."]},
+  {"name":"chart_symbol_screenshot","claims":["A red circle is visible.","The chart symbol name is verified."],"facts":["A red circle is visible."],"expected_unsupported":["The chart symbol name is verified."]},
+  {"name":"image_ship_type_update","claims":["The requested target type is bulk carrier.","The write was committed."],"facts":["The requested target type is bulk carrier."],"expected_unsupported":["The write was committed."]},
+  {"name":"voice_update_request","claims":["The audio contains an update request.","The low-confidence MMSI is safe to write."],"facts":["The audio contains an update request."],"expected_unsupported":["The low-confidence MMSI is safe to write."]},
+  {"name":"video_operation_error","claims":["An error dialog appears in the video.","The root cause is verified."],"facts":["An error dialog appears in the video."],"expected_unsupported":["The root cause is verified."]},
+  {"name":"multiple_attachments","claims":["Each attachment has an independent source.","All fields are mutually consistent."],"facts":["Each attachment has an independent source."],"expected_unsupported":["All fields are mutually consistent."]}
+]

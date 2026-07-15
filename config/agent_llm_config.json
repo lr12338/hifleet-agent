@@ -21,7 +21,15 @@
     "top_p": 0.9,
     "model": "deepseek-v4-flash-260425",
     "text_model": "deepseek-v4-flash-260425",
-    "multimodal_model": "doubao-seed-2-0-lite-260428"
+    "multimodal_model": "doubao-seed-2-0-lite-260428",
+    "customer_ceshi_v2_text_model": "deepseek-v4-flash-260425",
+    "customer_ceshi_v2_multimodal_model": "doubao-seed-2-0-lite-260428",
+    "customer_ceshi_v2_max_steps": 6,
+    "customer_ceshi_v2_timeout_seconds": 30,
+    "customer_ceshi_v2_max_media_calls": 4,
+    "customer_ceshi_v2_max_tool_calls": 8,
+    "customer_ceshi_v2_max_runtime_ms": 90000,
+    "customer_ceshi_v2_ship_write_enabled": false
   },
   "sp": "System prompt dynamically assembled from config/system_prompt_base.md + skills/*/SKILL.md",
   "tools": [

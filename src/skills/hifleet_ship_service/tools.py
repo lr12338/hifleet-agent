@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 import time
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from langchain.tools import tool
 from coze_coding_utils.log.write_log import request_context
@@ -889,7 +889,7 @@ def get_ship_trajectory(mmsi: str, starttime: str = "", endtime: str = "", zoom:
 
 @tool
 def get_ship_call_ports(mmsi: str, starttime: str = "", endtime: str = "", accuracyval: str = "6") -> str:
-    """查询单船历史挂靠记录。"""
+    """查询单船历史挂靠记录；未提供时间范围时默认查询最近一年。"""
     t0 = time.time()
     ctx = request_context.get() or new_context(method="get_ship_call_ports")
     try:
@@ -897,6 +897,10 @@ def get_ship_call_ports(mmsi: str, starttime: str = "", endtime: str = "", accur
             output = "请提供MMSI以查询历史挂靠。"
             _emit_result("get_ship_call_ports", ctx, ToolResult(status="error", code="CALL_PORTS_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
             return output
+        if not starttime:
+            starttime = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        if not endtime:
+            endtime = datetime.now().strftime("%Y-%m-%d")
         if starttime and len(starttime) == 10:
             starttime += " 00:00:00"
         if endtime and len(endtime) == 10:

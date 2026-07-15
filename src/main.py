@@ -5,6 +5,7 @@ import traceback
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, AsyncIterable, AsyncGenerator, Optional, List
 from urllib.parse import urlparse
@@ -90,6 +91,68 @@ TIMEOUT_SECONDS = 900  # 15分钟
 HEADER_X_INTENT_HINT = "x-intent-hint"
 EXTERNAL_CUSTOMER_SUPPORT_PROFILES = {"customer_support", "customer_ceshi"}
 RECURSION_FALLBACK_MESSAGE = "抱歉，当前问题未能在有限步骤内确认。请补充您想查询的具体目标，以及关联的船名、MMSI、IMO 或业务场景，我会继续为您核查。"
+_COZELOOP_FLUSH_LOCK = threading.Lock()
+_COZELOOP_FLUSH_IN_FLIGHT = False
+_COZELOOP_NEXT_FLUSH_AT = 0.0
+
+
+def _flush_cozeloop_in_background() -> None:
+    global _COZELOOP_FLUSH_IN_FLIGHT, _COZELOOP_NEXT_FLUSH_AT
+    try:
+        cozeloop.flush()
+    except Exception as exc:
+        logger.warning("[CozeLoop] background flush failed: %s", str(exc)[:240])
+    finally:
+        with _COZELOOP_FLUSH_LOCK:
+            _COZELOOP_FLUSH_IN_FLIGHT = False
+            _COZELOOP_NEXT_FLUSH_AT = time.monotonic() + float(os.getenv("COZELOOP_FLUSH_MIN_INTERVAL_SECONDS", "60"))
+
+
+def schedule_cozeloop_flush() -> None:
+    global _COZELOOP_FLUSH_IN_FLIGHT
+    now = time.monotonic()
+    with _COZELOOP_FLUSH_LOCK:
+        if _COZELOOP_FLUSH_IN_FLIGHT or now < _COZELOOP_NEXT_FLUSH_AT:
+            return
+        _COZELOOP_FLUSH_IN_FLIGHT = True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        thread = threading.Thread(target=_flush_cozeloop_in_background, name="cozeloop-flush", daemon=True)
+        thread.start()
+    else:
+        loop.create_task(asyncio.to_thread(_flush_cozeloop_in_background))
+
+
+def _compact_run_response(result: Dict[str, Any], *, session_id: str, user_id: str, source_channel: str, agent_profile: str) -> Dict[str, Any]:
+    route_trace = result.get("route_trace") if isinstance(result.get("route_trace"), dict) else {}
+    dependency_error = result.get("dependency_error") if isinstance(result.get("dependency_error"), dict) else {}
+    response: Dict[str, Any] = {
+        "status": str(result.get("status") or "success"),
+        "run_id": result.get("run_id", ""),
+        "answer": result.get("generated_answer") or result.get("candidate_answer") or result.get("message", ""),
+        "session_id": session_id,
+        "user_id": user_id,
+        "source_channel": source_channel,
+        "agent_profile": agent_profile,
+        "sources": route_trace.get("sources", []),
+        "metrics": result.get("metrics", {}),
+    }
+    diagnostics = route_trace.get("turn_diagnostics") if isinstance(route_trace.get("turn_diagnostics"), dict) else {}
+    if diagnostics:
+        context = {
+            "inherited_entity": bool(diagnostics.get("inherited_entity")),
+            "current_media_count": int(diagnostics.get("current_media_count", 0)),
+            "degrade_stage": str(diagnostics.get("degrade_stage", "")),
+        }
+        if diagnostics.get("media_delivery"):
+            context["media_delivery"] = str(diagnostics["media_delivery"])
+        if diagnostics.get("media_perception_passes"):
+            context["media_perception_passes"] = int(diagnostics["media_perception_passes"])
+        response["context"] = context
+    if dependency_error:
+        response["error"] = dependency_error
+    return response
 
 
 def _normalize_stack_trace(stack_trace: Any) -> str:
@@ -354,12 +417,13 @@ def ensure_stream_compatible_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _resolve_request_llm_route(payload: Dict[str, Any]) -> Dict[str, Any]:
     cfg = load_llm_config()
+    requested_route = payload.get("llm_route") if isinstance(payload.get("llm_route"), dict) else {}
     resolved = resolve_model_selection(
         cfg,
         has_multimodal_input=messages_have_multimodal_content(payload.get("messages")),
-        requested_model=str(payload.get("model", "")).strip(),
-        requested_thinking=str(payload.get("thinking", "")).strip(),
-        requested_reasoning_effort=str(payload.get("reasoning_effort", "")).strip(),
+        requested_model=str(payload.get("model") or requested_route.get("model") or "").strip(),
+        requested_thinking=str(payload.get("thinking") or requested_route.get("thinking_type") or "").strip(),
+        requested_reasoning_effort=str(payload.get("reasoning_effort") or requested_route.get("reasoning_effort") or "").strip(),
     )
     payload["llm_route"] = resolved
     return resolved
@@ -503,7 +567,7 @@ class AgentService:
         finally:
             self.running_tasks.pop(run_id, None)
             clear_current_llm_route()
-        cozeloop.flush()
+        schedule_cozeloop_flush()
 
     def _get_stream_runner(self):
         return self._agent_stream_runner
@@ -594,7 +658,7 @@ class AgentService:
             # 清理任务记录
             self.running_tasks.pop(run_id, None)
             clear_current_llm_route()
-        cozeloop.flush()
+        schedule_cozeloop_flush()
 
     # 取消执行 - 使用asyncio的标准方式
     def cancel_run(self, run_id: str, ctx: Optional[Context] = None) -> Dict[str, Any]:
@@ -840,21 +904,34 @@ async def http_run(request: Request) -> Dict[str, Any]:
         if isinstance(result, dict):
             result["run_id"] = run_id
             result.setdefault("llm_route", payload.get("llm_route", {}))
+        response_mode = str(payload.get("response_mode", "full")).strip().lower()
+        response_result: Dict[str, Any] = result
+        if response_mode == "compact" and isinstance(result, dict):
+            response_result = _compact_run_response(
+                result,
+                session_id=session_id,
+                user_id=user_id,
+                source_channel=source_channel,
+                agent_profile=agent_profile,
+            )
+        http_status_code = 503 if response_mode == "compact" and bool((response_result.get("error") or {}).get("retryable")) else 200
         latency_ms = int((time.perf_counter() - started) * 1000)
         _log_api_call_event(
             run_id=run_id,
             route="/run",
-            status=str(result.get("status", "success")) if isinstance(result, dict) else "success",
-            http_status_code=200,
+            status=str(response_result.get("status", "success")) if isinstance(response_result, dict) else "success",
+            http_status_code=http_status_code,
             latency_ms=latency_ms,
             payload=payload,
-            response_json=_to_log_json(result),
+            response_json=_to_log_json(response_result),
             session_id=session_id,
             user_id=user_id,
             source_channel=source_channel,
             intent_hint=intent_hint,
         )
-        return result
+        if http_status_code != 200:
+            return JSONResponse(status_code=http_status_code, content=response_result)
+        return response_result
 
     except ValueError as e:
         logger.error(f"Payload validation error in http_run: {e}")
@@ -984,7 +1061,7 @@ async def http_run(request: Request) -> Dict[str, Any]:
             }
         )
     finally:
-        cozeloop.flush()
+        schedule_cozeloop_flush()
 
 
 
@@ -1210,7 +1287,7 @@ async def openai_chat_completions(request: Request):
         logger.error(f"JSON decode error in openai_chat_completions: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON format")
     finally:
-        cozeloop.flush()
+        schedule_cozeloop_flush()
 
 
 @app.get("/health")

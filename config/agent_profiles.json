@@ -37,7 +37,7 @@
       "disabled_tools": []
     },
     "customer_ceshi": {
-      "description": "Guarded customer-support experiment chain for multimodal understanding, ship queries, ship position/static updates, evidence constraints, and readable regression traces.",
+      "description": "Isolated model-driven customer-support experiment. DeepSeek orchestrates; Doubao is on-demand perception; writes require an independent confirmation gate.",
       "aliases": [],
       "source_channels": [
         "websdk",
@@ -54,19 +54,19 @@
         "multimodal_support",
         "browser_verify"
       ],
-      "prompt_file": "config/profiles/customer_ceshi.md",
+      "prompt_file": "config/profiles/customer_ceshi_v2.md",
       "max_iterations": 6,
       "requires_auth": false,
       "sandbox_enabled": false,
       "tool_policy": {
         "allow_file_tools": false,
         "allow_python": false,
-        "allow_write_actions": true,
+        "allow_write_actions": false,
         "prefer_search_before_answer": true,
         "allow_browser_verify": true,
         "allow_multimodal": true,
         "allow_artifact_links": false,
-        "lightweight_skills_agent": true
+        "lightweight_skills_agent": false
       },
       "disabled_tools": []
     }
