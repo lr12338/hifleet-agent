@@ -4102,6 +4102,19 @@ def build_agent(ctx=None, intent: str = ""):
     intent_hint = _resolve_intent_hint(ctx, explicit_intent=intent)
     profile = _resolve_agent_profile(ctx)
     if profile.profile_id == "customer_ceshi":
+        from agents.customer_ceshi_responses import runtime_config
+
+        ceshi_runtime = runtime_config(cfg)
+        if ceshi_runtime["mode"] in {"responses", "chat_function_calling"}:
+            from agents.customer_ceshi_responses import build_customer_ceshi_responses_agent
+
+            try:
+                return build_customer_ceshi_responses_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)
+            except Exception as exc:
+                if ceshi_runtime["fallback_mode"] == "legacy_v2" and ceshi_runtime["legacy_v2_enabled"]:
+                    logger.warning("[MainAgent] customer_ceshi native runtime unavailable; using explicitly enabled legacy_v2: %s", exc)
+                else:
+                    raise
         from agents.customer_ceshi_v2 import build_customer_ceshi_v2_agent
 
         agent = build_customer_ceshi_v2_agent(ctx, cfg, workspace_path, profile, intent_hint=intent_hint)

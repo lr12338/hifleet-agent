@@ -29,7 +29,14 @@
     "customer_ceshi_v2_max_media_calls": 4,
     "customer_ceshi_v2_max_tool_calls": 8,
     "customer_ceshi_v2_max_runtime_ms": 90000,
-    "customer_ceshi_v2_ship_write_enabled": false
+    "customer_ceshi_v2_ship_write_enabled": false,
+    "customer_ceshi_runtime": {
+      "mode": "responses",
+      "fallback_mode": "chat_function_calling",
+      "responses_enabled": true,
+      "chat_fallback_enabled": true,
+      "legacy_v2_enabled": false
+    }
   },
   "sp": "System prompt dynamically assembled from config/system_prompt_base.md + skills/*/SKILL.md",
   "tools": [
