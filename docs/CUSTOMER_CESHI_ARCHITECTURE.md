@@ -1,302 +1,128 @@
-# customer_ceshi 当前架构与 ship_update 链路
+# customer_ceshi 开发与运行指南
 
-本文描述当前真实生效的 `customer_ceshi` 链路。`customer_ceshi` 不再是独立沙盒 profile，而是与 `customer_support` 共用 lightweight 客服 graph 的回归/调试 profile。差异主要在 profile prompt、trace 可读性和回归覆盖。
+> 适用范围：仅 `customer_ceshi` 测试客服链。它与生产 `customer_support` 使用不同 Builder、运行时和 checkpoint namespace；修改本链路不得改变生产客服行为。
 
-## 1. 当前定位
+## 1. 一页总览
 
-| 维度 | 当前行为 |
-| --- | --- |
-| 入口 | `/run` / `/stream_run`，请求体或 header 指定 `agent_profile=customer_ceshi` |
-| 主 graph | `preprocess -> delegate -> finalize` |
-| 多模态 | direct perception 只整理 OCR、可见元素、附件问题摘要和检索关键词，不直接判断图标含义 |
-| 写入链路 | `ship_update` 子 agent 生成结构化计划；主链路只校验工具白名单、调用真实工具并记录结果 |
-| 跨轮状态 | 内部使用 `ship_update_draft`；`pending_update_state` 仅作为旧接口兼容视图 |
-| 成功话术 | 只有真实写入工具明确成功时才允许回复成功 |
+`customer_ceshi` 是 HiFleet 企业客服的实验链，用于验证 Responses API、原生函数调用、受控上下文、媒体理解和船舶更新能力。
 
-关键文件：
+| 用户输入 | 决策模型 | API 与运行方式 | 可用能力 |
+| --- | --- | --- | --- |
+| 纯文本 | `deepseek-v4-flash-260425` | Responses API 优先；不可用时同模型 Chat Function Calling | HiFleet 知识检索、网页核验、船舶只读查询、受控更新候选 |
+| 图片、视频、音频 | Doubao 图片/视频模型或音频模型 | Responses API；公网 URL 直接进入 `input[].content[]` | 媒体理解、只读检索、船舶只读查询、受控 AIS 证据记录 |
 
-- `src/agents/agent.py`：lightweight graph、多模态 perception、ship_update 子 agent 调度、finalize guard。
-- `src/agents/ship_update_subagent.py`：船位/静态信息更新的 prompt-driven 子 agent contract、draft 兼容与 fallback。
-- `src/skills/hifleet_ship_service/tools.py`：船位上传、静态信息更新和成功回复格式。
-- `config/profiles/customer_ceshi.md` / `config/profiles/customer_support.md`：客服可见行为边界。
+“单模型”按单个用户问题计算：纯文本问题不调用 Doubao；媒体问题不切换到 DeepSeek。一个问题可由同一模型多次 Responses 调用完成工具循环。
 
-## 2. 主链路
+## 2. 开发路线与关键决策
+
+1. **隔离入口**：`customer_ceshi` 从生产客服链分离，使用 `customer_ceshi_responses` namespace；失败时不自动回退到 `customer_support`。
+2. **Responses 优先**：弃用自定义 `AgentDecision JSON` 作为默认工具协议，改为 Provider `function_call` → 本地执行 → `function_call_output` → `previous_response_id` 续传。
+3. **模型主导、运行时治理**：模型理解问题、选择最少工具、读取证据并生成客户答复；代码仅负责白名单、预算、参数校验、证据压缩、会话隔离和写入安全。
+4. **受控记忆替代跨题 Provider 链**：跨用户问题不复用 `previous_response_id`。本地账本最多保存 10 轮问答，最近 3 轮保留完整文本，其余轮次压缩；原始工具日志、异常、媒体 URL 和推理不进入下一题。
+5. **媒体与业务问题统一处理**：媒体问题由 Doubao 直接接收公网 URL，同时可使用同一 Doubao Responses 工具循环核验 HiFleet 规则，避免“读到截图却无法回答时间范围/数量限制”。
+6. **写入永远受控**：模型不直接调用底层写工具。仅当前轮明确更新、字段来自当前文字或有效媒体证据且校验通过时，运行时调用 `upload_ship_position` 或 `update_ship_static_info`。
+
+## 3. 思考与执行链路
 
 ```mermaid
 flowchart TD
-    A["/run /stream_run"] --> B["消息归一化 + profile 解析"]
-    B --> C["_build_lightweight_customer_support_agent"]
-    C --> D["preprocess"]
-    D --> E{"敏感内部请求?"}
-    E -->|是| F["固定拒答"]
-    E -->|否| G{"当前轮有图片/语音/视频?"}
-    G -->|是| H["direct multimodal perception"]
-    H --> I["客观文本化<br/>OCR/可见元素/问题摘要/检索关键词"]
-    G -->|否| J["原始文本"]
-    I --> K["CustomerUnderstanding hint"]
-    J --> K
-    K --> L{"ship_update_draft 或写入候选?"}
-    L -->|是| M["ship_update 子 agent"]
-    M --> N{"status"}
-    N -->|ready_to_execute| O["调用 upload_ship_position / update_ship_static_info"]
-    N -->|need_user_input/cancelled/error| P["直接回复追问/取消/错误"]
-    N -->|non_write| Q["交回 standard agent 排障/知识问答"]
-    L -->|否| Q
-    O --> R["工具结果判定 + 成功/失败收口"]
-    P --> S["finalize"]
-    Q --> S
-    R --> S
+    A["/run 或 /stream_run\nagent_profile=customer_ceshi"] --> B["agents.agent.build_agent"]
+    B --> C["读取 customer_ceshi_runtime"]
+    C --> D{"当前消息有媒体？"}
+    D -->|否| E["DeepSeek NativeToolRuntime"]
+    D -->|是| F["Doubao 多模态 Responses"]
+    E --> G["模型理解 → 原生 function_call"]
+    F --> G
+    G --> H["白名单/去重/预算/参数校验"]
+    H --> I["精简 function_call_output"]
+    I --> J["同题 previous_response_id 续传"]
+    J --> K{"仍需工具？"}
+    K -->|是| G
+    K -->|否| L["微信纯文本渲染 + 事实型安全门禁"]
+    L --> M["记录 10 轮受控记忆"]
 ```
 
-当前写入链路的关键点是：模型负责识别和组织候选字段，代码层不再用固定业务规则决定“是否写入哪艘船”；但在真正调用工具前，会做工具字段白名单、字段别名、空值清理和 skills 参数格式化，保证传给工具的是工具参数而不是 API body。
+### 3.1 工具循环
 
-## 3. ship_update 子 agent
+- 只读工具来自 `CapabilityRegistry`，包含本地知识库、网页检索/核验和船舶/港口查询。
+- 搜索按“工具名 + 归一化 query”去重；默认本地知识库最多 2 次、联网搜索最多 2 次。
+- 工具返回不直接拼接原始 JSON。运行时只回传查询、状态、摘要、最多 3 条事实、最多 2 个来源、置信度和下一步建议。
+- 当工具明确 `can_answer=true` 时，下一次模型请求强制总结，不允许再做同义检索。
+- 普通产品、故障排查和数据时效解释由模型基于证据总结；安全门禁只校验“写入成功”和“查询无结果”等可由工具事实确认的结论。
 
-子 agent 是船舶写入业务判断中心。主链路不再用固定规则解释“确认更新 / 只补 MMSI / 目的港 follow-up / 取消”等业务语义。
+### 3.2 多媒体请求格式
 
-子 agent 输出固定结构：
+外部服务传入的公网 URL 按接收顺序保留在同一 `content` 数组，仅当前轮进入模型：
 
-| 字段 | 含义 |
+| 媒体 | Responses 内容项 | 额外参数 |
+| --- | --- | --- |
+| 图片 | `{"type":"input_image","image_url":"..."}` | 默认 `detail: "high"`；可配置像素范围 |
+| 视频 | `{"type":"input_video","video_url":"..."}` | `fps` 必须在 0.2–5，默认 1 |
+| 音频 | `{"type":"input_audio","audio_url":"..."}` | 无额外必填参数 |
+| 用户文字/历史摘要 | `{"type":"input_text","text":"..."}` | 与本轮媒体并列 |
+
+普通产品截图不再强制输出 AIS JSON。若 Doubao 从当前附件清晰识别出完整 AIS 更新字段，才调用内部 `record_media_update_candidate`；该调用只进入短期证据账本，不会显示给客户。
+
+### 3.3 直接更新流程
+
+1. 用户上传媒体：旧媒体证据立即失效；Doubao 可记录一份通过校验的 AIS 候选，默认有效 10 分钟。
+2. 用户当前轮明确说“更新船位”“执行更新”“根据上图/AIS 数据更新”，或在有效候选存在时只说“确认”。
+3. 运行时仅合并当前文字与同用户、同会话、未过期媒体证据：
+   - 船位更新必须有 9 位 MMSI、经度、纬度、更新时间。
+   - 静态更新必须有 MMSI 和至少一个可更新静态字段。
+4. 校验通过才调用底层写入；写入后候选立即清除。成功话术必须由真实写工具成功结果支撑。
+
+普通 10 轮记忆、历史查询结果、旧媒体、签名 URL 和模型猜测均不能补写更新字段。
+
+## 4. 关键文件与配置
+
+| 位置 | 职责 |
 | --- | --- |
-| `status` | `ready_to_execute`、`need_user_input`、`non_write`、`cancelled`、`error` |
-| `operation_type` | `position_update`、`static_update`、`mixed_update`、`none` |
-| `tool_name` / `tool_args` | 候选写入工具与工具参数 |
-| `draft_action` | `create`、`update`、`resume`、`clear`、`none` |
-| `ship_update_draft` | 当前写入草稿，保存目标船、候选工具参数、缺失字段和证据来源 |
-| `reply_to_user` | 需要追问、取消或错误时的客服话术 |
+| `src/agents/agent.py` | 根据 `agent_profile=customer_ceshi` 选择 isolated Responses Builder；生产 `customer_support` 走原有路径 |
+| `src/agents/customer_ceshi_responses/builder.py` | 主实现：Responses/Chat 工具循环、上下文账本、多模态 payload、AIS 证据账本、更新校验、微信渲染和 trace |
+| `config/agent_llm_config.json` | `customer_ceshi_runtime` 模型、Responses 参数、上下文、检索预算和直接更新开关 |
+| `config/profiles/customer_ceshi_v2.md` | HiFleet 客服身份、微信纯文本、检索与更新行为约束 |
+| `config/agent_profiles.json` | `customer_ceshi` profile、技能和 prompt 文件绑定 |
+| `scripts/probe_customer_ceshi_responses.py` | 显式启用的真实端点能力探测；不打印密钥、媒体 URL、模型正文或推理 |
+| `tests/customer_ceshi_v2/test_responses_runtime.py` | Responses 工具续传、多媒体 payload、AIS 证据、微信渲染和模型隔离回归 |
 
-主链路只做硬边界：
+`customer_ceshi_runtime` 的常用字段：
 
-- JSON schema / enum 校验。
-- 写入工具白名单：`upload_ship_position`、`update_ship_static_info`。
-- 工具参数字段别名、空值清理和执行前格式化。
-- 真实工具调用、工具结果成功/失败判定、trace 记录。
-- LLM 子 agent 不可用或返回非法 JSON 时，才使用 deterministic fallback。
-
-### 3.1 参数解析与执行前格式化
-
-```mermaid
-flowchart LR
-    A["current_text / perception / active ship_update_draft"] --> B["ship_update 子 agent<br/>深度理解并输出 JSON"]
-    B --> C["schema + enum 校验"]
-    C --> D["工具字段白名单"]
-    D --> E["字段别名映射"]
-    E --> F["skills 参数格式化"]
-    F --> G{"status=ready_to_execute<br/>且工具允许?"}
-    G -->|是| H["真实写工具调用"]
-    G -->|否| I["追问 / non-write handoff / 错误收口"]
-```
-
-执行前格式化只处理工具参数形态，不重新判断业务意图：
-
-| 输入来源可能返回 | 最终工具参数 |
+| 配置 | 默认意图 |
 | --- | --- |
-| `draught` | `draft` |
-| `status` / `nav_status` | `navstatus` |
-| `name` | `ship_name` |
-| `imonumber` | `imo` |
-| `type` | `ship_type` |
-| `buildyear` | `built_year` |
-| `116°19.746′ E` | `116.3291` |
-| `29°49.007′ N` | `29.816783` |
-| `2026-07-08 15:37 (UTC+8)` | `2026-07-08 15:37:00` |
-| `2026-07-06 18:30 (UTC)` | `2026-07-06 18:30:00` |
-| `0 kn` | `0` |
-| `163°` | `163` |
-| `1.6 m` | `1.6` |
+| `mode` | `responses`；可临时设为 `chat_function_calling`、`legacy_v2` 或 `disabled` |
+| `fallback_mode` / `chat_fallback_enabled` | Responses 不可用时仅允许同一文本模型的 Chat Function Calling 降级 |
+| `responses.deepseek` | DeepSeek 模型、思考、采样、token 和原生工具参数 |
+| `responses.doubao` | Doubao 模型、图片 detail、视频 fps、思考、采样和 `tool_choice` |
+| `context` | 10 轮记忆、最近完整轮数、摘要长度和 session TTL |
+| `search` | 本地/网页检索次数及证据包大小 |
+| `direct_updates` | 直接更新开关、媒体证据 TTL 和最低置信度 |
 
-如果 LLM 子 agent 同时返回 `normalized_fields.lon_dec / lat_dec`，主链路会保留这些值进入 trace，并把最终 `tool_args.lon / lat` 归一成十进制度。这样可避免日志中“已识别 decimal，但实际工具仍收到原始 OCR 字符串”的问题。
+新配置优先于旧 `customer_ceshi_*` / `customer_ceshi_v2_*` 兼容字段；新开发只应写入 `customer_ceshi_runtime`。
 
-ETA 是可选字段。若 ETA 只识别到 `2026-` 等残缺值或无法归一成日期时间，应从 `tool_args` 中丢弃，不阻断船位核心字段更新。
+## 5. 可观测性、测试与排障
 
-完整船位工具参数示例：
+每次运行返回并脱敏记录：运行模式、实际模型、模型/工具/媒体调用数、工具耗时、上下文轮数与 token、输出/推理 token、Provider 状态、降级原因、guard 结果和响应 ID 尾部。不得记录 API key、完整签名 URL、原始工具日志、媒体内容或隐藏推理。
 
-```json
-{
-  "mmsi": "353738000",
-  "lon": "122",
-  "lat": "31",
-  "updatetime": "2025-03-31 09:52:13",
-  "speed": "7.1",
-  "heading": "135.0",
-  "course": "254.1",
-  "draft": "4.2",
-  "destination": "DA LIAN",
-  "eta": "2025-03-27 14:00:00",
-  "navstatus": "机动船在航",
-  "ship_name": "LEO I"
-}
-```
-
-对应 API body 由工具内部映射生成，其中 `draft -> draught`、`navstatus -> status`、`mmsi -> name + mmsi`。
-
-## 4. ship_update_draft
-
-`ship_update_draft` 取代旧业务型 pending，用于跨轮补字段。典型场景：
-
-- 首轮图片识别出经纬度、更新时间、状态，但缺 MMSI。
-- 次轮用户只补 9 位 MMSI。
-- 子 agent 从当前 draft 合并 MMSI，生成 `ready_to_execute` 工具计划。
-
-状态规则：
-
-- 无 draft 时，单独 MMSI 或“确认更新”不得写入。
-- draft 默认 5 轮过期。
-- 用户明确取消时清理 draft。
-- 工具明确成功后清理 draft，并将兼容 `pending_update_state.status` 标记为 `executed_success`。
-- `pending_update_state` 仍在响应和 trace 中保留一版，供旧调用方和旧测试兼容；内部主状态使用 `ship_update_draft`。
-
-字段来源只允许：
-
-- 当前轮用户文本。
-- 当前轮附件 perception。
-- 当前 `ship_update_draft`。
-
-不得从历史其他船舶成功回复、历史截图或历史 MMSI 中补写经纬度、ETA、吃水、状态或更新时间。
-
-## 5. 字段规则
-
-### 5.1 船位更新
-
-工具：`upload_ship_position`
-
-必填：
-
-- `mmsi`
-- `lon`
-- `lat`
-- `updatetime`
-
-可选：
-
-- `speed`
-- `heading`
-- `course`
-- `draft`
-- `navstatus`
-- `destination`
-- `eta`
-
-组合字段规则：
-
-- `船艏/航迹向: A / B` 必须解析为 `heading=A`、`course=B`。
-- 航速、船首向、航迹向、吃水可接受带单位或度数符号输入，例如 `0 kn`、`163°`、`1.6 m`，执行前必须转换成纯数值字符串。
-- 经纬度最终传给工具时优先为十进制度；工具层仍保留度分格式兜底转换能力。
-- ETA 最终按 `yyyy-MM-dd HH:mm:ss` 传给工具；带 `(UTC)` 的展示文本会被清理，残缺 ETA 作为可选字段丢弃。
-
-目的港/ETA 占位符清洗：
-
-- `--`
-- `-`
-- `—`
-- `N/A`
-- `未知`
-- `-- / --`
-- `/ETA`
-- `ETA`
-- `目的港/ETA`
-- `destination/eta`
-
-这些值表示未提供，不进入 draft 或 tool args，也不作为缺失字段追问。
-
-### 5.2 静态信息更新
-
-工具：`update_ship_static_info`
-
-必填：
-
-- `mmsi`
-- 至少一个静态字段，例如 `ship_name`、`imo`、`callsign`、`ship_type`、`length`、`width`、`dwt`、`built_year`、`destination`、`eta`、`draft`
-
-成功回复格式与船位更新保持一致，包含：
-
-- 成功标题。
-- MMSI。
-- HiFleet 微信验证链接。
-- 本次更新参数明细。
-- `数据同步：预计 5 分钟内生效`。
-
-静态信息没有 `updatetime` 字段，因此成功回复不伪造更新时间。
-
-船舶类型更新专项规则：
-
-- 用户要求更新船型/船舶类型时，必须同时传 `ship_type` 和 `minotype`。
-- `ship_type` 映射 API 字段 `type`，`minotype` 映射 API 字段 `minotype`。
-- 两者字段值必须一致，例如 `ship_type="散货船"`、`minotype="散货船"`。
-- 如果子 agent 只输出其中一个字段，执行前会自动补齐另一字段；如果二者同时存在但值不一致，工具层拒绝执行。
-
-完整静态信息工具参数示例：
-
-```json
-{
-  "mmsi": "100000278",
-  "ship_name": "CESHI",
-  "imo": "0",
-  "callsign": "0",
-  "ship_type": "散货船",
-  "minotype": "散货船",
-  "width": "12.3",
-  "length": "30.5",
-  "dwt": "12000",
-  "built_year": "2018",
-  "destination": "EE SLM",
-  "eta": "2021-05-22 00:00:00",
-  "draft": "1.0"
-}
-```
-
-对应 API body 由工具内部映射生成，其中 `ship_name -> name`、`imo -> imonumber`、`ship_type -> type`、`built_year -> buildyear`、`draft -> draught`。
-
-## 6. 非写入咨询
-
-以下场景不调用后台写入工具：
-
-- `为什么船位更新这么慢`
-- `目的港 ETA 为什么显示旧值`
-- `怎么在平台手动更新目的港 ETA`
-- `能不能发邮件到 reports@hifleet.com 更新 ETA`
-- `两艘船连续 1-2 天没有船位跟踪，AIS 正常，请后台看看`
-- 海图符号、平台按钮、颜色标识含义咨询
-
-如果 ship_update 子 agent 返回 `non_write`，lightweight graph 会把请求交回 standard agent 继续知识库/网页检索和排障回答，而不是把内部分类话术直接发给客户。
-
-## 7. Trace 重点字段
-
-排障时优先看：
-
-| 字段 | 用途 |
-| --- | --- |
-| `route_trace.reasoning_trace.perception_summary` | 当前轮附件 OCR、可见元素、问题摘要和检索关键词 |
-| `route_trace.reasoning_trace.understanding_result` | 需求理解 hint |
-| `route_trace.ship_update_subagent_gate` | 是否进入 ship_update 子 agent 及原因 |
-| `route_trace.reasoning_trace.ship_update_subagent` | 子 agent 原始结构化结果 |
-| `route_trace.reasoning_trace.ship_update_draft` | 当前写入草稿 |
-| `route_trace.reasoning_trace.write_args` | 最终候选工具参数 |
-| `route_trace.check_result.current_run_tool_success` | 本轮真实工具是否明确成功 |
-| `route_trace.readable_trace.agent_process_summary` | 可读排障摘要 |
-
-重点判断：
-
-- 当前轮没有真实工具调用时，`generated_tool_calls` 和 `tool_call_sequence` 不应继承历史工具。
-- 工具失败或结果不确定时，`allowed_success_claim` 必须为 false。
-- 有 active draft 时，补 MMSI/确认更新只能使用 draft 字段，不能从历史其他船舶回复取参数。
-
-## 8. 回归测试
-
-核心测试：
+常用验证：
 
 ```bash
-.venv/bin/python -m pytest tests/test_customer_ceshi_prompt_contract.py tests/test_customer_ceshi_pending_state.py tests/test_customer_support_router.py tests/test_customer_ceshi_write_robustness.py -q
-.venv/bin/python -m pytest tests/test_customer_support_intent_agent.py tests/test_customer_support_p0_optimization.py -q
-.venv/bin/python -m pytest tests/test_hifleet_ship_upload_position.py -q
+PYTHONPATH=src .venv/bin/pytest -q tests/customer_ceshi_v2/test_responses_runtime.py
+PYTHONPATH=src .venv/bin/pytest -q tests/customer_ceshi_v2/test_trace_redaction.py
+
+# 默认 SKIPPED；仅在测试凭据、测试会话和测试图片均明确准备后启用。
+PYTHONPATH=src CUSTOMER_CESHI_REAL_MODEL_TEST=1 \
+  CUSTOMER_CESHI_MULTIMODAL_PROBE_URL=https://example.test/probe.png \
+  .venv/bin/python scripts/probe_customer_ceshi_responses.py
 ```
 
-重点覆盖：
+排障优先级：先看 `runtime_mode`、`provider_error`、`fallback_reason` 与 `finish_reason`；再检查 `tool_calls`、证据 `can_answer` 和去重/预算；最后检查媒体 `media_response_text` 与 `media_candidate_status`。只有 Provider 明确失败、媒体无法读取或没有任何安全可见回答时，才应回复附件读取失败。
 
-- `/ETA`、`目的港/ETA: -- / --` 不进入写入参数。
-- 合法 `目的港/ETA:VNSGN/2026-07-03 09:00` 保留。
-- 船位工具参数按 skills 格式化：度分坐标转十进制度，时间补齐秒，带单位数值转纯数值。
-- 旧扁平 `pending_update_state` 可迁移为 `ship_update_draft`。
-- active draft + MMSI follow-up 使用当前 draft 字段写入。
-- `non_write` 交回 standard agent 排障，不直接返回内部分类话术。
-- 静态信息更新成功回复包含验证链接和参数明细。
+## 6. 官方接口参考
+
+- [Responses API 创建模型响应](https://docs.volcengine.com/docs/82379/1569618?lang=zh)
+- [图片理解](https://docs.volcengine.com/docs/82379/1362931?lang=zh)
+- [视频理解](https://docs.volcengine.com/docs/82379/1895586?lang=zh)
+- [音频理解](https://docs.volcengine.com/docs/82379/2377589?lang=zh)
+
+以实际 Provider 探测结果为准；不要假设 OpenAI-compatible SDK 的所有字段都与官方端点完全等价。

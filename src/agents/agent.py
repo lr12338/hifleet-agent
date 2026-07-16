@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
@@ -74,7 +74,7 @@ from agents.customer_support_router import (
     validate_links,
     classify_write_tool_result,
 )
-from agents.customer_support_guard import SENSITIVE_REFUSAL, sanitize_customer_output
+from agents.customer_support_guard import SENSITIVE_REFUSAL, UNIFIED_HIFLEET_CONTACT, sanitize_customer_output
 from agents.customer_support_scenarios import DestinationEtaScenario, destination_eta_safe_response
 from agents.customer_support_evidence_guard import apply_high_risk_evidence_guard
 from agents.customer_support_understanding import build_customer_understanding
@@ -113,9 +113,10 @@ CUSTOMER_SUPPORT_UNDERSTANDING_PROMPT = """你是 HiFleet 客服系统的需求�
 4. 生成 3 到 5 条适合检索的 query；简单问题至少给 1 条高质量 query
 5. 判断该问题是否应优先本地知识库
 6. 判断联网检索时是否应限制到 HiFleet 官方站点
-7. 如果信息不足，只指出一个最关键缺失项
+7. 判断回答证据模式：`search_synthesis`（默认）、`ask_one_identifier`、`browser_assisted` 或 `browser_required`
+8. 如果信息不足，只指出一个最关键缺失项
 
-对编号、代码、OCR 文本、简称等语义不完整的短输入：先结合上下文推断用户可能目标，不能仅凭外观断言编号类型。只要涉及“能否查询/是否支持/如何使用/编号含义”等能力确认，必须设置 evidence_required=true，将待确认能力改写为 rewritten_user_need，并生成用于知识库和网页核验的 search_query_candidates。知识库未命中不等于不支持；证据不足时才通过 missing_slot 追问一个关键问题。
+对编号、代码、OCR 文本、简称等语义不完整的短输入：先结合上下文推断用户可能目标，不能仅凭外观断言编号类型。普通知识、排障和船位可见性问题默认使用 `search_synthesis`，由知识库和 Web 多次检索后综合回答；浏览器不是默认门槛。只有用户明确要求核验某个页面、或必须确认精确入口/提交生效条件/价格权限/法规公告原文时，才使用 `browser_required`。知识库未命中不等于不支持；证据不足时才通过 missing_slot 追问一个关键问题。
 
 可选 intent:
 - conversation: 总结上文、回看上一条问题、询问上一个船舶
@@ -143,7 +144,7 @@ query_type 只允许：
 - 默认这是 HiFleet 客服场景；但明显闲聊、泛化电脑/网络问题不要硬套 HiFleet。
 - 如果有附件，必须优先结合附件和 perception 理解用户真实诉求。
 - 如果有附件识别结果 perception，应优先结合 perception 判断真实诉求；截图中的海图符号、平台图标、颜色标识含义问题按多模态知识/排障处理，并生成适合知识库或网页检索的关键词；截图有 Error/失败/加载异常时优先 troubleshooting；文件/表格类附件优先 file_task。
-- 不要因为出现“船位/更新”就默认 ship_update；像“船位更新很慢”“为什么更新这么慢”属于 knowledge。
+- 不要因为出现“船位/更新”就默认 ship_update；像“船位更新很慢”“为什么更新这么慢”“怎么查不到船位了”属于船位可见性/数据链路排障，优先 `search_synthesis`。没有当前轮船名、MMSI 或 IMO 时可先给通用原因和检查步骤，只有需要进一步定位时才用 `ask_one_identifier` 追问船名或 MMSI。
 - 对“上面/这艘船/上一条/总结”等强依赖上下文的问题，优先结合上下文理解，不要忽略会话历史。
 - 如果当前问题是船舶追问，但本轮没写船名/MMSI/IMO，只要上下文里已有明确船舶，可以标记 use_context_ship=true。
 - 明确要求修改/上传/更新船舶数据时才标记 ship_update；只是在问平台显示或更新慢时不要标记 ship_update。
@@ -206,7 +207,7 @@ Few-shot:
 - 不要补充任何 JSON 之外的文本
 
 JSON 格式:
-{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","user_goal":"用户想完成的动作","evidence_required":true,"use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true,"operation_type":"none|ship_query|position_update|static_update|mixed_update|ambiguous_update|frontend_capability_question|data_delay_troubleshooting","ship_update_candidate":false,"ship_write_request":false,"pending_action":"resume|hold|cancel|pause|none","non_write_reason":"none|frontend_capability_question|data_delay_troubleshooting","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{},"ship_update_confidence":"high|medium|low"}
+{"intent":"knowledge","confidence":"high|medium|low","reason_summary":"一句话","user_goal":"用户想完成的动作","answer_mode":"search_synthesis|ask_one_identifier|browser_assisted|browser_required","evidence_required":true,"use_context_ship":false,"missing_slot":{"field":"","question":""},"rewritten_user_need":"用户真正想确认的需求描述","query_type":"hifleet_product","business_scenario":"string","search_keywords":["hifleet","筛选船队","记忆功能"],"search_query_candidates":["hifleet 筛选船队 记忆功能"],"needs_multimodal_grounding":false,"should_prefer_local_kb":true,"should_limit_to_hifleet_sites":true,"operation_type":"none|ship_query|position_update|static_update|mixed_update|ambiguous_update|frontend_capability_question|data_delay_troubleshooting","ship_update_candidate":false,"ship_write_request":false,"pending_action":"resume|hold|cancel|pause|none","non_write_reason":"none|frontend_capability_question|data_delay_troubleshooting","ship_identity":{"mmsi":"","imo":"","ship_name":""},"ship_update_fields":{},"ship_update_confidence":"high|medium|low"}
 """
 
 
@@ -322,6 +323,35 @@ CUSTOMER_SUPPORT_REPAIR_PROMPT = """你是 HiFleet 官方客服的回复修正�
 - 保持简洁、客服化。
 """
 
+CUSTOMER_SUPPORT_FINAL_RESPONSE_PROMPT = """你是 HiFleet 官方客服的最终回复 Agent。只返回 JSON，不要解释你的工作过程。
+
+你只能依据 answer_packet 中的 current_question、customer_issue_summary、confirmed_scope、direct_answer_candidates、selected_evidence、supplementary_evidence、conflicts、unavailable_facts 和 human_support 生成可直接发送给客户的中文回复。不要使用任何未提供的信息，也不要把检索工具状态或历史对话当作事实。
+
+回复要求：
+- 先直接、自然地回答 current_question。简单问题通常 1 到 3 句；确有必要时再分点说明。
+- 事实性内容只能由 selected_evidence 支撑。supplementary_evidence 只能补充，不能替代直接结论。
+- conflicts 非空时，明确说明不同资料存在差异，并分别说明已检索到的内容；不要自行裁定。
+- 不得单独输出“暂时无法回答”“无法提供解答”“无法确认截图信息”等空泛拒答。
+- 证据不足时，先用 customer_issue_summary 概括用户实际咨询内容，再说明当前无法确认的具体规则、范围或权益；不要泛称“这张截图”或“相关信息”。
+- 只要补充一个信息即可继续处理时，resolution_mode=ask_one_question：礼貌说明需要的一个关键页面、版本、入口或清晰截图，并承诺收到后继续协助；不要强行转人工。
+- 涉及多个产品权益、套餐范围、权限、时间范围，或当前资料无法准确核验的业务规则时，resolution_mode=human_handoff：先致歉、概括问题、说明暂不能准确答复，再邀请用户留下联系方式，或直接使用 human_support 中的人工客服联系方式。人工承接时必须包含客服电话和微信客服。
+- 其他能够由 selected_evidence 回答的问题使用 resolution_mode=answer，不要无故追加人工客服联系方式。
+- reference_urls 只能从 selected_evidence 中已有的 URL 选择，最多 3 条；没有直接相关 URL 时返回空数组，不要编造来源或链接。
+- 不要输出“检索分析、综合判断、H1、命中、证据、置信度、工具、浏览器、知识库、trace、模型”等内部过程词。
+- 不要照抄网页导航、搜索摘要、HTML 噪声、历史回答、旧船舶信息、推广文案或与问题无关的联系方式。
+
+JSON schema：
+{
+  "answer": "可直接发送给客户的回复",
+  "used_evidence_ids": ["E1"],
+  "reference_urls": ["https://example.com"],
+  "needs_followup": false,
+  "followup_question": "",
+  "resolution_mode": "answer|ask_one_question|human_handoff",
+  "handoff_reason": ""
+}
+"""
+
 
 def _json_object_from_text(text: str) -> dict[str, Any]:
     raw = (text or "").strip()
@@ -400,6 +430,7 @@ UNDERSTANDING_OPERATION_TYPES = {
 
 UNDERSTANDING_PENDING_ACTIONS = {"resume", "hold", "cancel", "pause", "none"}
 SHIP_UPDATE_OPERATION_HINTS = {"position_update", "static_update", "mixed_update", "ambiguous_update"}
+ANSWER_MODES = {"search_synthesis", "ask_one_identifier", "browser_assisted", "browser_required"}
 
 
 def _dedupe_short_strings(values: list[Any], limit: int) -> list[str]:
@@ -451,6 +482,7 @@ def _infer_understanding_defaults(intent: str, route: str, text: str) -> dict[st
         "needs_multimodal_grounding": intent in {"chart_symbol", "multimodal_understanding"},
         "should_prefer_local_kb": prefer_local_kb,
         "should_limit_to_hifleet_sites": limit_hifleet_sites,
+        "answer_mode": "browser_required" if query_type == "browser_verify" else "search_synthesis" if route == "knowledge" else "",
     }
 
 
@@ -476,6 +508,9 @@ def _normalize_customer_support_understanding_result(raw: dict[str, Any], *, tex
         limit_hifleet_sites = False
     elif query_type not in {"hifleet_product", "hifleet_troubleshooting"}:
         limit_hifleet_sites = False
+    answer_mode = str(raw.get("answer_mode") or defaults.get("answer_mode") or "").strip().lower()
+    if answer_mode not in ANSWER_MODES:
+        answer_mode = "browser_required" if query_type == "browser_verify" else "search_synthesis" if route == "knowledge" else ""
 
     return {
         "rewritten_user_need": rewritten_user_need,
@@ -485,6 +520,7 @@ def _normalize_customer_support_understanding_result(raw: dict[str, Any], *, tex
         "needs_multimodal_grounding": bool(raw.get("needs_multimodal_grounding", defaults["needs_multimodal_grounding"])),
         "should_prefer_local_kb": prefer_local_kb,
         "should_limit_to_hifleet_sites": limit_hifleet_sites,
+        "answer_mode": answer_mode,
     }
 
 
@@ -524,6 +560,7 @@ def _normalize_ship_update_understanding_result(raw: dict[str, Any], *, fallback
         "intent": intent or str(fallback.get("intent") or "knowledge"),
         "user_goal": str(data.get("user_goal") or fallback.get("user_goal") or "").strip(),
         "evidence_required": bool(data.get("evidence_required", fallback.get("evidence_required", False))),
+        "answer_mode": str(data.get("answer_mode") or knowledge_result.get("answer_mode") or fallback.get("answer_mode") or "search_synthesis"),
         "missing_slot": {
             "field": str(missing_slot.get("field") or "").strip(),
             "question": str(missing_slot.get("question") or "").strip(),
@@ -584,7 +621,12 @@ def _run_lightweight_customer_understanding(
     # understanding response erase that routing information.
     fallback_scenario = str(fallback.get("multimodal_scenario") or "")
     fallback_business_scenario = str(fallback.get("business_scenario") or "")
-    if fallback_scenario in {"audio_request", "video_request", "file_or_document_task"}:
+    if fallback_scenario in {
+        "audio_request",
+        "video_request",
+        "file_or_document_task",
+        "chart_symbol_explanation",
+    }:
         normalized["multimodal_scenario"] = fallback_scenario
         normalized["business_scenario"] = fallback_business_scenario or None
     if fallback_business_scenario == "ship_update_from_media" and bool(fallback.get("ship_write_request")):
@@ -1094,6 +1136,228 @@ def _repair_customer_support_answer(
         if not any(marker in lowered for marker in ("ai摘要", "[query", "smart_search", "回答指导", "内部分析")):
             return cleaned
     return _build_customer_support_followup_question(route, missing_slot, review_result)
+
+
+def _response_question_terms(question: str) -> set[str]:
+    normalized = re.sub(r"\s+", "", str(question or "").lower())
+    terms: set[str] = set(re.findall(r"[a-z0-9]{2,}", normalized))
+    for block in re.findall(r"[\u4e00-\u9fff]{2,}", normalized):
+        terms.add(block)
+        terms.update(block[index : index + 2] for index in range(len(block) - 1))
+    return {term for term in terms if term}
+
+
+def _response_evidence_relevance(question: str, item: dict[str, Any]) -> float:
+    terms = _response_question_terms(question)
+    content = " ".join(
+        str(item.get(key) or "")
+        for key in ("title", "snippet", "claim", "query", "source_name")
+    ).lower()
+    if not content:
+        return 0.0
+    matched = sum(1 for term in terms if term in content)
+    title = str(item.get("title") or "").lower()
+    snippet = str(item.get("snippet") or "").lower()
+    direct_matches = sum(1 for term in terms if term in title or term in snippet)
+    declared = min(max(float(item.get("relevance") or 0.0), 0.0), 1.0)
+    authority = min(max(float(item.get("authority") or 0.0), 0.0), 1.0)
+    return direct_matches * 3.0 + matched * 0.5 + declared * 0.2 + authority * 0.05
+
+
+def _customer_issue_summary(
+    question: str,
+    perception: dict[str, Any] | None = None,
+    understanding_result: dict[str, Any] | None = None,
+) -> str:
+    perception = dict(perception or {})
+    understanding = dict(understanding_result or {})
+    candidates = (
+        understanding.get("user_goal"),
+        understanding.get("rewritten_user_need"),
+        perception.get("visual_question_summary"),
+        perception.get("recognized_text"),
+        perception.get("visible_text"),
+        question,
+    )
+    for candidate in candidates:
+        summary = normalize_message_text(str(candidate or ""))
+        if summary:
+            return summary[:420]
+    return "当前咨询的问题"
+
+
+def _build_customer_support_answer_packet(
+    *,
+    question: str,
+    evidence_items: list[dict[str, Any]],
+    evidence_summary: dict[str, Any],
+    perception: dict[str, Any] | None = None,
+    understanding_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for item in evidence_items or []:
+        if not isinstance(item, dict):
+            continue
+        snippet = normalize_message_text(str(item.get("snippet") or ""))
+        if not snippet:
+            continue
+        ranked.append((_response_evidence_relevance(question, item), dict(item)))
+    ranked.sort(key=lambda value: value[0], reverse=True)
+
+    def serialize(index: int, score: float, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": f"E{index}",
+            "title": str(item.get("title") or item.get("source_name") or "相关资料").strip()[:180],
+            "summary": normalize_message_text(str(item.get("snippet") or ""))[:700],
+            "url": str(item.get("url") or "").strip(),
+            "source_type": str(item.get("source_type") or "").strip(),
+            "claim_ids": [str(value) for value in list(item.get("supports") or []) if str(value).strip()][:4],
+            "relevance_score": round(score, 3),
+        }
+
+    serialized = [serialize(index, score, item) for index, (score, item) in enumerate(ranked, start=1)]
+    selected = serialized[:4]
+    supplementary = serialized[4:7]
+    candidates = [
+        {
+            "evidence_id": item["id"],
+            "summary": item["summary"],
+            "claim_ids": item["claim_ids"],
+        }
+        for item in selected
+    ]
+    conflicts = []
+    for item in evidence_items or []:
+        for conflict in list(item.get("conflicts") or []):
+            value = normalize_message_text(str(conflict or ""))
+            if value and value not in conflicts:
+                conflicts.append(value)
+    understanding = dict(understanding_result or {})
+    missing_slot = dict(understanding.get("missing_slot") or {})
+    unavailable = [
+        value
+        for value in (
+            normalize_message_text(str(evidence_summary.get("missing_key_fact") or "")),
+            normalize_message_text(str(evidence_summary.get("fallback_reason") or "")),
+            normalize_message_text(str(missing_slot.get("field") or "")),
+        )
+        if value
+    ]
+    return {
+        "current_question": question,
+        "customer_issue_summary": _customer_issue_summary(question, perception, understanding),
+        "confirmed_scope": [
+            {"evidence_id": item["id"], "title": item["title"], "summary": item["summary"]}
+            for item in selected
+        ],
+        "direct_answer_candidates": candidates,
+        "selected_evidence": selected,
+        "supplementary_evidence": supplementary,
+        "conflicts": conflicts[:4],
+        "unavailable_facts": unavailable[:2],
+        "human_support": {"phone": UNIFIED_HIFLEET_CONTACT, "wechat": "hifleetkhzs"},
+    }
+
+
+def _fallback_customer_support_answer_from_packet(packet: dict[str, Any]) -> str:
+    issue = normalize_message_text(str(packet.get("customer_issue_summary") or packet.get("current_question") or "当前问题"))[:240]
+    support = dict(packet.get("human_support") or {})
+    phone = str(support.get("phone") or UNIFIED_HIFLEET_CONTACT)
+    wechat = str(support.get("wechat") or "hifleetkhzs")
+    return (
+        f"不好意思，关于您咨询的“{issue}”，目前我还无法给您准确的答复。\n\n"
+        f"您可以留下方便联系的方式，或直接联系人工客服核实：客服电话 {phone}，微信客服 {wechat}。"
+        "人工客服会结合您的账号、套餐或页面情况进一步协助您。"
+    )
+
+
+def _generate_customer_support_final_answer(
+    *,
+    ctx,
+    cfg: dict[str, Any],
+    question: str,
+    evidence_items: list[dict[str, Any]],
+    evidence_summary: dict[str, Any],
+    perception: dict[str, Any] | None = None,
+    understanding_result: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    packet = _build_customer_support_answer_packet(
+        question=question,
+        evidence_items=evidence_items,
+        evidence_summary=evidence_summary,
+        perception=perception,
+        understanding_result=understanding_result,
+    )
+    allowed_ids = {str(item.get("id") or "") for item in packet["selected_evidence"]}
+    allowed_urls = {str(item.get("url") or "") for item in packet["selected_evidence"] if str(item.get("url") or "")}
+    urls_by_evidence_id = {
+        str(item.get("id") or ""): str(item.get("url") or "")
+        for item in packet["selected_evidence"]
+        if str(item.get("url") or "")
+    }
+
+    def invoke(retry_instruction: str = "") -> dict[str, Any]:
+        payload = {"answer_packet": packet}
+        if retry_instruction:
+            payload["retry_instruction"] = retry_instruction
+        return _invoke_customer_support_json_agent(ctx, cfg, CUSTOMER_SUPPORT_FINAL_RESPONSE_PROMPT, payload)
+
+    raw = invoke()
+    for attempt in range(2):
+        answer = str(raw.get("answer") or "").strip()
+        used_ids = [str(value) for value in list(raw.get("used_evidence_ids") or []) if str(value).strip()]
+        reference_urls = [str(value) for value in list(raw.get("reference_urls") or []) if str(value).strip()]
+        needs_followup = bool(raw.get("needs_followup"))
+        resolution_mode = str(raw.get("resolution_mode") or ("ask_one_question" if needs_followup else "answer")).strip()
+        handoff_reason = normalize_message_text(str(raw.get("handoff_reason") or ""))[:240]
+        answer_urls = set(re.findall(r"https?://[^\s)）\]】>\"']+", answer))
+        referenced_evidence_urls = {urls_by_evidence_id.get(evidence_id, "") for evidence_id in used_ids}
+        contact_values = dict(packet.get("human_support") or {})
+        has_unknown_phone = any(
+            number != str(contact_values.get("phone") or "")
+            for number in re.findall(r"(?<!\d)\d{3,4}-\d{3,4}-\d{3,4}(?!\d)", answer)
+        )
+        has_handoff_contact = (
+            str(contact_values.get("phone") or "") in answer
+            and str(contact_values.get("wechat") or "") in answer
+        )
+        valid = (
+            bool(answer)
+            and resolution_mode in {"answer", "ask_one_question", "human_handoff"}
+            and set(used_ids).issubset(allowed_ids)
+            and set(reference_urls).issubset(allowed_urls)
+            and set(reference_urls).issubset(referenced_evidence_urls)
+            and answer_urls.issubset(allowed_urls)
+            and not has_unknown_phone
+            and (not allowed_ids or needs_followup or bool(used_ids))
+            and (bool(allowed_ids) or needs_followup)
+            and (resolution_mode != "human_handoff" or has_handoff_contact)
+        )
+        if valid:
+            if reference_urls:
+                links = "\n".join(f"- {url}" for url in dict.fromkeys(reference_urls))
+                if "参考链接" not in answer:
+                    answer = f"{answer.rstrip()}\n\n参考链接：\n{links}"
+            return sanitize_customer_output(answer), {
+                "status": "generated",
+                "attempt": attempt + 1,
+                "selected_evidence_count": len(packet["selected_evidence"]),
+                "used_evidence_ids": used_ids,
+                "reference_urls": reference_urls,
+                "resolution_mode": resolution_mode,
+                "handoff_reason": handoff_reason,
+            }
+        raw = invoke("上一次输出不符合 JSON 契约或引用范围。请只使用 selected_evidence 中的 ID 和 URL，重新生成。")
+
+    return sanitize_customer_output(_fallback_customer_support_answer_from_packet(packet)), {
+        "status": "fallback",
+        "attempt": 2,
+        "selected_evidence_count": len(packet["selected_evidence"]),
+        "used_evidence_ids": [],
+        "reference_urls": [],
+        "resolution_mode": "human_handoff",
+        "handoff_reason": "final_response_contract_unavailable",
+    }
 
 
 def _redact_trace_text(value: Any, limit: int = 180) -> str:
@@ -2212,6 +2476,31 @@ class LightweightCustomerSupportState(TypedDict, total=False):
     _pending_before: dict[str, Any]
     delegate_input_message_count: int
     delegate_answer: str
+    working_messages: list[AnyMessage]
+
+
+def _text_working_messages(messages: list[AnyMessage] | list[Any] | None) -> tuple[list[Any], dict[str, int]]:
+    """Keep one system prompt, five complete dialogue rounds, and the current user turn."""
+    original = list(messages or [])
+    latest_index = next((index for index in range(len(original) - 1, -1, -1) if isinstance(original[index], HumanMessage)), -1)
+    if latest_index < 0:
+        return original, {"input_message_count": len(original), "retained_context_count": len(original), "excluded_tool_message_count": 0}
+    latest_system = next((message for message in reversed(original[: latest_index + 1]) if isinstance(message, SystemMessage)), None)
+    dialogue = [message for message in original[:latest_index] if isinstance(message, (HumanMessage, AIMessage))]
+    rounds: list[list[Any]] = []
+    pending: list[Any] = []
+    for message in dialogue:
+        if isinstance(message, HumanMessage):
+            pending = [message]
+        elif isinstance(message, AIMessage) and pending:
+            rounds.append([*pending, message])
+            pending = []
+    selected = ([latest_system] if latest_system is not None else []) + [message for pair in rounds[-5:] for message in pair] + [original[latest_index]]
+    return selected, {
+        "input_message_count": len(original),
+        "retained_context_count": len(selected) - (1 if latest_system is not None else 0),
+        "excluded_tool_message_count": sum(1 for message in original if isinstance(message, ToolMessage)),
+    }
 
 
 def _resolve_intent_hint(ctx=None, explicit_intent: str = "") -> str:
@@ -3498,10 +3787,14 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         messages = list(original_messages)
         text = _latest_user_text(messages)
         has_multimodal_input = _has_current_multimodal_media(messages)
+        context_filter = {"input_message_count": len(original_messages), "retained_context_count": len(original_messages), "excluded_tool_message_count": 0}
         if has_multimodal_input:
             # Retain the current attachment and only the two most recent preceding
             # messages so stale conversation context cannot override visual evidence.
             messages = messages[-3:]
+            text = _latest_user_text(messages)
+        else:
+            messages, context_filter = _text_working_messages(original_messages)
             text = _latest_user_text(messages)
         route_trace = {
             "run_id": str(getattr(ctx, "run_id", "") or ""),
@@ -3523,6 +3816,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "deprecated_customer_router_bypassed": True,
                 "v1_output_modalities": ["text", "link"],
                 "understanding_result": {},
+                "context_filter": context_filter,
             },
         }
         if is_sensitive_internal_request(text):
@@ -3562,7 +3856,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "needs_knowledge_lookup": bool(perception.get("needs_knowledge_lookup")),
             "confidence": str(perception.get("confidence") or ""),
             "current_media_preserved": bool(has_multimodal_input),
-            "input_message_count": len(original_messages),
+                "input_message_count": len(original_messages),
             "retained_context_count": max(0, len(messages) - 1),
             "dropped_irrelevant_context_count": max(0, len(original_messages) - len(messages)),
         }
@@ -3668,7 +3962,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                     "phase_history": ["preprocess", "ship_update_subagent", "delegate"],
                     "status": "running",
                     "task_goal": text,
-                    "messages": messages,
+                    "messages": original_messages,
+                    "working_messages": messages,
                     "perception_result": perception,
                     "generated_answer": "",
                     "delegate_answer": "",
@@ -3728,7 +4023,10 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         understanding_intent = str(understanding.get("intent") or "").strip().lower()
         multimodal_scenario = str(understanding.get("multimodal_scenario") or "")
         business_scenario = str(understanding.get("business_scenario") or multimodal_scenario)
+        if has_multimodal_input and not business_scenario and bool(perception.get("needs_knowledge_lookup")) and str(perception.get("suspected_symbol") or ""):
+            business_scenario = "chart_symbol_explanation"
         needs_evidence = bool(understanding.get("evidence_required"))
+        answer_mode = str(understanding.get("answer_mode") or "").strip().lower()
         query_candidates = list(understanding.get("search_query_candidates") or [])
         if "reports@hifleet.com" in text.lower() and str(understanding.get("non_write_reason") or "") == "frontend_capability_question":
             answer = destination_eta_safe_response(DestinationEtaScenario.EMAIL_UPDATE_QUESTION)
@@ -3767,7 +4065,11 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "ship_query_from_media": ("ship_single", "ship_single_query", SHIP_QUERY_BUNDLE),
                 "file_or_document_task": ("file_task", "file_task", FILE_BUNDLE),
             }.get(business_scenario)
-        should_run_knowledge = understanding_intent in {"knowledge", "troubleshooting"} and needs_evidence and bool(query_candidates)
+        should_run_knowledge = (
+            understanding_intent in {"knowledge", "troubleshooting"}
+            and bool(query_candidates)
+            and (needs_evidence or answer_mode in {"search_synthesis", "browser_assisted", "browser_required"})
+        )
         if scenario_chain or should_run_knowledge:
             planned_route, planned_task_type, planned_bundle = scenario_chain or ("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE)
             route_trace["route"] = planned_route
@@ -3779,6 +4081,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "multimodal_scenario": multimodal_scenario,
                 "business_scenario": business_scenario,
                 "evidence_required": bool(needs_evidence),
+                "answer_mode": answer_mode,
                 "missing_slot": dict(understanding.get("missing_slot") or {}),
             }
             return {
@@ -3786,7 +4089,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                 "phase_history": ["preprocess", "knowledge"],
                 "status": "running",
                 "task_goal": text,
-                "messages": messages,
+                "messages": original_messages,
+                "working_messages": messages,
                 "perception_result": perception,
                 "generated_answer": "",
                 "delegate_answer": "",
@@ -3806,7 +4110,8 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             "phase_history": ["preprocess"],
             "status": "running",
             "task_goal": text,
-            "messages": messages,
+            "messages": original_messages,
+            "working_messages": messages,
             "perception_result": perception,
             "generated_answer": "",
             "delegate_answer": "",
@@ -3854,6 +4159,17 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             session_id=str(state.get("session_id", "")),
             run_id=str(getattr(ctx, "run_id", "") or ""),
         )
+        final_response_trace: dict[str, Any] = {"status": "not_applied", "reason": "specialized_route"}
+        if planned_route == "knowledge":
+            answer, final_response_trace = _generate_customer_support_final_answer(
+                ctx=ctx,
+                cfg=cfg,
+                question=question,
+                evidence_items=evidence_items,
+                evidence_summary=evidence_summary,
+                perception=dict(state.get("perception_result", {}) or {}),
+                understanding_result=understanding,
+            )
         trace = {
             **route_trace,
             **trace,
@@ -3870,6 +4186,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
         }
         trace["evidence_summary"] = dict(evidence_summary or {})
         trace["evidence_items"] = list(evidence_items or [])
+        trace["final_response"] = final_response_trace
         return {
             "phase": "knowledge",
             "status": "success",
@@ -4105,6 +4422,10 @@ def build_agent(ctx=None, intent: str = ""):
         from agents.customer_ceshi_responses import runtime_config
 
         ceshi_runtime = runtime_config(cfg)
+        if ceshi_runtime["mode"] == "disabled":
+            raise RuntimeError("customer_ceshi runtime is disabled by configuration")
+        if ceshi_runtime["mode"] == "legacy_v2" and not ceshi_runtime["legacy_v2_enabled"]:
+            raise RuntimeError("customer_ceshi legacy_v2 runtime is disabled by configuration")
         if ceshi_runtime["mode"] in {"responses", "chat_function_calling"}:
             from agents.customer_ceshi_responses import build_customer_ceshi_responses_agent
 

@@ -1274,6 +1274,7 @@ def _understanding_summary_for_trace(understanding_result: dict[str, Any] | None
         "search_keywords": list(result.get("search_keywords", []) or []),
         "understanding_primary_query": str(candidates[0] if candidates else ""),
         "evidence_required": bool(result.get("evidence_required")),
+        "answer_mode": str(result.get("answer_mode") or ""),
         "should_prefer_local_kb": bool(result.get("should_prefer_local_kb")),
         "should_limit_to_hifleet_sites": bool(result.get("should_limit_to_hifleet_sites")),
     }
@@ -1480,6 +1481,40 @@ def _try_direct_hifleet_knowledge_answer(question: str) -> str:
         )
 
     return ""
+
+
+def _format_search_synthesis_answer(question: str, search_output: str, evidence_items: list[dict[str, Any]]) -> str:
+    """Summarize multi-query KB/Web evidence without inventing unsupported claims."""
+    summary, _ = _extract_search_answer(search_output)
+    usable = [
+        item
+        for item in evidence_items
+        if str(item.get("url") or "").startswith(("http://", "https://")) and str(item.get("snippet") or "").strip()
+    ]
+    if not usable:
+        return _format_general_knowledge_answer(question, search_output, evidence_items=evidence_items)
+    lead = summary or str(usable[0].get("snippet") or "").strip()
+    parts = [f"综合判断：{lead}", "\n检索分析："]
+    seen_claims: set[str] = set()
+    for item in usable:
+        claim = str((item.get("supports") or ["当前问题"])[0] or "当前问题")
+        url = str(item.get("url") or "").strip()
+        if claim in seen_claims:
+            continue
+        seen_claims.add(claim)
+        title = str(item.get("title") or item.get("source_name") or "相关资料").strip()
+        parts.append(f"- {claim}：{str(item.get('snippet') or '').strip()[:220]}")
+        parts.append(f"  验证链接（{title}）：{url}")
+    parts.append("\n参考资料：")
+    seen_urls: set[str] = set()
+    for item in usable:
+        url = str(item.get("url") or "").strip()
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        title = str(item.get("title") or item.get("source_name") or "相关资料").strip()
+        parts.append(f"- {title}：{url}")
+    return format_customer_answer("\n".join(parts))
 
 
 def _format_general_knowledge_answer(question: str, search_output: str, *, evidence_items: list[dict[str, Any]] | None = None) -> str:
@@ -2159,7 +2194,10 @@ def _invoke_three_layer_knowledge_chain(
     outputs: list[str] = []
     evidence_items: list[dict[str, Any]] = []
     retrieval_trace = _new_knowledge_retrieval_trace(understanding_summary, query)
-    require_full_evidence = bool(understanding_summary.get("evidence_required"))
+    answer_mode = str(understanding_summary.get("answer_mode") or "legacy")
+    legacy_mode = answer_mode == "legacy"
+    search_synthesis = answer_mode == "search_synthesis"
+    require_full_evidence = answer_mode == "browser_required" or (legacy_mode and bool(understanding_summary.get("evidence_required")))
     site_hint = "hifleet.com" if understanding_summary.get("should_limit_to_hifleet_sites") or _looks_like_hifleet_product_query(question) else ""
 
     local_payload: dict[str, Any] = {}
@@ -2183,7 +2221,7 @@ def _invoke_three_layer_knowledge_chain(
         retrieval_trace["t0_kb_hit"] = bool((local_payload.get("items") or []))
         retrieval_trace["t0_can_answer"] = bool(local_payload.get("can_answer"))
         retrieval_trace["t0_result_count"] = len(list(local_payload.get("items") or []))
-        if local_payload.get("can_answer") and not require_full_evidence:
+        if local_payload.get("can_answer") and not require_full_evidence and not search_synthesis:
             retrieval_trace["t1_eval_decision"] = "short_circuit"
             retrieval_trace["t1_eval_reason"] = "local_kb_search can_answer=true"
             return outputs, evidence_items, retrieval_trace
@@ -2240,13 +2278,13 @@ def _invoke_three_layer_knowledge_chain(
                 "t2_target_urls": list(web_payload.get("best_urls") or []),
             }
         )
-        if web_payload.get("can_answer") and not require_full_evidence:
+        if web_payload.get("can_answer") and not require_full_evidence and not search_synthesis:
             retrieval_trace["t1_eval_decision"] = "short_circuit"
             retrieval_trace["t1_eval_reason"] = "web_search can_answer=true"
             return outputs, evidence_items, retrieval_trace
 
     should_browser = (
-        (str(web_payload.get("continue_with") or "") == "agent_browser" or require_full_evidence)
+        (require_full_evidence or (answer_mode in {"legacy", "browser_assisted"} and str(web_payload.get("continue_with") or "") == "agent_browser"))
         and "web_search_agent_browser" in tool_map
         and (bool(web_payload) or require_full_evidence)
     )
@@ -2569,6 +2607,8 @@ def execute_planned_knowledge_chain(
     primary_query = _understanding_primary_query(understanding_result, question)
     default_depth = decision.search_depth or ("normal" if understanding_summary.get("query_type") in {"authoritative_public_data", "shipping_general_knowledge", "hifleet_troubleshooting"} else "quick")
     queries = _merge_knowledge_search_plan(question, decision, search_plan, understanding_result, default_depth)
+    answer_mode = str(understanding_summary.get("answer_mode") or "legacy")
+    search_synthesis = answer_mode == "search_synthesis"
     if "local_kb_search" not in tool_map and "web_search" not in tool_map and "smart_search" in tool_map:
         queries = queries[:1]
     outputs: list[str] = []
@@ -2594,10 +2634,10 @@ def execute_planned_knowledge_chain(
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
         retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
-        if (chain_trace.get("t2_can_answer") and int(chain_trace.get("t2_relevant_page_count") or 0) > 0) or (
+        if not search_synthesis and ((chain_trace.get("t2_can_answer") and int(chain_trace.get("t2_relevant_page_count") or 0) > 0) or (
             not understanding_summary.get("evidence_required")
             and (chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"))
-        ):
+        )):
             chain_trace["query_plan"] = [item.get("query", "") for item in queries]
             chain_trace["query_traces"] = list(retrieval_trace.get("query_traces") or [])
             retrieval_trace = chain_trace
@@ -2627,6 +2667,8 @@ def execute_planned_knowledge_chain(
         "evidence_count": len(evidence_items),
         "official_support_count": evidence_summary["official_support_count"],
         "multi_query_synthesis": len(queries) > 1,
+        "completed_query_count": len(retrieval_trace.get("query_traces") or []),
+        "answer_mode": answer_mode,
         "evidence_summary": evidence_summary,
     }
     trace.answer_confidence = evidence_summary["confidence"]
@@ -2662,7 +2704,7 @@ def execute_planned_knowledge_chain(
             evidence_summary,
         )
     if (
-        understanding_summary.get("evidence_required")
+        answer_mode == "browser_required"
         and retrieval_trace.get("t2_attempted")
         and not retrieval_trace.get("t2_can_answer")
     ):
@@ -2672,7 +2714,11 @@ def execute_planned_knowledge_chain(
         return _format_route_upload_troubleshooting(output), evidence_items, evidence_summary
     if decision.task_type == "platform_troubleshooting":
         return _format_platform_troubleshooting_answer(question, output), evidence_items, evidence_summary
-    answer = _format_general_knowledge_answer(question, output, evidence_items=evidence_items)
+    answer = (
+        _format_search_synthesis_answer(question, output, evidence_items)
+        if answer_mode == "search_synthesis"
+        else _format_general_knowledge_answer(question, output, evidence_items=evidence_items)
+    )
     return _ensure_step_answer_completeness(question, answer, evidence_items), evidence_items, evidence_summary
 
 def _format_platform_troubleshooting_answer(question: str, search_output: str) -> str:

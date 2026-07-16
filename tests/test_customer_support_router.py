@@ -2274,7 +2274,7 @@ def test_planned_chain_browser_failure_continues_next_query():
     entities = extract_entities(question)
     decision = classify_message(question, entities)
     trace = make_trace(decision, entities)
-    trace.reasoning_trace["understanding_result"] = {"evidence_required": True, "query_type": "hifleet_product", "should_limit_to_hifleet_sites": True}
+    trace.reasoning_trace["understanding_result"] = {"evidence_required": True, "answer_mode": "browser_required", "query_type": "hifleet_product", "should_limit_to_hifleet_sites": True}
 
     _, _, summary = execute_planned_knowledge_chain(
         question,
@@ -2309,7 +2309,12 @@ def test_three_layer_chain_uses_keyword_browser_fallback_without_urls():
     entities = extract_entities(text)
     decision = classify_message(text, entities)
     trace = make_trace(decision, entities)
-    trace.reasoning_trace["understanding_result"] = {"evidence_required": True, "query_type": "hifleet_product", "should_limit_to_hifleet_sites": True}
+    trace.reasoning_trace["understanding_result"] = {
+        "answer_mode": "browser_required",
+        "evidence_required": True,
+        "query_type": "hifleet_product",
+        "should_limit_to_hifleet_sites": True,
+    }
 
     execute_knowledge_chain(text, decision, {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser}, trace)
 
@@ -2335,7 +2340,12 @@ def test_evidence_required_browser_failure_returns_conservative_answer():
     entities = extract_entities(question)
     decision = classify_message(question, entities)
     trace = make_trace(decision, entities)
-    trace.reasoning_trace["understanding_result"] = {"evidence_required": True, "query_type": "hifleet_product", "should_limit_to_hifleet_sites": True}
+    trace.reasoning_trace["understanding_result"] = {
+        "answer_mode": "browser_required",
+        "evidence_required": True,
+        "query_type": "hifleet_product",
+        "should_limit_to_hifleet_sites": True,
+    }
 
     answer, _, _ = execute_planned_knowledge_chain(
         question,
@@ -2709,3 +2719,41 @@ def test_incident_candidates_treat_perception_placeholder_identifiers_as_missing
     )
 
     assert candidates == [{"name": "禾盛东方", "mmsi": "", "imo": ""}]
+
+
+def test_search_synthesis_uses_kb_and_web_when_browser_is_missing():
+    question = "怎么查不到船位了"
+    decision = RouteDecision("knowledge", "platform_knowledge", KNOWLEDGE_BUNDLE, "complex")
+    local_kb = FakeTool(
+        "local_kb_search",
+        lambda args: json.dumps({"tool": "local_kb_search", "can_answer": True, "items": [{"title": "船位 FAQ", "url": "https://www.hifleet.com/wp/communities/fleet/faq-position", "content": "免费用户的最新船位展示受权限和数据来源影响。"}]}, ensure_ascii=False),
+    )
+    web_search = FakeTool(
+        "web_search",
+        lambda args: json.dumps({"tool": "web_search", "query": args["query"], "can_answer": True, "continue_with": "agent_browser", "items": [{"title": "官方船位说明", "url": "https://www.hifleet.com/wp/communities/fleet/position", "snippet": "AIS 上报、卫星覆盖和网络缓存都可能造成船位不显示或延迟。"}], "best_urls": ["https://www.hifleet.com/wp/communities/fleet/position"]}, ensure_ascii=False),
+    )
+    browser = FakeTool("web_search_agent_browser", lambda args: (_ for _ in ()).throw(AssertionError("search_synthesis must not require browser")))
+    trace = make_trace(decision, extract_entities(question))
+    trace.reasoning_trace["understanding_result"] = {
+        "query_type": "hifleet_troubleshooting",
+        "answer_mode": "search_synthesis",
+        "evidence_required": True,
+        "search_query_candidates": ["HiFleet 查不到船位 原因", "HiFleet 船位延迟 排查"],
+        "should_limit_to_hifleet_sites": True,
+    }
+
+    answer, evidence_items, _ = execute_planned_knowledge_chain(
+        question,
+        decision,
+        [],
+        {"local_kb_search": local_kb, "web_search": web_search, "web_search_agent_browser": browser},
+        trace,
+    )
+
+    assert len(local_kb.calls) == 2
+    assert len(web_search.calls) == 2
+    assert browser.calls == []
+    assert "不能确认该功能是否支持" not in answer
+    assert "https://www.hifleet.com/wp/communities/fleet/position" in answer
+    assert trace.check_result["answer_mode"] == "search_synthesis"
+    assert evidence_items

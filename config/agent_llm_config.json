@@ -30,12 +30,76 @@
     "customer_ceshi_v2_max_tool_calls": 8,
     "customer_ceshi_v2_max_runtime_ms": 90000,
     "customer_ceshi_v2_ship_write_enabled": false,
+    "customer_ceshi_single_model_per_request": true,
     "customer_ceshi_runtime": {
       "mode": "responses",
       "fallback_mode": "chat_function_calling",
       "responses_enabled": true,
       "chat_fallback_enabled": true,
-      "legacy_v2_enabled": false
+      "legacy_v2_enabled": false,
+      "text_model": {
+        "model": "deepseek-v4-flash-260425",
+        "timeout_seconds": 30
+      },
+      "responses": {
+        "deepseek": {
+          "model": "deepseek-v4-flash-260425",
+          "store": true,
+          "max_output_tokens": 8192,
+          "thinking": {
+            "type": "enabled"
+          },
+          "reasoning_effort": "high",
+          "temperature": 0.2,
+          "top_p": 0.9,
+          "tool_choice": "auto"
+        },
+        "doubao": {
+          "store": true,
+          "max_output_tokens": 8192,
+          "thinking": {
+            "type": "enabled"
+          },
+          "reasoning_effort": "high",
+          "temperature": 0.2,
+          "top_p": 0.9,
+          "tool_choice": "auto",
+          "image_detail": "high",
+          "video_fps": 1,
+          "image_video": {
+            "model": "doubao-seed-2-1-pro-260628"
+          },
+          "audio": {
+            "model": "doubao-seed-2-0-lite-260428"
+          }
+        }
+      },
+      "chat_fallback": {
+        "deepseek": {
+          "model": "deepseek-v4-flash-260425",
+          "temperature": 0.2,
+          "top_p": 0.9
+        }
+      },
+      "context": {
+        "max_rounds": 10,
+        "recent_full_rounds": 3,
+        "summary_chars_per_turn": 600,
+        "full_chars_per_turn": 1600,
+        "max_facts_per_turn": 3,
+        "session_ttl_seconds": 86400
+      },
+      "search": {
+        "max_local_kb_calls": 2,
+        "max_web_calls": 2,
+        "max_facts": 3,
+        "max_sources": 2
+      },
+      "direct_updates": {
+        "enabled": true,
+        "media_evidence_ttl_seconds": 600,
+        "media_evidence_minimum_confidence": "high"
+      }
     }
   },
   "sp": "System prompt dynamically assembled from config/system_prompt_base.md + skills/*/SKILL.md",

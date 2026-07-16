@@ -29,6 +29,50 @@ def test_compact_run_response_excludes_internal_state():
     assert "messages" not in response
 
 
+def test_customer_support_run_result_only_returns_current_turn_messages():
+    result = main._sanitize_customer_support_run_result(
+        {
+            "generated_answer": "客服电话是 400-963-6899。",
+            "messages": [
+                {"type": "system", "content": "请用中文回复。"},
+                {"type": "human", "content": "旧问题：查船位"},
+                {"type": "ai", "content": "旧船位结果"},
+                {"type": "human", "content": "你们联系电话是"},
+                {"type": "ai", "content": "错误旧答复"},
+            ],
+            "working_messages": [{"type": "human", "content": "旧问题：查船位"}],
+            "pending_update_state": {"status": "executed_success"},
+            "ship_update_draft": {"mmsi": "123456789"},
+            "route_trace": {
+                "route": "knowledge",
+                "task_type": "platform_knowledge",
+                "tool_call_sequence": ["local_kb_search", "web_search"],
+                "evidence_items": [{"url": "https://www.hifleet.com/helpcenter/?i18n=zh", "snippet": "内部摘要"}],
+                "final_response": {"reference_urls": ["https://www.hifleet.com/helpcenter/?i18n=zh"]},
+                "reasoning_trace": {"private": "must not return"},
+            },
+        },
+        "customer_support",
+    )
+
+    assert result["messages"] == [
+        {"type": "human", "content": "你们联系电话是"},
+        {"type": "ai", "content": "客服电话是 400-963-6899。"},
+    ]
+    assert "working_messages" not in result
+    assert "pending_update_state" not in result
+    assert "ship_update_draft" not in result
+    assert result["route_trace"] == {
+        "route": "knowledge",
+        "task_type": "platform_knowledge",
+        "current_turn": {
+            "tool_call_count": 2,
+            "evidence_count": 1,
+            "reference_urls": ["https://www.hifleet.com/helpcenter/?i18n=zh"],
+        },
+    }
+
+
 def test_request_llm_route_accepts_nested_external_route(monkeypatch):
     monkeypatch.setattr(main, "load_llm_config", lambda: {"config": {"text_model": "default-text"}})
     monkeypatch.setattr(

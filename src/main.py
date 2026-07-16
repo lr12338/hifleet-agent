@@ -42,6 +42,7 @@ from coze_coding_utils.log.config import LOG_LEVEL
 from coze_coding_utils.error.classifier import ErrorClassifier
 from coze_coding_utils.helper.stream_runner import AgentStreamRunner, agent_stream_handler, RunOpt
 from agents.profiles import PROFILE_HEADER, resolve_profile_id, set_current_agent_profile
+from agents.customer_support_guard import sanitize_customer_output
 from agents.customer_support_stream_debug import (
     DebugRuntimeCursor,
     build_customer_support_debug_events,
@@ -153,6 +154,59 @@ def _compact_run_response(result: Dict[str, Any], *, session_id: str, user_id: s
     if dependency_error:
         response["error"] = dependency_error
     return response
+
+
+def _sanitize_customer_support_run_result(result: Dict[str, Any], agent_profile: str) -> Dict[str, Any]:
+    if agent_profile != "customer_support" or not isinstance(result, dict):
+        return result
+    cleaned = dict(result)
+    for key in ("generated_answer", "delegate_answer", "candidate_answer", "message"):
+        if isinstance(cleaned.get(key), str):
+            cleaned[key] = sanitize_customer_output(cleaned[key])
+    original_messages = list(cleaned.get("messages") or [])
+    current_user_text = ""
+    for message in reversed(original_messages):
+        if isinstance(message, dict):
+            role = str(message.get("role") or message.get("type") or "").lower()
+            if role in {"user", "human"} and isinstance(message.get("content"), str):
+                current_user_text = message["content"]
+                break
+        elif str(getattr(message, "type", "")).lower() in {"user", "human"}:
+            content = getattr(message, "content", "")
+            if isinstance(content, str):
+                current_user_text = content
+                break
+    answer = str(cleaned.get("generated_answer") or cleaned.get("candidate_answer") or cleaned.get("message") or "")
+    public_messages = []
+    if current_user_text:
+        public_messages.append({"type": "human", "content": current_user_text})
+    if answer:
+        public_messages.append({"type": "ai", "content": sanitize_customer_output(answer)})
+    cleaned["messages"] = public_messages
+    route_trace = cleaned.get("route_trace") if isinstance(cleaned.get("route_trace"), dict) else {}
+    evidence_items = list(route_trace.get("evidence_items") or [])
+    cleaned["route_trace"] = {
+        "route": str(route_trace.get("route") or ""),
+        "task_type": str(route_trace.get("task_type") or ""),
+        "current_turn": {
+            "tool_call_count": len(list(route_trace.get("tool_call_sequence") or [])),
+            "evidence_count": len(evidence_items),
+            "reference_urls": list((route_trace.get("final_response") or {}).get("reference_urls") or []),
+        },
+    }
+    for key in (
+        "working_messages",
+        "delegate_answer",
+        "generated_tool_calls",
+        "perception_result",
+        "pending_update_state",
+        "ship_update_draft",
+        "_pending_before",
+        "check_result",
+        "output_assets",
+    ):
+        cleaned.pop(key, None)
+    return cleaned
 
 
 def _normalize_stack_trace(stack_trace: Any) -> str:
@@ -904,6 +958,7 @@ async def http_run(request: Request) -> Dict[str, Any]:
         if isinstance(result, dict):
             result["run_id"] = run_id
             result.setdefault("llm_route", payload.get("llm_route", {}))
+            result = _sanitize_customer_support_run_result(result, agent_profile)
         response_mode = str(payload.get("response_mode", "full")).strip().lower()
         response_result: Dict[str, Any] = result
         if response_mode == "compact" and isinstance(result, dict):

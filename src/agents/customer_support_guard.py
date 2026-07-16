@@ -75,6 +75,7 @@ def sanitize_customer_output(text: str) -> str:
     value = re.sub(r"(?mi)^如需更多帮助，请继续补充.*$", "", value)
     value = re.sub(r"(?mi)^请用中文回复。?\s*$", "", value)
     value = re.sub(r"(?mi)^下载APP,?手机查船更方便.*$", "", value)
+    value = re.sub(r"(?mi)^.*下载\s*APP.*(?:手机查船更方便|download/qr\.html).*$", "", value)
     value = re.sub(r"(?mi)^.*手机查船更方便.*$", "", value)
     value = re.sub(r"(?mi)^.*服务电话:400-963-6899.*$", "", value)
     value = re.sub(r"(?mi)^.*微信:hifleetkhzs.*$", "", value)

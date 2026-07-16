@@ -61,7 +61,7 @@
       "tool_policy": {
         "allow_file_tools": false,
         "allow_python": false,
-        "allow_write_actions": false,
+      "allow_write_actions": true,
         "prefer_search_before_answer": true,
         "allow_browser_verify": true,
         "allow_multimodal": true,

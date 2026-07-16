@@ -15,6 +15,7 @@ from agents.agent import (
     _customer_support_route_for_intent,
     _execute_customer_support_harness,
     _execute_customer_support_planner,
+    _generate_customer_support_final_answer,
     _heuristic_image_perception,
     _run_customer_support_perception_agent,
     _run_direct_multimodal_perception,
@@ -821,13 +822,13 @@ def test_customer_support_graph_write_guard_overrides_light_agent(monkeypatch):
     assert result["route_trace"]["reasoning_trace"]["route_source"] == "write_guard"
 
 
-def test_customer_ceshi_profile_uses_isolated_v2_graph(monkeypatch):
+def test_customer_ceshi_profile_uses_isolated_responses_graph(monkeypatch):
     built = {}
 
     class FakeGraph:
         pass
 
-    monkeypatch.setattr("agents.customer_ceshi_v2.build_customer_ceshi_v2_agent", lambda *args, **kwargs: built.setdefault("graph", FakeGraph()))
+    monkeypatch.setattr("agents.customer_ceshi_responses.build_customer_ceshi_responses_agent", lambda *args, **kwargs: built.setdefault("graph", FakeGraph()))
     monkeypatch.setattr("agents.agent._build_lightweight_customer_support_agent", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("customer_ceshi must not use the production builder")))
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("customer_ceshi must not use standard agent")))
     set_current_agent_profile("customer_ceshi")
@@ -1098,9 +1099,9 @@ def test_lightweight_ship_position_troubleshooting_does_not_preflight_update(mon
     )
 
     assert position.calls == []
-    assert result["route_trace"]["route"] == "lightweight_skills_agent"
+    assert result["route_trace"]["route"] == "knowledge"
     assert result["route_trace"]["reasoning_trace"].get("route_source") != "write_preflight_guard"
-    assert "船位更新慢通常" in result["messages"][-1].content
+    assert "写入" not in result["messages"][-1].content
 
 
 def test_sensitive_internal_request_detection():
@@ -1791,3 +1792,200 @@ def test_lightweight_graph_routes_audio_recognized_text_update_through_subagent_
     assert result["route_trace"]["ship_update_subagent"]["status"] == "need_user_input"
     assert result["generated_tool_calls"] == []
     assert "确认执行" in result["messages"][-1].content
+
+
+def test_final_response_agent_prefers_relevant_evidence_over_first_web_result(monkeypatch):
+    captured = {}
+
+    def fake_json_agent(ctx, cfg, system_prompt, payload, model_override=""):
+        captured["prompt"] = system_prompt
+        captured["packet"] = payload["answer_packet"]
+        return {
+            "answer": "HiFleet 客服电话是 400-963-6899，也可联系微信客服 hifleetkhzs。",
+            "used_evidence_ids": ["E1"],
+            "reference_urls": [],
+            "needs_followup": False,
+            "followup_question": "",
+        }
+
+    monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", fake_json_agent)
+    answer, trace = _generate_customer_support_final_answer(
+        ctx=None,
+        cfg={"config": {}},
+        question="你们联系电话是",
+        evidence_items=[
+            {
+                "title": "船队监控",
+                "snippet": "HIFLEET APP 可接收船舶报警通知。",
+                "url": "https://www.hifleet.com/wp/communities/fleet/paged/2",
+                "source_type": "official_site",
+                "query": "HiFleet 联系电话",
+                "relevance": 0.9,
+                "authority": 1.0,
+                "supports": ["H1"],
+            },
+            {
+                "title": "数据服务与客服联系方式",
+                "snippet": "统一客服电话：400-963-6899；微信客服：hifleetkhzs。",
+                "url": "",
+                "source_type": "local_kb",
+                "query": "HiFleet 联系方式",
+                "relevance": 0.6,
+                "authority": 0.6,
+                "supports": ["H2"],
+            },
+        ],
+        evidence_summary={},
+    )
+
+    assert captured["packet"]["selected_evidence"][0]["title"] == "数据服务与客服联系方式"
+    assert "只返回 JSON" in captured["prompt"]
+    assert answer == "HiFleet 客服电话是 400-963-6899，也可联系微信客服 hifleetkhzs。"
+    assert trace["used_evidence_ids"] == ["E1"]
+    assert "船队监控" not in answer
+
+
+def test_final_response_agent_retries_when_reference_is_outside_selected_evidence(monkeypatch):
+    responses = iter(
+        [
+            {
+                "answer": "请查看帮助页。",
+                "used_evidence_ids": ["E9"],
+                "reference_urls": ["https://invalid.example.com"],
+                "needs_followup": False,
+            },
+            {
+                "answer": "可在帮助中心查看相关说明。",
+                "used_evidence_ids": ["E1"],
+                "reference_urls": ["https://www.hifleet.com/helpcenter/?i18n=zh"],
+                "needs_followup": False,
+            },
+        ]
+    )
+    monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", lambda *args, **kwargs: next(responses))
+
+    answer, trace = _generate_customer_support_final_answer(
+        ctx=None,
+        cfg={"config": {}},
+        question="帮助中心在哪里",
+        evidence_items=[
+            {
+                "title": "帮助中心",
+                "snippet": "可通过帮助中心查看平台使用说明。",
+                "url": "https://www.hifleet.com/helpcenter/?i18n=zh",
+                "source_type": "official_site",
+                "query": "HiFleet 帮助中心",
+                "relevance": 1.0,
+                "authority": 1.0,
+                "supports": ["H1"],
+            }
+        ],
+        evidence_summary={},
+    )
+
+    assert trace["status"] == "generated"
+    assert trace["attempt"] == 2
+    assert trace["reference_urls"] == ["https://www.hifleet.com/helpcenter/?i18n=zh"]
+    assert "https://www.hifleet.com/helpcenter/?i18n=zh" in answer
+    assert "invalid.example.com" not in answer
+
+
+def test_final_response_agent_uses_friendly_human_handoff_for_unverified_product_scope(monkeypatch):
+    captured = {}
+
+    def fake_json_agent(ctx, cfg, system_prompt, payload, model_override=""):
+        captured["packet"] = payload["answer_packet"]
+        return {
+            "answer": (
+                "不好意思，关于您咨询的专业版中历史台风、预抵船舶、最近抵港的时间范围，以及 30 天潮汐表限制，"
+                "目前我无法准确确认具体权益范围。\n\n"
+                "您可以留下方便联系的方式，或直接联系人工客服：客服电话 400-963-6899，微信客服 hifleetkhzs。"
+            ),
+            "used_evidence_ids": [],
+            "reference_urls": [],
+            "needs_followup": True,
+            "followup_question": "",
+            "resolution_mode": "human_handoff",
+            "handoff_reason": "专业版权益范围需要人工核实",
+        }
+
+    monkeypatch.setattr("agents.agent._invoke_customer_support_json_agent", fake_json_agent)
+    answer, trace = _generate_customer_support_final_answer(
+        ctx=None,
+        cfg={"config": {}},
+        question="请结合用户上一条发送的媒体内容，回答以下补充说明或问题：这个截图",
+        perception={
+            "attachment_type": "image",
+            "visible_text": "专业版中，历史台风、预抵船舶、最近抵港是否有时间范围？港口-船舶是指哪一部分内容？30天潮汐表是否有限制？",
+        },
+        understanding_result={"user_goal": "确认专业版功能的时间范围、港口内容和潮汐表限制"},
+        evidence_items=[],
+        evidence_summary={"missing_key_fact": "专业版权益范围"},
+    )
+
+    assert captured["packet"]["customer_issue_summary"] == "确认专业版功能的时间范围、港口内容和潮汐表限制"
+    assert "不好意思" in answer
+    assert "专业版" in answer
+    assert "400-963-6899" in answer
+    assert "hifleetkhzs" in answer
+    assert "暂时无法为您提供对应的解答" not in answer
+    assert "无法确认您所提及的这张截图" not in answer
+    assert trace["resolution_mode"] == "human_handoff"
+
+
+def test_final_response_agent_allows_one_targeted_followup_without_handoff(monkeypatch):
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "answer": "不好意思，目前还看不清您想确认的图标。请补一张更清晰的截图，并圈出该位置，我收到后继续帮您确认。",
+            "used_evidence_ids": [],
+            "reference_urls": [],
+            "needs_followup": True,
+            "followup_question": "请补一张更清晰的截图，并圈出该位置。",
+            "resolution_mode": "ask_one_question",
+            "handoff_reason": "",
+        },
+    )
+
+    answer, trace = _generate_customer_support_final_answer(
+        ctx=None,
+        cfg={"config": {}},
+        question="这个图标是什么意思",
+        perception={"visual_question_summary": "用户想确认截图中的图标含义"},
+        evidence_items=[],
+        evidence_summary={"missing_key_fact": "清晰截图"},
+    )
+
+    assert "更清晰的截图" in answer
+    assert "400-963-6899" not in answer
+    assert trace["resolution_mode"] == "ask_one_question"
+
+
+def test_final_response_agent_retries_invalid_handoff_contact_then_uses_friendly_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "agents.agent._invoke_customer_support_json_agent",
+        lambda *args, **kwargs: {
+            "answer": "请联系人工客服：13800138000。",
+            "used_evidence_ids": [],
+            "reference_urls": [],
+            "needs_followup": True,
+            "followup_question": "",
+            "resolution_mode": "human_handoff",
+            "handoff_reason": "需人工确认",
+        },
+    )
+
+    answer, trace = _generate_customer_support_final_answer(
+        ctx=None,
+        cfg={"config": {}},
+        question="专业版权益范围是什么",
+        evidence_items=[],
+        evidence_summary={"missing_key_fact": "套餐权益"},
+    )
+
+    assert trace["status"] == "fallback"
+    assert trace["resolution_mode"] == "human_handoff"
+    assert "不好意思" in answer
+    assert "400-963-6899" in answer
+    assert "hifleetkhzs" in answer
+    assert "13800138000" not in answer
