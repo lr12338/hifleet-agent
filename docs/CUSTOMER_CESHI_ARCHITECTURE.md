@@ -1,5 +1,7 @@
 # customer_ceshi 开发与运行指南
 
+> 外部 HTTP 调用、标准消息、多模态、微信兼容和流式响应统一见 [CUSTOMER_SERVICE_API.md](CUSTOMER_SERVICE_API.md)。本页只描述 `customer_ceshi` 的测试运行时差异；它不改变共用的 `/run`、`/stream_run` 请求结构。
+
 > 适用范围：仅 `customer_ceshi` 测试客服链。它与生产 `customer_support` 使用不同 Builder、运行时和 checkpoint namespace；修改本链路不得改变生产客服行为。
 
 ## 1. 一页总览
@@ -50,7 +52,9 @@ flowchart TD
 - 当工具明确 `can_answer=true` 时，下一次模型请求强制总结，不允许再做同义检索。
 - 普通产品、故障排查和数据时效解释由模型基于证据总结；安全门禁只校验“写入成功”和“查询无结果”等可由工具事实确认的结论。
 
-### 3.2 多媒体请求格式
+### 3.2 内部多媒体转换
+
+调用方仍使用共享 API 手册中的 `image_url`、`input_audio`、`video_url` 和 `file_url` 段。下表仅说明 `customer_ceshi` 将外部标准段转换给内部多模态 Provider 的方式，不是额外的 HTTP 请求契约。
 
 外部服务传入的公网 URL 按接收顺序保留在同一 `content` 数组，仅当前轮进入模型：
 

@@ -2,7 +2,7 @@
 
 HiFleet 企业客服生产服务。正式客服链路使用 Chat Completions API 运行时，通过 FastAPI 在端口 `10123` 提供同步、流式和 OpenAI 兼容接口。
 
-生产链路的唯一完整说明见 [docs/CUSTOMER_SUPPORT.md](docs/CUSTOMER_SUPPORT.md)。测试中的 `customer_ceshi` / Responses API 链路不属于本说明范围。
+生产调用规范（两条客服链路共用）见 [docs/CUSTOMER_SERVICE_API.md](docs/CUSTOMER_SERVICE_API.md)。`customer_support` 的生产运行与安全规则见 [docs/CUSTOMER_SUPPORT.md](docs/CUSTOMER_SUPPORT.md)。
 
 ## 快速启动
 
@@ -87,4 +87,4 @@ curl -N -X POST http://127.0.0.1:10123/stream_run \
   }'
 ```
 
-该接口返回 `text/event-stream`。现有调用方也可继续使用 `/v1/chat/completions` 兼容入口；请求契约、多模态/微信格式和错误处理请查阅 [docs/CUSTOMER_SUPPORT.md](docs/CUSTOMER_SUPPORT.md)。
+该接口返回 `text/event-stream`。现有调用方也可继续使用 `/v1/chat/completions` 兼容入口；字段契约、多模态/微信格式、`customer_ceshi` 调用和错误处理请查阅 [docs/CUSTOMER_SERVICE_API.md](docs/CUSTOMER_SERVICE_API.md)。
