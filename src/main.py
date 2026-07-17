@@ -51,6 +51,7 @@ from agents.customer_support_stream_debug import (
 from llm_config import load_llm_config, messages_have_multimodal_content, resolve_model_selection
 from utils.context_headers import ensure_context_headers
 from utils.llm_route_state import clear_current_llm_route, set_current_llm_route
+from skills.knowledge_qa.local_kb_runtime import local_kb_index_summary
 
 setup_logging(
     log_file=LOG_FILE,
@@ -1348,10 +1349,14 @@ async def openai_chat_completions(request: Request):
 @app.get("/health")
 async def health_check():
     try:
-        # 这里可以添加更多的健康检查逻辑
         return {
             "status": "ok",
             "message": "Service is running",
+            "build": {
+                "id": os.getenv("COZE_APP_BUILD_ID", "workspace"),
+                "main_source_mtime": int(Path(__file__).stat().st_mtime),
+            },
+            "local_kb": local_kb_index_summary(),
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))

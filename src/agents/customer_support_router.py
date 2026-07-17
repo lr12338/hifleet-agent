@@ -1270,6 +1270,7 @@ def _understanding_summary_for_trace(understanding_result: dict[str, Any] | None
     candidates = list(result.get("search_query_candidates", []) or [])
     return {
         "query_type": str(result.get("query_type", "")),
+        "user_goal": str(result.get("user_goal", "")),
         "rewritten_user_need": str(result.get("rewritten_user_need", "")),
         "search_keywords": list(result.get("search_keywords", []) or []),
         "understanding_primary_query": str(candidates[0] if candidates else ""),
@@ -1374,7 +1375,7 @@ def _merge_knowledge_search_plan(
                 "hypothesis_id": hypothesis_id or "H1",
                 "query": normalized_query,
                 "depth": resolved_depth,
-                "source_priority": list(source_priority or ["local_kb", "official_site", "official_community", "public_web"]),
+                "source_priority": list(source_priority or ["official_site", "official_community", "public_web", "local_kb"]),
                 "purpose": purpose or "回答当前问题",
             }
         )
@@ -1983,6 +1984,43 @@ def _output_from_structured_payload(payload: dict[str, Any], fallback_output: st
     return fallback_output
 
 
+def _evidence_topic_relevance(query: str, title: str, snippet: str) -> float:
+    """Estimate whether a result is about the current retrieval query.
+
+    This is a generic relevance check, not a product-specific routing rule.  It
+    intentionally excludes the query field itself so a search engine result
+    cannot be treated as relevant merely because it echoes the search query.
+    """
+    query_text = re.sub(r"\s+", "", normalize_message_text(query).lower())
+    content = re.sub(r"\s+", "", f"{title}\n{snippet}".lower())
+    if not query_text or not content:
+        return 0.0
+    terms = set(re.findall(r"[a-z0-9]{2,}", query_text))
+    for block in re.findall(r"[\u4e00-\u9fff]{2,}", query_text):
+        terms.add(block)
+        terms.update(block[index : index + 2] for index in range(len(block) - 1))
+        terms.update(block[index : index + 3] for index in range(len(block) - 2))
+        terms.update(block[index : index + 4] for index in range(len(block) - 3))
+    generic_terms = {"hifleet", "船队在线"}
+    matched = [term for term in terms if term and term not in generic_terms and term in content]
+    if not matched:
+        return 0.0
+    strong_matches = [
+        term
+        for term in matched
+        if (bool(re.fullmatch(r"[\u4e00-\u9fff]{3,}", term)) or bool(re.fullmatch(r"[a-z0-9]{5,}", term)))
+    ]
+    if not strong_matches and len(matched) < 3:
+        return 0.0
+    title_text = re.sub(r"\s+", "", str(title or "").lower())
+    title_matches = sum(1 for term in matched if term in title_text)
+    exact_operation_matches = sum(1 for term in matched if len(term) >= 4 and term in title_text)
+    return min(
+        1.0,
+        0.18 + min(0.45, len(matched) * 0.1) + min(0.2, title_matches * 0.1) + min(0.3, exact_operation_matches * 0.2),
+    )
+
+
 def _evidence_items_from_structured_payload(
     payload: dict[str, Any],
     *,
@@ -1991,10 +2029,9 @@ def _evidence_items_from_structured_payload(
     depth: str,
     hypothesis_id: str = "H1",
     purpose: str = "",
+    topic_query: str = "",
 ) -> list[dict[str, Any]]:
     tool_name = str(payload.get("tool") or source_name)
-    if not payload.get("can_answer") and tool_name == "local_kb_search":
-        return []
     if tool_name == "web_search_agent_browser":
         browser_payload = _browser_bridge_to_legacy_payload(payload)
         if browser_payload:
@@ -2037,6 +2074,7 @@ def _evidence_items_from_structured_payload(
             else:
                 source_type = "public_web"
         snippet = normalize_message_text(str(item.get("content") or item.get("summary") or item.get("snippet") or ""))
+        title = str(item.get("title") or "")
         authority = float(item.get("authority") or (0.95 if source_type in {"local_kb", "official_site", "official_community"} else 0.6))
         relevance = float(item.get("score") or item.get("relevance") or (0.9 if payload.get("can_answer") else 0.65))
         evidence_items.append(
@@ -2049,10 +2087,12 @@ def _evidence_items_from_structured_payload(
                 "conflicts": [],
                 "authority": authority,
                 "relevance": relevance,
+                "topic_relevance": _evidence_topic_relevance(topic_query or query, title, snippet),
+                "query_relevance": _evidence_topic_relevance(query, title, snippet),
                 "query": query,
                 "depth": depth,
                 "purpose": purpose,
-                "title": str(item.get("title") or ""),
+                "title": title,
             }
         )
     return evidence_items
@@ -2199,50 +2239,18 @@ def _invoke_three_layer_knowledge_chain(
     search_synthesis = answer_mode == "search_synthesis"
     require_full_evidence = answer_mode == "browser_required" or (legacy_mode and bool(understanding_summary.get("evidence_required")))
     site_hint = "hifleet.com" if understanding_summary.get("should_limit_to_hifleet_sites") or _looks_like_hifleet_product_query(question) else ""
-
-    local_payload: dict[str, Any] = {}
-    local_output = ""
-    if "local_kb_search" in tool_map:
-        raw_local = _invoke_tool(tool_map, trace, "local_kb_search", {"query": query})
-        local_payload = _parse_tool_json(raw_local)
-        local_output = _output_from_structured_payload(local_payload, raw_local)
-        outputs.append(local_output)
-        evidence_items.extend(
-            _evidence_items_from_structured_payload(
-                local_payload,
-                source_name="local_kb_search",
-                query=query,
-                depth="local",
-                hypothesis_id=hypothesis_id,
-                purpose=purpose,
-            )
+    evidence_focus_query = " ".join(
+        value
+        for value in (
+            question,
+            str(understanding_summary.get("user_goal") or ""),
+            str(understanding_summary.get("rewritten_user_need") or ""),
         )
-        _append_layer(retrieval_trace, "T0", local_payload)
-        retrieval_trace["t0_kb_hit"] = bool((local_payload.get("items") or []))
-        retrieval_trace["t0_can_answer"] = bool(local_payload.get("can_answer"))
-        retrieval_trace["t0_result_count"] = len(list(local_payload.get("items") or []))
-        if local_payload.get("can_answer") and not require_full_evidence and not search_synthesis:
-            retrieval_trace["t1_eval_decision"] = "short_circuit"
-            retrieval_trace["t1_eval_reason"] = "local_kb_search can_answer=true"
-            return outputs, evidence_items, retrieval_trace
-    elif "smart_search" in tool_map:
-        # Compatibility path for old tests/callers that inject only smart_search.
-        raw = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
-        outputs.append(raw)
-        evidence_items.extend(
-            _evidence_items_from_tool_output(
-                raw,
-                source_name="smart_search",
-                query=query,
-                depth=depth,
-                hypothesis_id=hypothesis_id,
-                purpose=purpose,
-            )
-        )
-        retrieval_trace["t1_eval_decision"] = "compat_smart_search"
-        retrieval_trace["t1_eval_reason"] = "three-layer tools unavailable"
-        return outputs, evidence_items, retrieval_trace
+        if value
+    )
 
+    # Public pages are searched first so current, directly verifiable material
+    # receives priority when it is genuinely about the user's question.
     web_payload: dict[str, Any] = {}
     if "web_search" in tool_map:
         search_type = "web_summary" if depth == "deep" else "web"
@@ -2261,6 +2269,7 @@ def _invoke_three_layer_knowledge_chain(
                 depth=search_type,
                 hypothesis_id=hypothesis_id,
                 purpose=purpose,
+                topic_query=evidence_focus_query,
             )
         )
         _append_layer(retrieval_trace, "T1", web_payload)
@@ -2278,13 +2287,61 @@ def _invoke_three_layer_knowledge_chain(
                 "t2_target_urls": list(web_payload.get("best_urls") or []),
             }
         )
-        if web_payload.get("can_answer") and not require_full_evidence and not search_synthesis:
-            retrieval_trace["t1_eval_decision"] = "short_circuit"
-            retrieval_trace["t1_eval_reason"] = "web_search can_answer=true"
-            return outputs, evidence_items, retrieval_trace
+
+    local_payload: dict[str, Any] = {}
+    local_output = ""
+    if "local_kb_search" in tool_map:
+        raw_local = _invoke_tool(tool_map, trace, "local_kb_search", {"query": query})
+        local_payload = _parse_tool_json(raw_local)
+        local_output = _output_from_structured_payload(local_payload, raw_local)
+        outputs.append(local_output)
+        evidence_items.extend(
+            _evidence_items_from_structured_payload(
+                local_payload,
+                source_name="local_kb_search",
+                query=query,
+                depth="local",
+                hypothesis_id=hypothesis_id,
+                purpose=purpose,
+                topic_query=evidence_focus_query,
+            )
+        )
+        _append_layer(retrieval_trace, "T0", local_payload)
+        retrieval_trace["t0_kb_hit"] = bool((local_payload.get("items") or []))
+        retrieval_trace["t0_can_answer"] = bool(local_payload.get("can_answer"))
+        retrieval_trace["t0_result_count"] = len(list(local_payload.get("items") or []))
+    elif "smart_search" in tool_map:
+        # Compatibility path for old tests/callers that inject only smart_search.
+        raw = _invoke_tool(tool_map, trace, "smart_search", {"query": query, "depth": depth})
+        outputs.append(raw)
+        evidence_items.extend(
+            _evidence_items_from_tool_output(
+                raw,
+                source_name="smart_search",
+                query=query,
+                depth=depth,
+                hypothesis_id=hypothesis_id,
+                purpose=purpose,
+            )
+        )
+        retrieval_trace["t1_eval_decision"] = "compat_smart_search"
+        retrieval_trace["t1_eval_reason"] = "three-layer tools unavailable"
+        return outputs, evidence_items, retrieval_trace
 
     should_browser = (
-        (require_full_evidence or (answer_mode in {"legacy", "browser_assisted"} and str(web_payload.get("continue_with") or "") == "agent_browser"))
+        (
+            require_full_evidence
+            or str(web_payload.get("continue_with") or "") == "agent_browser"
+            or (
+                _question_needs_step_complete_answer(question)
+                and bool(web_payload.get("best_urls"))
+            )
+            or (
+                search_synthesis
+                and not bool(retrieval_trace.get("t0_can_answer"))
+                and bool(web_payload.get("best_urls"))
+            )
+        )
         and "web_search_agent_browser" in tool_map
         and (bool(web_payload) or require_full_evidence)
     )
@@ -2313,6 +2370,7 @@ def _invoke_three_layer_knowledge_chain(
                 depth="browser",
                 hypothesis_id=hypothesis_id,
                 purpose="受控公开页面正文核验",
+                topic_query=evidence_focus_query,
             )
         )
         _append_layer(retrieval_trace, "T2", browser_payload)
@@ -2547,12 +2605,6 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
         retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
-        if (chain_trace.get("t2_can_answer") and int(chain_trace.get("t2_relevant_page_count") or 0) > 0) or (
-            not understanding_summary.get("evidence_required")
-            and (chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"))
-        ):
-            retrieval_trace.update(chain_trace)
-            break
         if len(chain_evidence) > len(retrieval_trace.get("layers", [])):
             retrieval_trace.update(chain_trace)
     output = _select_best_evidence_output(outputs, evidence_items)
@@ -2568,6 +2620,8 @@ def execute_knowledge_chain(text: str, decision: RouteDecision, tool_map: dict[s
         "invalid_links": invalid,
         "planned_queries": [item.get("query", "") for item in queries],
         "evidence_count": len(evidence_items),
+        "relevant_evidence_count": evidence_summary["support_count"],
+        "excluded_low_relevance_count": evidence_summary["excluded_low_relevance_count"],
         "official_support_count": evidence_summary["official_support_count"],
         "multi_query_synthesis": len(queries) > 1,
         "evidence_summary": evidence_summary,
@@ -2634,14 +2688,6 @@ def execute_planned_knowledge_chain(
         outputs.extend(chain_outputs)
         evidence_items.extend(chain_evidence)
         retrieval_trace.setdefault("query_traces", []).append(_trace_snapshot(chain_trace))
-        if not search_synthesis and ((chain_trace.get("t2_can_answer") and int(chain_trace.get("t2_relevant_page_count") or 0) > 0) or (
-            not understanding_summary.get("evidence_required")
-            and (chain_trace.get("t1_can_answer") or chain_trace.get("t0_can_answer"))
-        )):
-            chain_trace["query_plan"] = [item.get("query", "") for item in queries]
-            chain_trace["query_traces"] = list(retrieval_trace.get("query_traces") or [])
-            retrieval_trace = chain_trace
-            break
         chain_trace["query_plan"] = [item.get("query", "") for item in queries]
         chain_trace["query_traces"] = list(retrieval_trace.get("query_traces") or [])
         retrieval_trace = chain_trace
@@ -2665,6 +2711,8 @@ def execute_planned_knowledge_chain(
         "invalid_links": invalid,
         "planned_queries": [item.get("query", "") for item in queries],
         "evidence_count": len(evidence_items),
+        "relevant_evidence_count": evidence_summary["support_count"],
+        "excluded_low_relevance_count": evidence_summary["excluded_low_relevance_count"],
         "official_support_count": evidence_summary["official_support_count"],
         "multi_query_synthesis": len(queries) > 1,
         "completed_query_count": len(retrieval_trace.get("query_traces") or []),
@@ -2971,20 +3019,34 @@ def _select_best_evidence_output(outputs: list[str], evidence_items: list[dict[s
     for output in outputs:
         if _answer_has_step_completeness(output) and not is_no_hit_text(output):
             return output
-    # Browser-verified official pages are preferred for community/article/latest verification tasks.
-    for i, item in enumerate(evidence_items):
+    relevant_items = [
+        item
+        for item in evidence_items
         if (
-            i < len(outputs)
-            and item.get("source_name") in {"agent_browser_deep_search", "web_search_agent_browser"}
-            and item.get("source_type") in {"official_site", "official_community"}
-            and not is_no_hit_text(outputs[i])
-        ):
-            return outputs[i]
-    # 优先返回本地知识库或官方站点的结果
-    high_quality_sources = {"local_kb", "official_site", "official_community"}
-    for i, item in enumerate(evidence_items):
-        if i < len(outputs) and item.get("source_type") in high_quality_sources and not is_no_hit_text(outputs[i]):
-            return outputs[i]
+            "topic_relevance" not in item
+            or float(item.get("topic_relevance") or 0.0) >= 0.3
+            or float(item.get("query_relevance") or 0.0) >= 0.3
+        )
+    ]
+    source_priority = {
+        "web_search_agent_browser": 3,
+        "agent_browser_deep_search": 3,
+        "web_search": 2,
+        "local_kb_search": 1,
+    }
+    if relevant_items:
+        best_item = max(
+            relevant_items,
+            key=lambda item: (
+                float(item.get("query_relevance") or 0.0),
+                float(item.get("topic_relevance") or 0.0),
+                source_priority.get(str(item.get("source_name") or ""), 0),
+                float(item.get("relevance") or 0.0),
+            ),
+        )
+        best_snippet = normalize_message_text(str(best_item.get("snippet") or ""))
+        if best_snippet:
+            return best_snippet
     # 其次返回任何命中的结果
     for i, output in enumerate(outputs):
         if not is_no_hit_text(output):
@@ -2994,9 +3056,14 @@ def _select_best_evidence_output(outputs: list[str], evidence_items: list[dict[s
 
 
 def review_evidence_items(evidence_items: list[dict[str, Any]]) -> dict[str, Any]:
-    support_count = len(evidence_items)
-    official_support_count = sum(1 for item in evidence_items if item.get("source_type") in {"official_site", "official_community"})
-    conflict_count = sum(1 for item in evidence_items if item.get("conflicts"))
+    relevant_items = [
+        item
+        for item in evidence_items
+        if "topic_relevance" not in item or float(item.get("topic_relevance") or 0.0) >= 0.3
+    ]
+    support_count = len(relevant_items)
+    official_support_count = sum(1 for item in relevant_items if item.get("source_type") in {"official_site", "official_community"})
+    conflict_count = sum(1 for item in relevant_items if item.get("conflicts"))
     if support_count >= 2 and official_support_count >= 1 and conflict_count == 0:
         confidence = "high"
     elif support_count >= 1:
@@ -3004,8 +3071,10 @@ def review_evidence_items(evidence_items: list[dict[str, Any]]) -> dict[str, Any
     else:
         confidence = "low"
     return {
-        "best_hypothesis": (evidence_items[0].get("supports") or ["H1"])[0] if evidence_items else "",
+        "best_hypothesis": (relevant_items[0].get("supports") or ["H1"])[0] if relevant_items else "",
         "support_count": support_count,
+        "raw_evidence_count": len(evidence_items),
+        "excluded_low_relevance_count": len(evidence_items) - support_count,
         "official_support_count": official_support_count,
         "conflict_count": conflict_count,
         "confidence": confidence,
