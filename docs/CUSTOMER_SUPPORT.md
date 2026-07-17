@@ -41,46 +41,7 @@ flowchart LR
 
 服务端口为 `10123`，提供 `/run`、`/stream_run` 和既有 `/v1/chat/completions` 兼容入口。新接入优先使用前两个接口。
 
-### 标准请求
-
-```json
-{
-  "messages": [
-    {"role": "user", "content": "为什么轨迹查询没有反应？"}
-  ],
-  "session_id": "websdk:tenant_a:user_100:c_001",
-  "user_id": "user_100",
-  "source_channel": "websdk",
-  "agent_profile": "customer_support"
-}
-```
-
-- 为同一用户的同一会话复用稳定、可追溯的 `session_id`；不同租户、用户或会话不得复用。
-- `user_id` 和 `source_channel` 应始终传入，便于会话隔离和观测。
-- `/run` 返回客户可见的同步结果；`/stream_run` 返回 SSE（`text/event-stream`）。调用方只应展示最终客户内容，不展示调试事件或内部字段。
-
-### 微信旧格式与多模态
-
-微信调用方可继续使用 `content.query.prompt`；服务端将 `text`、`image`、`voice`、`video` 分别转换为文本、`image_url`、`input_audio`、`video_url` 消息段。
-
-```json
-{
-  "content": {
-    "query": {
-      "prompt": [
-        {"type": "image", "content": {"url": "https://example.com/a.png"}},
-        {"type": "text", "content": {"text": "这艘船为什么搜不到？"}}
-      ]
-    }
-  },
-  "session_id": "wechat_kf:hifleet:openid_xxx:c_default",
-  "user_id": "openid_xxx",
-  "source_channel": "wechat_kf",
-  "agent_profile": "customer_support"
-}
-```
-
-标准 `messages` 同样支持多模态 `content` 数组，例如 `image_url`、`input_audio`（可带 `format`）和 `video_url`。附件 URL 必须由调用方授权且可被服务访问。
+标准请求字段、`response_mode=compact`、同步响应、SSE、媒体消息段和微信旧 `content.query.prompt` 格式统一见 [CUSTOMER_SERVICE_API.md](CUSTOMER_SERVICE_API.md)。本链路要求显式传入 `agent_profile=customer_support`，并且调用方只能向客户展示最终客户内容，不能展示调试事件或内部字段。
 
 ## 4. 高风险操作
 
@@ -134,6 +95,31 @@ HIFLEET_KB_UPDATE_KEY=...
 5. 工具已调用但客户回复不正确时，以工具结果和最终清洗后的回复为准，不向客户暴露 trace、Prompt 或密钥。
 
 ## 6. 回归验收
+
+### 对话场景与关键案例
+
+从真实客服渠道生成脱敏的场景地图、重点案例和回归 fixture。默认只读取 `wechat_kf`、`wechat_cs`、`hifleet_mp`、`webchat_*`、`wechat_mp` 与 `customer_api`，不会修改数据库：
+
+```bash
+source .venv/bin/activate
+python scripts/analyze_customer_dialogs.py --days 7 --limit 500
+```
+
+输出在 `reports/customer_support_dialogs`：
+
+- `customer_support_dialog_case_report.md`：开发者短报告，固定包含场景地图、关键案例、优化建议和测试断言。
+- `customer_support_regression_fixtures.json`：脱敏的可执行回归 fixture；包含船位更新字段解析、缺字段保护、工具失败不报成功和目的港/ETA 话术防护。
+- `customer_support_dialog_details.md`：保留完整分析明细，供进一步排查使用。
+- `CUSTOMER_SUPPORT_CASE_REVIEW_PROMPT.md`：将单个关键案例交给优化 Agent 复盘、提出最小改动与测试方案的提示词模板。
+
+使用生成的 fixture 运行回归时，脚本会把写工具替换为本地替身，不会执行真实船位或静态信息更新：
+
+```bash
+python scripts/hifleet_agent_regression.py \
+  --fixture-file reports/customer_support_dialogs/customer_support_regression_fixtures.json
+```
+
+对外微信客服请求适配也应通过 `POST /run` 的模拟调用验证：使用 `source_channel=wechat_kf` 和 `content.query.prompt`，替换 Agent/工具为测试替身，断言用户可见回复且不产生真实写入。
 
 先运行不产生真实写入的客服回归：
 

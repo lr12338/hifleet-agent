@@ -59,6 +59,17 @@ READ_TOOL_NAMES = [
 WRITE_TOOL_NAMES = ["upload_ship_position", "update_ship_static_info"]
 
 
+class FixtureTool:
+    """Deterministic tool substitute used by generated write-operation fixtures."""
+
+    def __init__(self, name: str, result: str):
+        self.name = name
+        self._result = result
+
+    def invoke(self, _args: dict[str, Any]) -> str:
+        return self._result
+
+
 def _mask(text: str) -> str:
     text = text or ""
     for key in ("HIFLEET_API_KEY", "api_key", "hifleet_key1", "hifleet_key2", "HIFLEET_TTSE_KEY"):
@@ -83,6 +94,40 @@ def _tool_map(include_write: bool) -> dict[str, Any]:
     names = READ_TOOL_NAMES + (WRITE_TOOL_NAMES if include_write else [])
     tools = SkillLoader.get_tools_by_names(names)
     return {tool.name: tool for tool in tools}
+
+
+def load_fixture_cases(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError(f"Fixture file must contain a JSON array: {path}")
+    cases: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict) or not item.get("id") or not item.get("query"):
+            raise ValueError(f"Invalid fixture item in {path}")
+        cases.append({
+            **item,
+            "required_substrings": list(item.get("required_substrings") or []),
+            "forbidden_substrings": list(item.get("forbidden_substrings") or []),
+            "max_latency_ms": int(item.get("max_latency_ms") or 30000),
+        })
+    return cases
+
+
+def fixture_tool_map() -> dict[str, Any]:
+    return {
+        "upload_ship_position": FixtureTool("upload_ship_position", "船位更新成功（回归替身）"),
+        "update_ship_static_info": FixtureTool("update_ship_static_info", "静态信息更新成功（回归替身）"),
+    }
+
+
+def tools_for_case(case: dict[str, Any], tools: dict[str, Any]) -> dict[str, Any]:
+    overrides = case.get("tool_overrides") or {}
+    if not isinstance(overrides, dict):
+        return tools
+    scoped_tools = dict(tools)
+    for name, result in overrides.items():
+        scoped_tools[str(name)] = FixtureTool(str(name), str(result))
+    return scoped_tools
 
 
 def _run_routed_case(case: dict[str, Any], tools: dict[str, Any]) -> dict[str, Any]:
@@ -115,10 +160,15 @@ def _run_routed_case(case: dict[str, Any], tools: dict[str, Any]) -> dict[str, A
     expected_route = case.get("expected_route")
     required = list(case.get("required_substrings") or [])
     forbidden = list(case.get("forbidden_substrings") or [])
+    expected_tools = set(case.get("expected_tools") or [])
+    forbidden_tools = set(case.get("forbidden_tools") or [])
+    called_tools = set(trace.tool_call_sequence)
     checks = {
         "route_ok": expected_route in (None, decision.route),
         "required_ok": all(_has_any(output_text, [item]) for item in required),
         "forbidden_ok": not any(_has_any(output_text, [item]) for item in forbidden),
+        "expected_tools_ok": expected_tools.issubset(called_tools),
+        "forbidden_tools_ok": not bool(forbidden_tools & called_tools),
         "no_exception": not error,
         "latency_ok": latency_ms <= int(case.get("max_latency_ms", 30000)),
     }
@@ -273,21 +323,28 @@ def main() -> int:
     parser.add_argument("--write-lon", default=None)
     parser.add_argument("--write-lat", default=None)
     parser.add_argument("--write-speed", default="0")
+    parser.add_argument("--fixture-file", default="", help="Load generated JSON fixtures; write tools are replaced with local substitutes.")
     parser.add_argument("--output", default=str(ROOT / "artifacts" / "hifleet_agent_regression_report.json"))
     args = parser.parse_args()
 
-    include_write_tools = True
-    tools = _tool_map(include_write_tools)
-    cases = build_cases(args)
-    append_write_case(cases, args)
+    fixture_file = Path(args.fixture_file) if args.fixture_file else None
+    if fixture_file:
+        tools = _tool_map(include_write=False)
+        tools.update(fixture_tool_map())
+        cases = load_fixture_cases(fixture_file)
+    else:
+        tools = _tool_map(include_write=True)
+        cases = build_cases(args)
+        append_write_case(cases, args)
 
-    results = [_run_routed_case(case, tools) for case in cases]
+    results = [_run_routed_case(case, tools_for_case(case, tools)) for case in cases]
     summary = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "query_ship": args.query_ship,
         "query_mmsi": args.query_mmsi,
         "update_mmsi": args.update_mmsi,
         "include_write": args.include_write,
+        "fixture_file": str(fixture_file) if fixture_file else "",
         "total": len(results),
         "passed": sum(1 for item in results if item["passed"]),
         "failed": sum(1 for item in results if not item["passed"]),
