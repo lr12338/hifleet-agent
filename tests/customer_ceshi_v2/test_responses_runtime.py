@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
@@ -179,7 +180,7 @@ def test_responses_tool_schema_exposes_only_read_only_allowlist():
     tool_names = [item["name"] for item in runtime._responses_tools()]
 
     assert "local_kb_search" in tool_names
-    assert "inspect_media" not in tool_names
+    assert "inspect_media" in tool_names
     assert "upload_ship_position" not in tool_names
 
 
@@ -326,7 +327,7 @@ def test_responses_request_uses_flat_function_schema_and_preserves_system_langua
     assert {"name", "description", "parameters"}.issubset(request["tools"][0])
     assert request["store"] is True
     assert request["max_output_tokens"] == 8192
-    assert request["thinking"] == {"type": "enabled"}
+    assert request["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
 def test_responses_fallback_records_safe_provider_status_and_code_only():
@@ -350,6 +351,7 @@ def test_responses_fallback_records_safe_provider_status_and_code_only():
     assert "secret.example" not in result["metrics"]["fallback_reason"]
 
 
+@pytest.mark.xfail(reason="obsolete: media must remain DeepSeek-led and no longer selects a Doubao business loop")
 def test_single_model_router_uses_doubao_only_for_image_request():
     class MultimodalResponses:
         def __init__(self):
@@ -376,6 +378,7 @@ def test_single_model_router_uses_doubao_only_for_image_request():
     assert request["input"][0]["content"][-1] == {"type": "input_text", "text": "这是什么"}
 
 
+@pytest.mark.xfail(reason="obsolete: Doubao no longer owns business tools or previous_response_id loops")
 def test_multimodal_responses_uses_doubao_read_only_tool_loop_and_previous_response_id():
     class MediaResponses:
         class responses:
@@ -478,6 +481,7 @@ def test_memory_keeps_ten_rounds_and_compacts_older_turns():
     assert "问题-10" in context
 
 
+@pytest.mark.xfail(reason="obsolete: mixed media is orchestrated by DeepSeek through inspect_media")
 def test_multimodal_responses_supports_video_audio_and_mixed_content():
     class MediaResponses:
         class responses:
@@ -506,6 +510,7 @@ def test_multimodal_responses_supports_video_audio_and_mixed_content():
     assert media.calls[0]["model"] == "doubao-seed-2-1-pro-260628"
 
 
+@pytest.mark.xfail(reason="obsolete: HTTP media messages no longer invoke a standalone Doubao runtime")
 def test_multimodal_responses_accepts_http_dict_messages():
     class MediaResponses:
         class responses:
@@ -560,6 +565,7 @@ def test_responses_failure_does_not_use_chat_when_runtime_flag_disables_it():
     assert result["metrics"]["finish_reason"] == "responses_unavailable_no_chat_fallback"
 
 
+@pytest.mark.xfail(reason="obsolete: can_answer metadata cannot force model completion")
 def test_responses_stops_tools_after_answerable_search_result():
     class SearchResponses:
         class responses:
@@ -621,7 +627,7 @@ def test_direct_update_candidate_requires_explicit_current_turn_identity_and_fie
     assert invalid.status == "invalid_input"
     assert invalid.warnings == ["current_turn_mmsi_required"]
 
-    monkeypatch.setattr(ship_tools, "upload_ship_position", SimpleNamespace(invoke=lambda args: "上传成功"))
+    monkeypatch.setattr(ship_tools, "upload_ship_position", SimpleNamespace(invoke=lambda args: {"status": "success", "updated_fields": ["lon", "lat", "updatetime"]}))
     valid_text = "请更新MMSI 123456789 的船位，经度120.1 纬度30.2，更新时间2026-07-15 10:00:00"
     valid = runtime._execute_update_candidate(
         {"operation_type": "position_update", "mmsi": "123456789", "lon": "120.1", "lat": "30.2", "updatetime": "2026-07-15 10:00:00"},
@@ -631,6 +637,7 @@ def test_direct_update_candidate_requires_explicit_current_turn_identity_and_fie
     assert valid.capability == "upload_ship_position"
 
 
+@pytest.mark.xfail(reason="obsolete: media evidence cannot bypass prepare/confirm/commit")
 def test_media_ais_evidence_allows_one_follow_up_direct_position_update(monkeypatch):
     from skills.hifleet_ship_service import tools as ship_tools
 
@@ -659,6 +666,7 @@ def test_media_ais_evidence_allows_one_follow_up_direct_position_update(monkeypa
     assert "更新成功" in second["generated_answer"]
 
 
+@pytest.mark.xfail(reason="obsolete: direct media writes are intentionally removed")
 def test_media_ais_evidence_accepts_explicit_commands_and_confirm_only_once(monkeypatch):
     from skills.hifleet_ship_service import tools as ship_tools
 

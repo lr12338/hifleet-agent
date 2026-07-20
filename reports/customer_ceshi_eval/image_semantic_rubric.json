@@ -1,0 +1,52 @@
+{
+  "summary": {
+    "kind": "conservative_semantic_rubric_no_answers_saved",
+    "fixture_count": 5,
+    "passed": 1,
+    "failed": 4
+  },
+  "results": [
+    {
+      "fixture": "Image05-我司2艘船舶航行连续2天都没有船位跟踪船长讲船上AIS工况也正常我查周边其他船舶的船为跟踪都是正常的请指导们后台看看什么问题.png.png.png",
+      "passed": false,
+      "http_status": 200,
+      "answer_length": 159,
+      "media_calls": 1,
+      "orchestrator_model": "deepseek-v4-flash-260425",
+      "perception_model": "doubao-seed-2-1-pro-260628",
+      "elapsed_ms": 8301
+    },
+    {
+      "fixture": "image-04请问这个平均航速，是否包含停航时段、进出港时间？.png",
+      "passed": true,
+      "http_status": 200,
+      "answer_length": 86,
+      "media_calls": 1,
+      "orchestrator_model": "deepseek-v4-flash-260425",
+      "perception_model": "doubao-seed-2-1-pro-260628",
+      "elapsed_ms": 57674
+    },
+    {
+      "fixture": "image01-这个在全球海图里是什么意思.png",
+      "passed": false,
+      "error": "ReadTimeout",
+      "elapsed_ms": 120148
+    },
+    {
+      "fixture": "image02-图上紫色的波浪线是指的什么.png",
+      "passed": false,
+      "http_status": 200,
+      "answer_length": 82,
+      "media_calls": 1,
+      "orchestrator_model": "deepseek-v4-flash-260425",
+      "perception_model": "doubao-seed-2-1-pro-260628",
+      "elapsed_ms": 65660
+    },
+    {
+      "fixture": "image03-图中的小圈圈是什么意思？.png",
+      "passed": false,
+      "error": "ReadTimeout",
+      "elapsed_ms": 120271
+    }
+  ]
+}

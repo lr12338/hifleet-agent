@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import re
 import threading
@@ -8,19 +9,25 @@ import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
+from pydantic import ValidationError
 
 from llm_gateway import build_chat_model, resolve_role_base_url, safe_default_headers
 
-from agents.customer_ceshi_v2.contracts import MediaAsset, Observation, ToolCall
+from agents.customer_ceshi_v2.contracts import InspectMediaRequest, MediaAsset, Observation, PerceptionPacket, ToolCall
 from agents.customer_ceshi_v2.tools import CapabilityRegistry, DENIED_TOOL_NAMES
 from agents.profiles import read_profile_prompt
 from agents.customer_ceshi_v2.tracing import safe_trace
+from agents.customer_ceshi_responses.ship_updates import PositionNormalizer, ShipIdentityNormalizer, ShipUpdateDraftStore, StaticFieldNormalizer, TimeNormalizer
+from agents.customer_ceshi_responses.claim_guard import guard_claims, limit_reply
+from agents.customer_ceshi_responses.scenarios import classify as classify_scenario
 
 
 CHECKPOINT_NAMESPACE = "customer_ceshi_responses"
@@ -31,12 +38,17 @@ READ_ONLY_TOOL_NAMES = {
     "local_kb_search", "web_search", "web_search_agent_browser", "verify_public_page", "agent_browser_deep_search",
     "ship_search", "get_ship_position", "get_ship_archive", "get_psc_records", "get_ship_trajectory",
     "get_ship_call_ports", "get_ship_voyages", "get_last_departure", "get_current_stop", "search_ports", "get_port_detail",
+    "inspect_media",
 }
 UPDATE_CANDIDATE_TOOL_NAME = "submit_ship_update_candidate"
+PREPARE_SHIP_UPDATE_TOOL_NAME = "prepare_ship_update"
+COMMIT_SHIP_UPDATE_TOOL_NAME = "commit_ship_update"
+CANCEL_SHIP_UPDATE_TOOL_NAME = "cancel_ship_update"
 MEDIA_UPDATE_EVIDENCE_TOOL_NAME = "record_media_update_candidate"
 _SEARCH_TOOL_NAMES = {"local_kb_search", "web_search", "web_search_agent_browser", "verify_public_page", "agent_browser_deep_search"}
 _UPDATE_INTENT = re.compile(r"(?:上传|更新|修改|补充|更正|录入).{0,24}(?:船位|位置|航速|航向|静态信息|船名|imo|呼号|船型|目的港|eta|吃水)|(?:船位|位置|航速|航向|静态信息|船名|imo|呼号|船型|目的港|eta|吃水).{0,24}(?:上传|更新|修改|补充|更正|录入)", re.I)
 _MEDIA_UPDATE_COMMAND = re.compile(r"(?:更新|上传|修改|更正|录入).{0,24}(?:船位|位置|ais|数据)?|(?:根据|按).{0,24}(?:图片|上图|附件|ais).{0,24}(?:更新|上传|修改)", re.I)
+_POSITION_UPDATE_TIME = re.compile(r"\d{4,5}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:?\d{2}(?::\d{2})?(?:\s*\(?UTC(?:[+-]\d{1,2})?\)?)?", re.I)
 _CONFIRM_ONLY = re.compile(r"^(?:请)?(?:确认|确认执行|执行确认|好的确认|好，?确认)$", re.I)
 _PLACEHOLDER_VALUE = re.compile(r"^(?:--|—|－|n/?a|未知|无|null|none)$", re.I)
 _MEDIA_UPDATE_FIELDS = (
@@ -585,6 +597,19 @@ def _update_candidate_schema(*, responses: bool) -> dict[str, Any]:
     return item if responses else {"type": "function", "function": {key: value for key, value in item.items() if key != "type"}}
 
 
+def _ship_update_transaction_schemas(*, responses: bool) -> list[dict[str, Any]]:
+    definitions = [
+        (PREPARE_SHIP_UPDATE_TOOL_NAME, "Prepare a ship-update draft. Never commits a write.", {"operation_type": {"type": "string", "enum": ["position_update", "static_update"]}, "mmsi": {"type": "string"}, "longitude": {"type": "string"}, "latitude": {"type": "string"}, "updatetime": {"type": "string"}, "fields": {"type": "object"}}, ["operation_type"]),
+        (COMMIT_SHIP_UPDATE_TOOL_NAME, "Commit only the current session's explicitly confirmed draft. The user never needs to know a draft ID.", {"draft_id": {"type": "string", "description": "Optional internal draft ID when available."}, "confirmed": {"type": "boolean"}}, ["confirmed"]),
+        (CANCEL_SHIP_UPDATE_TOOL_NAME, "Cancel the current session's pending ship-update draft.", {}, []),
+    ]
+    items = []
+    for name, description, properties, required in definitions:
+        item = {"type": "function", "name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}
+        items.append(item if responses else {"type": "function", "function": {key: value for key, value in item.items() if key != "type"}})
+    return items
+
+
 def _media_update_evidence_schema() -> dict[str, Any]:
     """Internal-only media evidence recorder exposed to the Doubao Responses loop."""
     properties = {
@@ -654,6 +679,170 @@ def _media_schema() -> dict[str, Any]:
     }
 
 
+class ResponsesMediaPerception:
+    """Restricted Doubao adapter used exclusively by DeepSeek's inspect_media tool."""
+
+    def __init__(self, client: Any | None, config: dict[str, Any]) -> None:
+        self.client = client
+        self.config = config
+        self.model = str(_responses_settings(config, "doubao").get("image_video", {}).get("model") or _responses_settings(config, "doubao").get("model") or "")
+
+    @staticmethod
+    def _normalize_packet_payload(payload: dict[str, Any], asset: MediaAsset, request: InspectMediaRequest) -> dict[str, Any]:
+        normalized = dict(payload)
+        factual_summary = normalized.get("factual_summary", "")
+        if isinstance(factual_summary, (dict, list)):
+            factual_summary = json.dumps(factual_summary, ensure_ascii=False, separators=(",", ":"))
+        normalized["factual_summary"] = str(factual_summary or "")
+        confidence = normalized.get("overall_confidence", "low")
+        if isinstance(confidence, (int, float)):
+            confidence = "high" if confidence >= 0.8 else "medium" if confidence >= 0.5 else "low"
+        normalized["overall_confidence"] = str(confidence).lower() if str(confidence).lower() in {"high", "medium", "low"} else "low"
+        fields = normalized.get("fields", [])
+        if isinstance(fields, dict):
+            fields = [{"name": name, "value": value} for name, value in fields.items()]
+        if not isinstance(fields, list):
+            fields = []
+        normalized_fields: list[dict[str, Any]] = []
+        for item in fields:
+            if isinstance(item, str):
+                item = {"name": "observed_detail", "value": item}
+            if not isinstance(item, dict):
+                continue
+            field = dict(item)
+            field["name"] = str(field.get("name") or "observed_detail")
+            field["asset_id"] = str(field.get("asset_id") or asset.asset_id)
+            field["status"] = str(field.get("status") or "observed").lower()
+            if field["status"] not in {"observed", "inferred", "uncertain", "placeholder", "conflict"}:
+                field["status"] = "uncertain"
+            field["confidence"] = str(field.get("confidence") or "medium").lower()
+            if field["confidence"] not in {"high", "medium", "low"}:
+                field["confidence"] = "low"
+            normalized_fields.append(field)
+        normalized["fields"] = normalized_fields
+        for key in ("ocr_blocks", "visual_objects", "entities", "transcript", "events", "evidence_refs"):
+            value = normalized.get(key, [])
+            normalized[key] = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+        for key in ("visual_features", "limitations", "unresolved_questions", "conflicts"):
+            value = normalized.get(key, [])
+            normalized[key] = [
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")) if isinstance(item, (dict, list)) else str(item)
+                for item in value
+                if item is not None
+            ] if isinstance(value, list) else []
+        normalized.update({
+            "asset_id": asset.asset_id,
+            "media_type": asset.kind,
+            "requested_objective": request.objective,
+            "requested_questions": request.questions,
+        })
+        return normalized
+
+    @staticmethod
+    def _file_name(asset: MediaAsset) -> str:
+        if asset.filename:
+            return re.sub(r"[^A-Za-z0-9._-]+", "_", asset.filename)[-160:] or "attachment"
+        path_name = urlparse(asset.url).path.rsplit("/", 1)[-1]
+        if path_name:
+            return re.sub(r"[^A-Za-z0-9._-]+", "_", path_name)[-160:] or "attachment"
+        extension = {"image": ".png", "video": ".mp4", "audio": ".wav"}.get(asset.kind, "")
+        return f"attachment{extension}"
+
+    def _upload_for_perception(self, asset: MediaAsset, settings: dict[str, Any]) -> str:
+        max_bytes = max(1_048_576, int(settings.get("upload_max_bytes", 32 * 1024 * 1024)))
+        timeout_seconds = max(5, int(settings.get("upload_timeout_seconds", 45)))
+        request = Request(asset.url, headers={"User-Agent": "customer-ceshi-media-perception/1.0"})
+        with urlopen(request, timeout=timeout_seconds) as source:
+            content_length = source.headers.get("Content-Length")
+            if content_length and int(content_length) > max_bytes:
+                raise ValueError("media_attachment_too_large")
+            content = source.read(max_bytes + 1)
+            content_type = source.headers.get_content_type() or mimetypes.guess_type(self._file_name(asset))[0] or "application/octet-stream"
+        if not content:
+            raise ValueError("media_attachment_empty")
+        if len(content) > max_bytes:
+            raise ValueError("media_attachment_too_large")
+        created = self.client.files.create(
+            file=(self._file_name(asset), content, content_type),
+            purpose="user_data",
+        )
+        file_id = str(getattr(created, "id", "") or (created.get("id", "") if isinstance(created, dict) else ""))
+        if not file_id:
+            raise RuntimeError("media_file_upload_missing_id")
+        status = str(getattr(created, "status", "") or (created.get("status", "") if isinstance(created, dict) else "")).lower()
+        deadline = time.monotonic() + timeout_seconds
+        while status == "processing" and time.monotonic() < deadline:
+            time.sleep(0.5)
+            created = self.client.files.retrieve(file_id)
+            status = str(getattr(created, "status", "") or (created.get("status", "") if isinstance(created, dict) else "")).lower()
+        if status in {"failed", "error", "cancelled", "canceled", "processing"}:
+            raise RuntimeError(f"media_file_processing_{status or 'unknown'}")
+        return file_id
+
+    def _delete_uploaded_file(self, file_id: str) -> None:
+        try:
+            self.client.files.delete(file_id)
+        except Exception:
+            pass
+
+    def inspect(self, asset: MediaAsset, request: InspectMediaRequest) -> PerceptionPacket | Observation:
+        if self.client is None:
+            return Observation(status="upstream_error", capability="inspect_media", warnings=["media_perception_unavailable"], retry_allowed=True)
+        settings = _responses_settings(self.config, "doubao")
+        model_settings = dict(settings.get("image_video") or {}) if asset.kind in {"image", "video"} else dict(settings.get("audio") or {})
+        model = str(model_settings.get("model") or settings.get("model") or self.model)
+        content: list[dict[str, Any]] = [{
+            "type": "input_text",
+            "text": (
+                "你是多模态感知组件，不是客服 Agent。只返回 JSON："
+                "asset_id、media_type、model、requested_objective、requested_questions、factual_summary、"
+                "ocr_blocks、visual_objects、entities、fields、visual_features、overall_confidence、limitations。"
+                "只记录明确可见/可听内容；区分 observed、inferred、uncertain、placeholder、conflict；"
+                "若附件带有箭头、圆圈、方框、荧光笔等人工标注，必须优先观察这些标注指向或圈出的区域，"
+                "分别记录标注样式、被标注对象、附近文字、所在页面/图层和空间关系；不得因截图整体复杂而忽略标注区域。"
+                "对海图或地图截图，factual_summary必须说明可见图层、图例/控件、标注对象与周边船舶/区域的关系；"
+                "不得回答产品规则、不得调用工具、不得执行更新、不得生成客服话术。\n"
+                + json.dumps(request.model_dump(), ensure_ascii=False)
+            ),
+        }]
+        if asset.kind not in {"image", "video", "audio"}:
+            return Observation(status="invalid_input", capability="inspect_media", warnings=["unsupported_media_type"], retry_allowed=False)
+        uploaded_file_id = ""
+        try:
+            uploaded_file_id = self._upload_for_perception(asset, settings)
+            media_item: dict[str, Any] = {"type": f"input_{asset.kind}", "file_id": uploaded_file_id}
+            if asset.kind == "image":
+                media_item["detail"] = str(settings.get("image_detail", "high"))
+            elif asset.kind == "video":
+                media_item["fps"] = float(settings.get("video_fps", 1))
+            content.append(media_item)
+            response = self.client.responses.create(
+                model=model,
+                input=[{"role": "user", "content": content}],
+                store=True,
+                max_output_tokens=min(int(settings.get("max_output_tokens", 2048)), 2048),
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            raw = NativeToolRuntime._responses_text(response)
+            parsed = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            parsed = self._normalize_packet_payload(parsed, asset, request)
+            parsed["model"] = model
+            return PerceptionPacket.model_validate(parsed)
+        except ValidationError as exc:
+            invalid_paths = [".".join(str(part) for part in error.get("loc") or ()) for error in exc.errors()]
+            return Observation(
+                status="upstream_error",
+                capability="inspect_media",
+                warnings=[f"media_perception_packet_invalid:{','.join(invalid_paths[:6]) or 'unknown'}"],
+                retry_allowed=True,
+            )
+        except Exception as exc:
+            return Observation(status="upstream_error", capability="inspect_media", warnings=[f"media_perception_error:{_provider_error_summary(exc)}"], retry_allowed=True)
+        finally:
+            if uploaded_file_id:
+                self._delete_uploaded_file(uploaded_file_id)
+
+
 class NativeToolRuntime:
     def __init__(self, *, client: Any, registry: CapabilityRegistry, perception: Any = None, config: dict[str, Any], mode: str, responses_client: Any | None = None, profile_prompt: str = "") -> None:
         self.client = client
@@ -669,14 +858,21 @@ class NativeToolRuntime:
         self.max_steps = int(config.get("customer_ceshi_max_steps", config.get("customer_ceshi_v2_max_steps", DEFAULT_MAX_STEPS)))
         self.max_tool_calls = int(config.get("customer_ceshi_max_tool_calls", config.get("customer_ceshi_v2_max_tool_calls", 8)))
         self.max_media_calls = int(config.get("customer_ceshi_max_media_calls", config.get("customer_ceshi_v2_max_media_calls", 4)))
+        draft_path = _nested_config(config, "customer_ceshi_runtime", "direct_updates").get("draft_store_path")
+        self.drafts = ShipUpdateDraftStore(draft_path)
+        self.dry_run_writes = bool(_nested_config(config, "customer_ceshi_runtime", "direct_updates").get("dry_run", False))
+        self._active_scenario = None
 
-    def _bound_client(self) -> Any:
+    def _bound_client(self, *, exclude_media: bool = False) -> Any:
         tools = [_tool_schema(tool) for name, tool in self.registry._tools.items() if name in READ_ONLY_TOOL_NAMES]
-        if self.direct_updates_enabled:
-            tools.append(_update_candidate_schema(responses=False))
+        if self.perception is not None and not exclude_media:
+            tools.append(_media_schema())
+        tools.extend(_ship_update_transaction_schemas(responses=False))
+        if self._active_scenario is not None:
+            tools = [tool for tool in tools if tool["function"]["name"] in self._active_scenario.allowed_tools]
         return self.client.bind_tools(tools)
 
-    def _responses_tools(self) -> list[dict[str, Any]]:
+    def _responses_tools(self, *, inspect_only: bool = False, exclude_media: bool = False) -> list[dict[str, Any]]:
         chat_schemas = [_tool_schema(tool) for name, tool in self.registry._tools.items() if name in READ_ONLY_TOOL_NAMES]
         tools = [
             {
@@ -687,8 +883,18 @@ class NativeToolRuntime:
             }
             for schema in chat_schemas
         ]
-        if self.direct_updates_enabled:
-            tools.append(_update_candidate_schema(responses=True))
+        if self.perception is not None and not exclude_media:
+            tools.append({
+                "type": "function",
+                "name": _media_schema()["function"]["name"],
+                "description": _media_schema()["function"]["description"],
+                "parameters": _media_schema()["function"]["parameters"],
+            })
+        tools.extend(_ship_update_transaction_schemas(responses=True))
+        if self._active_scenario is not None:
+            tools = [tool for tool in tools if tool["name"] in self._active_scenario.allowed_tools]
+        if inspect_only:
+            tools = [tool for tool in tools if tool["name"] == "inspect_media"]
         return tools
 
     def _responses_request_options(self) -> dict[str, Any]:
@@ -700,14 +906,17 @@ class NativeToolRuntime:
             "top_p": values.get("top_p", self.config.get("top_p", 0.9)),
             "tool_choice": values.get("tool_choice", "auto"),
         }
+        extra_body: dict[str, Any] = {}
         thinking = values.get("thinking")
         if isinstance(thinking, dict):
-            options["thinking"] = thinking
+            extra_body["thinking"] = thinking
         elif str(values.get("thinking_type", self.config.get("thinking_type", "enabled"))) == "enabled":
-            options["thinking"] = {"type": "enabled"}
-        reasoning_effort = values.get("reasoning_effort", self.config.get("reasoning_effort"))
-        if reasoning_effort:
-            options["reasoning_effort"] = reasoning_effort
+            extra_body["thinking"] = {"type": "enabled"}
+        context_management = values.get("context_management")
+        if isinstance(context_management, dict) and context_management.get("edits"):
+            extra_body["context_management"] = context_management
+        if extra_body:
+            options["extra_body"] = extra_body
         return {key: value for key, value in options.items() if value is not None}
 
     def _responses_create(self, request: dict[str, Any]) -> Any:
@@ -715,7 +924,7 @@ class NativeToolRuntime:
         try:
             return self.responses_client.responses.create(**request)
         except Exception:
-            optional = {"store", "max_output_tokens", "temperature", "top_p", "tool_choice", "thinking", "reasoning_effort"}
+            optional = {"store", "max_output_tokens", "temperature", "top_p", "tool_choice", "extra_body"}
             reduced = {key: value for key, value in request.items() if key not in optional}
             if len(reduced) == len(request):
                 raise
@@ -937,64 +1146,246 @@ class NativeToolRuntime:
             return self._write_observation("update_ship_static_info", raw, {"mmsi": mmsi, **provided})
         return Observation(status="invalid_input", capability=UPDATE_CANDIDATE_TOOL_NAME, warnings=["unsupported_operation_type"], retry_allowed=False)
 
+    def _draft_operation(self, name: str, arguments: dict[str, Any], session_key: str) -> Observation:
+        if name == CANCEL_SHIP_UPDATE_TOOL_NAME:
+            self.drafts.cancel(session_key)
+            return Observation(status="success", capability=name, facts=["已取消当前待确认的更新草稿。"], retry_allowed=False)
+        if name == COMMIT_SHIP_UPDATE_TOOL_NAME:
+            draft = self.drafts.get(session_key)
+            supplied_draft_id = str(arguments.get("draft_id") or "")
+            if draft is None or (supplied_draft_id and supplied_draft_id != draft.draft_id) or arguments.get("confirmed") is not True:
+                return Observation(status="invalid_input", capability=name, warnings=["explicit_current_draft_confirmation_required"], retry_allowed=False)
+            if self.dry_run_writes:
+                return Observation(
+                    status="partial",
+                    capability=name,
+                    facts=["更新草稿已通过 dry-run 校验；未执行生产写入。"],
+                    data={"adapter_status": "accepted", "dry_run": True, "transaction_id": f"dryrun:{draft.draft_id}", "draft_id": draft.draft_id},
+                    warnings=["dry_run_no_production_write"],
+                    retry_allowed=False,
+                )
+            return Observation(status="forbidden", capability=name, warnings=["write_adapter_not_enabled"], facts=["草稿已确认，但当前环境未启用写入 Adapter，因此未执行更新。"], retry_allowed=False)
+        operation = str(arguments.get("operation_type") or "")
+        target = {"mmsi": str(arguments.get("mmsi") or "").strip()}
+        fields = dict(arguments.get("fields") or {})
+        for key in ("longitude", "latitude", "updatetime"):
+            if arguments.get(key) not in (None, ""):
+                fields[key] = arguments[key]
+        if operation == "position_update":
+            coordinates = PositionNormalizer().normalize(" ".join(str(fields.get(key) or "") for key in ("longitude", "latitude")))
+            if coordinates.get("confidence") == "deterministic":
+                fields["longitude"] = coordinates["longitude"]
+                fields["latitude"] = coordinates["latitude"]
+            normalized_time = TimeNormalizer().normalize(str(fields.get("updatetime") or ""))
+            if normalized_time.get("value"):
+                fields["updatetime"] = normalized_time["value"]
+        draft = self.drafts.prepare(session_key=session_key, operation_type=operation, target=target, fields=fields, field_sources={key: "current_turn_text" for key in fields})
+        return Observation(status="success", capability=name, facts=["已生成更新草稿；请核对后明确确认。"], data={"draft_id": draft.draft_id, "operation_type": draft.operation_type, "target": draft.target, "fields": draft.fields, "missing_fields": draft.missing_fields, "requires_confirmation": True, "expires_at": draft.expires_at, "draft_hash": draft.draft_hash}, retry_allowed=False)
+
+    def _prepare_text_position_update(self, text: str, session_key: str) -> Observation | None:
+        """Prepare only a complete, unambiguous current-turn position update."""
+        scenario = classify_scenario(text)
+        if scenario is None or scenario.name != "position_update":
+            return None
+        mmsi_match = re.search(r"(?<!\d)(\d{9})(?!\d)", text or "")
+        coordinates = PositionNormalizer().normalize(text)
+        time_match = _POSITION_UPDATE_TIME.search(text or "")
+        normalized_time = TimeNormalizer().normalize(time_match.group(0) if time_match else "")
+        missing: list[str] = []
+        if mmsi_match is None:
+            missing.append("9 位 MMSI")
+        if coordinates.get("confidence") != "deterministic":
+            missing.append("可识别的经纬度")
+        if not normalized_time.get("value"):
+            missing.append("可识别的更新时间")
+        if missing:
+            return Observation(
+                status="invalid_input",
+                capability=PREPARE_SHIP_UPDATE_TOOL_NAME,
+                warnings=["missing_or_invalid_position_update_fields"],
+                suggested_fix=f"请补充{'、'.join(missing)}后再生成更新草稿。",
+                retry_allowed=False,
+            )
+        if normalized_time.get("requires_confirmation"):
+            return Observation(
+                status="invalid_input",
+                capability=PREPARE_SHIP_UPDATE_TOOL_NAME,
+                warnings=["ambiguous_five_digit_year_requires_confirmation"],
+                suggested_fix="检测到五位年份时间，请明确确认正确的四位年份后再生成更新草稿。",
+                retry_allowed=False,
+            )
+        return self._draft_operation(
+            PREPARE_SHIP_UPDATE_TOOL_NAME,
+            {
+                "operation_type": "position_update",
+                "mmsi": mmsi_match.group(1),
+                "longitude": str(coordinates["original_values"]["longitude"]),
+                "latitude": str(coordinates["original_values"]["latitude"]),
+                "updatetime": str(normalized_time["value"]),
+            },
+            session_key,
+        )
+
+    def _prepare_text_static_update(self, text: str, session_key: str) -> Observation | None:
+        scenario = classify_scenario(text)
+        if scenario is None or scenario.name != "static_update":
+            return None
+        identity = ShipIdentityNormalizer().normalize(text)
+        normalized = StaticFieldNormalizer().normalize(text)
+        if not identity["mmsi"]:
+            return Observation(
+                status="invalid_input",
+                capability=PREPARE_SHIP_UPDATE_TOOL_NAME,
+                warnings=["current_turn_mmsi_required"],
+                suggested_fix="更新船舶静态信息请在当前消息提供 9 位 MMSI。",
+                retry_allowed=False,
+            )
+        fields = dict(normalized["fields"])
+        if not fields:
+            return Observation(
+                status="invalid_input",
+                capability=PREPARE_SHIP_UPDATE_TOOL_NAME,
+                warnings=["valid_static_field_required"],
+                suggested_fix="请至少提供一项有效静态字段，例如船名、IMO、船型、目的港、ETA或吃水。",
+                retry_allowed=False,
+            )
+        return self._draft_operation(
+            PREPARE_SHIP_UPDATE_TOOL_NAME,
+            {"operation_type": "static_update", "mmsi": identity["mmsi"], "fields": fields},
+            session_key,
+        )
+
+    def _prepare_text_update(self, text: str, session_key: str) -> Observation | None:
+        return self._prepare_text_position_update(text, session_key) or self._prepare_text_static_update(text, session_key)
+
     @staticmethod
     def _write_observation(capability: str, raw: Any, arguments: dict[str, Any]) -> Observation:
-        text = str(raw or "")
-        failure = any(marker in text.lower() for marker in ("失败", "错误", "invalid", "failed", "error"))
-        status = "upstream_error" if failure else "success"
-        return Observation(status=status, capability=capability, facts=[text[:1200]], data={"updated_fields": sorted(key for key, value in arguments.items() if key != "mmsi" and value), "mmsi": arguments.get("mmsi", "")}, retry_allowed=False)
+        payload = raw if isinstance(raw, dict) else {}
+        if not payload and isinstance(raw, str):
+            try:
+                candidate = json.loads(raw)
+                payload = candidate if isinstance(candidate, dict) else {}
+            except json.JSONDecodeError:
+                payload = {}
+        adapter_status = str(payload.get("status") or "unknown").lower()
+        status = "success" if adapter_status == "success" else "upstream_error"
+        message = str(payload.get("message") or payload.get("code") or raw or "write_service_did_not_return_structured_status")
+        return Observation(
+            status=status,
+            capability=capability,
+            facts=[message[:1200]],
+            data={
+                "adapter_status": adapter_status,
+                "transaction_id": str(payload.get("transaction_id") or ""),
+                "updated_fields": list(payload.get("updated_fields") or []) if adapter_status == "success" else [],
+                "mmsi": arguments.get("mmsi", ""),
+            },
+            retry_allowed=False,
+        )
 
-    def _invoke_responses(self, *, human: HumanMessage | None, messages: list[Any], assets: list[MediaAsset], context_block: str) -> tuple[str, list[dict[str, Any]], list[str], int, int, str, str]:
+    def _invoke_responses(self, *, human: HumanMessage | None, messages: list[Any], assets: list[MediaAsset], context_block: str, session_key: str) -> tuple[str, list[dict[str, Any]], list[str], int, int, str, str]:
         if self.responses_client is None:
             raise RuntimeError("responses_client_unavailable")
         user_text = _text(getattr(human, "content", ""))
         inbound_system_text = "\n".join(_text(_message_content(message)) for message in messages if isinstance(message, SystemMessage) or _message_type(message) == "system")
-        initial_input = "\n\n".join(part for part in (self._system(assets).content, inbound_system_text, context_block, user_text) if part)
+        asset_manifest = ""
+        if assets:
+            asset_manifest = "当前附件仅可通过 inspect_media 读取：" + json.dumps(
+                [{"asset_id": asset.asset_id, "type": asset.kind} for asset in assets], ensure_ascii=False
+            )
+        initial_input = "\n\n".join(part for part in (self._system(assets).content, inbound_system_text, context_block, asset_manifest, user_text) if part)
         settings = _responses_settings(self.config, "deepseek")
         request: dict[str, Any] = {
             "model": str(settings.get("model") or getattr(self.client, "model_name", "") or getattr(self.client, "model", "") or self.config.get("customer_ceshi_v2_text_model") or self.config.get("text_model")),
             "input": initial_input,
-            "tools": self._responses_tools(),
+            "tools": self._responses_tools(inspect_only=bool(assets and self.perception is not None)),
         }
         request.update(self._responses_request_options())
+        if assets and self.perception is not None:
+            request["tool_choice"] = "required"
+        elif self._active_scenario is not None and self._active_scenario.name in {"platform_operation", "membership_permissions"}:
+            request["tool_choice"] = "required"
         response = self._responses_create(request)
         self._capture_response_usage(response)
         model_calls = tool_calls = media_calls = 0
         observations: list[dict[str, Any]] = []
         names: list[str] = []
+        asset_map = {asset.asset_id: asset for asset in assets}
+        media_recovery_used = False
         search_fingerprints: set[str] = set()
         search_counts: dict[str, int] = {"local_kb_search": 0, "web_search": 0}
+        is_chart_symbol = self._active_scenario is not None and self._active_scenario.name == "multimodal_symbol"
+        tool_call_limit = 3 if is_chart_symbol else self.max_tool_calls
         current_user_text = user_text
         response_id = str(getattr(response, "id", "") or (response.get("id", "") if isinstance(response, dict) else ""))
         for _ in range(self.max_steps):
             model_calls += 1
             calls = self._responses_calls(response)
             if not calls:
+                if assets and self.perception is not None and not media_recovery_used:
+                    media_recovery_used = True
+                    recovery_observations: list[dict[str, Any]] = []
+                    for asset in assets:
+                        observation = self._execute(
+                            "inspect_media",
+                            {
+                                "asset_id": asset.asset_id,
+                                "objective": "读取当前附件中的可见事实，服务于用户当前问题。",
+                                "questions": [user_text] if user_text else [],
+                                "mode": "broad_scan",
+                            },
+                            asset_map,
+                        )
+                        media_calls += 1
+                        tool_calls += 1
+                        names.append("inspect_media")
+                        observed = observation.model_dump()
+                        observed["evidence_id"] = f"e-{len(observations) + 1}"
+                        observations.append(observed)
+                        compact = self._compact_observation(observation)
+                        compact["evidence_id"] = observed["evidence_id"]
+                        recovery_observations.append(compact)
+                    request = {
+                        "model": request["model"],
+                        "input": initial_input + "\n\n附件观察结果（仅作为事实证据）：\n" + json.dumps(recovery_observations, ensure_ascii=False),
+                        "tools": self._responses_tools(exclude_media=is_chart_symbol and media_calls >= 1),
+                        **self._responses_request_options(),
+                    }
+                    response = self._responses_create(request)
+                    self._capture_response_usage(response)
+                    response_id = str(getattr(response, "id", "") or (response.get("id", "") if isinstance(response, dict) else ""))
+                    continue
                 return self._responses_text(response), observations, names, model_calls, tool_calls, response_id, "stop"
             outputs: list[dict[str, Any]] = []
-            force_final = False
             for call in calls:
-                if force_final:
-                    observation = Observation(status="forbidden", capability=str(call["name"]), warnings=["answerable_evidence_already_available"], retry_allowed=False, suggested_fix="请基于已获得的证据直接回答用户。")
-                    observed = observation.model_dump()
-                    observed["evidence_id"] = f"e-{len(observations) + 1}"
-                    observations.append(observed)
-                    compact = self._compact_observation(observation)
-                    compact["evidence_id"] = observed["evidence_id"]
-                    outputs.append({"type": "function_call_output", "call_id": call["id"], "output": json.dumps(compact, ensure_ascii=False)})
-                    continue
-                if tool_calls >= self.max_tool_calls:
-                    return "", observations, names, model_calls, tool_calls, response_id, "tool_budget"
+                if tool_calls >= tool_call_limit:
+                    final_request = {
+                        "model": request["model"],
+                        "input": "工具调用预算已到上限。请仅基于本轮已返回的附件观察和检索证据，直接给出简洁、校准后的客户回复；不要再调用工具，也不要提及内部预算。",
+                        "tools": [],
+                        **self._responses_request_options(),
+                        "tool_choice": "none",
+                    }
+                    if response_id:
+                        final_request["previous_response_id"] = response_id
+                    final_response = self._responses_create(final_request)
+                    self._capture_response_usage(final_response)
+                    final_response_id = str(getattr(final_response, "id", "") or (final_response.get("id", "") if isinstance(final_response, dict) else ""))
+                    return self._responses_text(final_response), observations, names, model_calls + 1, tool_calls, final_response_id, "tool_budget_finalized"
                 name, arguments = call["name"], call["args"]
                 if name in DENIED_TOOL_NAMES:
                     observation = Observation(status="forbidden", capability=name, warnings=["write_tools_disabled"], retry_allowed=False)
+                elif name in {PREPARE_SHIP_UPDATE_TOOL_NAME, COMMIT_SHIP_UPDATE_TOOL_NAME, CANCEL_SHIP_UPDATE_TOOL_NAME}:
+                    observation = self._draft_operation(name, arguments, session_key)
                 elif name == UPDATE_CANDIDATE_TOOL_NAME:
-                    observation = self._execute_update_candidate(arguments, current_user_text)
-                elif name == "inspect_media" and media_calls >= self.max_media_calls:
-                    observation = Observation(status="forbidden", capability=name, warnings=["media_budget_exhausted"], retry_allowed=False)
+                    observation = Observation(status="forbidden", capability=name, warnings=["legacy_direct_update_tool_disabled"], retry_allowed=False)
+                elif name == "inspect_media" and media_calls >= (1 if is_chart_symbol else self.max_media_calls):
+                    observation = Observation(status="forbidden", capability=name, warnings=["media_budget_exhausted"], retry_allowed=False, suggested_fix="请基于当前附件观察和已有证据直接回答，不要再次读取同一附件。")
                 else:
                     fingerprint = f"{name}:{self._normalized_query(arguments)}" if name in _SEARCH_TOOL_NAMES else ""
                     limit = self.search_settings["max_local_kb_calls"] if name == "local_kb_search" else self.search_settings["max_web_calls"] if name == "web_search" else None
+                    if is_chart_symbol and name in {"local_kb_search", "web_search"}:
+                        limit = 1
                     if fingerprint and fingerprint in search_fingerprints:
                         observation = Observation(status="forbidden", capability=name, warnings=["duplicate_search_query"], retry_allowed=False, suggested_fix="请基于已有证据回答，或提出一个不同的明确证据缺口。")
                     elif limit is not None and search_counts.get(name, 0) >= limit:
@@ -1014,10 +1405,8 @@ class NativeToolRuntime:
                 compact = self._compact_observation(observation)
                 compact["evidence_id"] = observed["evidence_id"]
                 outputs.append({"type": "function_call_output", "call_id": call["id"], "output": json.dumps(compact, ensure_ascii=False)})
-                force_final = force_final or self._can_answer_from(observation)
-            request = {"model": request["model"], "input": outputs, "tools": self._responses_tools(), **self._responses_request_options()}
-            if force_final:
-                request["tool_choice"] = "none"
+                # Tool metadata can describe coverage but never decides that the model must stop.
+            request = {"model": request["model"], "input": outputs, "tools": self._responses_tools(exclude_media=is_chart_symbol and media_calls >= 1), **self._responses_request_options()}
             if response_id:
                 request["previous_response_id"] = response_id
             response = self._responses_create(request)
@@ -1026,15 +1415,71 @@ class NativeToolRuntime:
         return "", observations, names, model_calls, tool_calls, response_id, "max_steps"
 
     def _system(self, assets: list[MediaAsset]) -> SystemMessage:
+        scenario_instruction = ""
+        if self._active_scenario is not None and self._active_scenario.name == "multimodal_symbol":
+            scenario_instruction = (
+                "For a chart-symbol question with media, inspect the attachment first, then retrieve a chart legend or directly relevant product evidence "
+                "before naming the symbol. Use at most one inspect_media call and one evidence lookup; prefer local_kb_search, and use web_search only when local evidence has no relevant fact. "
+                "After those bounded calls, answer from the evidence already returned instead of repeating a tool. Visible color or shape alone is never enough to name it. "
+                "If no evidence source verifies its identity, state the uncertainty and give the one best verification step."
+            )
         return SystemMessage(content="\n\n".join(part for part in (
             self.profile_prompt,
             "You are the sole customer_ceshi orchestrator. Use the minimum tools needed. Do not emit a custom action JSON protocol or expose internal tool details. "
-            "For product knowledge, stop searching and answer after a result explicitly says it can answer or recommends answering directly. "
-            "Never repeat an equivalent search query. Only submit_ship_update_candidate may request a write; all other write tools are forbidden. "
-            "Do not claim a high-risk product capability, policy, UI element, media detail, or operation success without supporting evidence.",
+            "For product knowledge, decide yourself whether the evidence covers the user's core question; tool metadata never decides completion. "
+            "Never repeat an equivalent search query. Ship writes require an explicit prepare/confirm/commit workflow; all direct write tools are forbidden. "
+            "Do not claim a high-risk product capability, policy, UI element, media detail, or operation success without supporting evidence. "
+            "Reply in concise Chinese plain text: ordinary answers should usually be 80–180 Chinese characters; troubleshooting uses at most four lines. "
+            "For a simple greeting, respond naturally in one short sentence and do not enumerate capabilities or add a menu.",
+            scenario_instruction,
         ) if part))
 
     def _execute(self, name: str, arguments: dict[str, Any], assets: dict[str, MediaAsset]) -> Observation:
+        if self._active_scenario is not None and name not in self._active_scenario.allowed_tools:
+            return Observation(status="forbidden", capability=name, warnings=[f"tool_not_allowed_for_scenario:{self._active_scenario.name}"], retry_allowed=False)
+        if name == "inspect_media":
+            if self.perception is None:
+                return Observation(status="forbidden", capability=name, warnings=["media_perception_unavailable"], retry_allowed=False)
+            asset = assets.get(str(arguments.get("asset_id") or ""))
+            if asset is None:
+                return Observation(status="invalid_input", capability=name, warnings=["unknown_media_asset"], retry_allowed=False)
+            packet = self.perception.inspect(
+                asset,
+                InspectMediaRequest(
+                    asset_id=asset.asset_id,
+                    objective=str(arguments.get("objective") or "观察附件"),
+                    questions=[str(item) for item in arguments.get("questions", []) if item],
+                    mode=str(arguments.get("mode") or "broad_scan"),
+                    expected_fields=[str(item) for item in arguments.get("expected_fields", []) if item],
+                ),
+            )
+            if isinstance(packet, Observation):
+                return packet
+            perception_facts = [str(packet.factual_summary or "").strip()]
+            if packet.suspected_symbol:
+                perception_facts.append(f"疑似视觉对象：{packet.suspected_symbol}")
+            perception_facts.extend(str(item).strip() for item in packet.visual_features if str(item).strip())
+            for field in packet.fields[:6]:
+                value = str(field.value or field.raw_text or "").strip()
+                if value:
+                    perception_facts.append(f"观察字段 {field.name}：{value}（{field.status}/{field.confidence}）")
+            for block in packet.ocr_blocks[:4]:
+                text = str(block.get("text") or block.get("content") or block.get("value") or "").strip()
+                if text:
+                    perception_facts.append(f"OCR：{text}")
+            for item in packet.visual_objects[:4]:
+                label = str(item.get("label") or item.get("name") or item.get("type") or item.get("description") or "").strip()
+                if label:
+                    perception_facts.append(f"视觉对象：{label}")
+            return Observation(
+                status="success",
+                capability=name,
+                facts=[fact[:500] for fact in perception_facts if fact][:10],
+                data={"perception": packet.model_dump()},
+                warnings=list(packet.limitations or []),
+                sources=[f"media:{asset.asset_id}"],
+                retry_allowed=False,
+            )
         if name not in READ_ONLY_TOOL_NAMES:
             return Observation(status="forbidden", capability=name, warnings=["tool_not_in_customer_ceshi_read_only_allowlist"], retry_allowed=False)
         started = time.monotonic()
@@ -1046,13 +1491,25 @@ class NativeToolRuntime:
     @staticmethod
     def _guard(answer: str, observations: list[dict[str, Any]]) -> tuple[str, str]:
         """Keep only outcome checks that cannot be safely delegated to semantic model reasoning."""
+        accepted_writes = [
+            item for item in observations
+            if item.get("capability") == COMMIT_SHIP_UPDATE_TOOL_NAME
+            and str((item.get("data") or {}).get("adapter_status") or "").lower() in {"accepted", "pending", "unknown"}
+        ]
+        if accepted_writes:
+            return "更新请求已通过测试校验，但未执行生产写入；当前不能确认船舶信息已经更新完成。", "accepted_write_not_confirmed"
         successful_writes = [item for item in observations if item.get("capability") in {"upload_ship_position", "update_ship_static_info"} and item.get("status") == "success"]
         if _ACTION_SUCCESS_CLAIM.search(answer or "") and not successful_writes:
             return "本次更新结果尚未获得系统成功确认，请稍后查询核对或补充信息后重试。", "blocked_unconfirmed_write"
+        if _ACTION_SUCCESS_CLAIM.search(answer or "") and successful_writes:
+            return answer, "not_required"
         query_observations = [item for item in observations if item.get("capability") in _QUERY_TOOL_NAMES]
         confirmed_empty = any(item.get("status") == "not_found" for item in query_observations)
         if _NO_RESULT_CLAIM.search(answer or "") and query_observations and not confirmed_empty:
             return "当前没有获得对应查询工具的无结果反馈，暂不能确认没有数据。请提供 MMSI、查询时间或页面现象后再核验。", "blocked_unconfirmed_empty_result"
+        answer, blocked_claims = guard_claims(answer, observations)
+        if blocked_claims:
+            return answer, f"blocked_unsupported_claims:{len(blocked_claims)}"
         answerable = [
             item for item in observations
             if item.get("status") in {"success", "partial"}
@@ -1067,6 +1524,7 @@ class NativeToolRuntime:
         messages = list(payload.get("messages") or [])
         human = _latest_human(messages)
         assets = _assets(human)
+        self._active_scenario = classify_scenario(_text(getattr(human, "content", "")), has_media=bool(assets))
         asset_map = {asset.asset_id: asset for asset in assets}
         context_block = str(payload.get("_customer_ceshi_context") or "").strip()
         model_messages: list[Any] = [self._system(list(asset_map.values()))]
@@ -1084,7 +1542,7 @@ class NativeToolRuntime:
         try:
             if self.mode == "responses":
                 try:
-                    answer, observations, tool_names, model_calls, tool_calls, provider_response_id, finish_reason = self._invoke_responses(human=human, messages=messages, assets=list(asset_map.values()), context_block=context_block)
+                    answer, observations, tool_names, model_calls, tool_calls, provider_response_id, finish_reason = self._invoke_responses(human=human, messages=messages, assets=list(asset_map.values()), context_block=context_block, session_key=str(payload.get("_customer_ceshi_session_key") or "default"))
                     media_calls = sum(1 for name in tool_names if name == "inspect_media")
                     if answer:
                         answer = _wechat_position_result(_text(getattr(human, "content", "")), observations) or answer
@@ -1098,8 +1556,11 @@ class NativeToolRuntime:
                     if fallback_mode != "chat_function_calling" or not chat_enabled:
                         answer = "实验客服链的 Responses 能力暂时不可用，且当前配置未允许切换到 Chat Function Calling；未回退到生产客服链。"
                         return self._result(answer, observations, tool_names, model_calls, tool_calls, media_calls, "responses_unavailable_no_chat_fallback", "not_required", started, "", fallback_reason, provider_error)
-            model = self._bound_client()
+            is_chart_symbol = self._active_scenario is not None and self._active_scenario.name == "multimodal_symbol"
+            search_fingerprints: set[str] = set()
+            search_counts: dict[str, int] = {"local_kb_search": 0, "web_search": 0}
             for _ in range(self.max_steps):
+                model = self._bound_client(exclude_media=is_chart_symbol and media_calls >= 1)
                 response = model.invoke(model_messages)
                 model_calls += 1
                 calls = list(getattr(response, "tool_calls", []) or [])
@@ -1116,12 +1577,26 @@ class NativeToolRuntime:
                     arguments = dict(call.get("args") or call.get("arguments") or {})
                     if name in DENIED_TOOL_NAMES:
                         observation = Observation(status="forbidden", capability=name, warnings=["write_tools_disabled"], retry_allowed=False)
+                    elif name in {PREPARE_SHIP_UPDATE_TOOL_NAME, COMMIT_SHIP_UPDATE_TOOL_NAME, CANCEL_SHIP_UPDATE_TOOL_NAME}:
+                        observation = self._draft_operation(name, arguments, str(payload.get("_customer_ceshi_session_key") or "default"))
                     elif name == UPDATE_CANDIDATE_TOOL_NAME:
-                        observation = self._execute_update_candidate(arguments, _text(getattr(human, "content", "")))
-                    elif name == "inspect_media" and media_calls >= self.max_media_calls:
-                        observation = Observation(status="forbidden", capability=name, warnings=["media_budget_exhausted"], retry_allowed=False)
+                        observation = Observation(status="forbidden", capability=name, warnings=["legacy_direct_update_tool_disabled"], retry_allowed=False)
+                    elif name == "inspect_media" and media_calls >= (1 if is_chart_symbol else self.max_media_calls):
+                        observation = Observation(status="forbidden", capability=name, warnings=["media_budget_exhausted"], retry_allowed=False, suggested_fix="请基于当前附件观察和已有证据直接回答，不要再次读取同一附件。")
                     else:
-                        observation = self._execute(name, arguments, asset_map)
+                        fingerprint = f"{name}:{self._normalized_query(arguments)}" if name in _SEARCH_TOOL_NAMES else ""
+                        limit = self.search_settings["max_local_kb_calls"] if name == "local_kb_search" else self.search_settings["max_web_calls"] if name == "web_search" else None
+                        if is_chart_symbol and name in {"local_kb_search", "web_search"}:
+                            limit = 1
+                        if fingerprint and fingerprint in search_fingerprints:
+                            observation = Observation(status="forbidden", capability=name, warnings=["duplicate_search_query"], retry_allowed=False, suggested_fix="请基于已有证据直接回答，或只提出一个不同的明确证据缺口。")
+                        elif limit is not None and search_counts.get(name, 0) >= limit:
+                            observation = Observation(status="forbidden", capability=name, warnings=["search_budget_exhausted"], retry_allowed=False, suggested_fix="请基于当前检索结果直接回答。")
+                        else:
+                            observation = self._execute(name, arguments, asset_map)
+                            if fingerprint:
+                                search_fingerprints.add(fingerprint)
+                                search_counts[name] = search_counts.get(name, 0) + 1
                     if name == "inspect_media":
                         media_calls += 1
                     tool_calls += 1
@@ -1144,16 +1619,28 @@ class NativeToolRuntime:
         return self._result(answer, observations, tool_names, model_calls, tool_calls, media_calls, finish_reason, guard_result, started, "", fallback_reason, provider_error)
 
     def _result(self, answer: str, observations: list[dict[str, Any]], tool_names: list[str], model_calls: int, tool_calls: int, media_calls: int, finish_reason: str, guard_result: str, started: float, provider_response_id: str, fallback_reason: str, provider_error: str) -> dict[str, Any]:
-        answer = _wechat_plain_text(answer)
+        answer = limit_reply(_wechat_plain_text(answer))
         tool_latency_ms = sum(int((item.get("data") or {}).get("tool_latency_ms", 0)) for item in observations)
+        media_observations = [item for item in observations if item.get("capability") == "inspect_media"]
+        media_statuses = sorted({str(item.get("status") or "unknown") for item in media_observations})
+        media_error_codes = sorted({
+            str(warning)[:160]
+            for item in media_observations
+            if str(item.get("status") or "") != "success"
+            for warning in list(item.get("warnings") or [])
+        })[:4]
         metrics = {
             "runtime_mode": "chat_function_calling" if fallback_reason else self.mode,
             "requested_runtime_mode": self.mode,
+            "effective_runtime": "chat_function_calling" if fallback_reason else self.mode,
             "orchestrator_model": str(getattr(self.client, "model_name", "") or getattr(self.client, "model", "")),
-            "perception_model": str(getattr(getattr(self.perception, "client", None), "model", "")),
+            "perception_model": str(getattr(self.perception, "model", "") or getattr(getattr(self.perception, "client", None), "model", "")),
             "model_calls": model_calls,
             "tool_calls": tool_calls,
+            "tool_names": list(tool_names),
             "media_calls": media_calls,
+            "media_statuses": media_statuses,
+            "media_error_codes": media_error_codes,
             "cache_hits": self._last_response_usage.get("cache_hits", 0),
             "latency_ms": int((time.monotonic() - started) * 1000),
             "tool_latency_ms": tool_latency_ms,
@@ -1166,6 +1653,9 @@ class NativeToolRuntime:
             "fallback_reason": fallback_reason,
             "provider_error": provider_error,
             "guard_result": guard_result,
+            "response_id_suffix": provider_response_id[-12:] if provider_response_id else "",
+            "output_length": len(answer),
+            "scenario": self._active_scenario.name if self._active_scenario is not None else "",
         }
         trace = safe_trace({"agent": "customer_ceshi_responses", "checkpoint_namespace": CHECKPOINT_NAMESPACE, "runtime_mode": self.mode, "provider_response_id": provider_response_id[-12:] if provider_response_id else "", "tool_calls": tool_names, "observations": observations, "metrics": metrics})
         degraded = finish_reason.startswith("error:") or finish_reason.startswith("responses_unavailable")
@@ -1228,7 +1718,7 @@ class SingleModelCustomerCeshiRuntime:
             if not isinstance(part, dict):
                 continue
             part_type = str(part.get("type") or "")
-            detail = part.get(part_type) if part_type in {"image_url", "video_url", "audio_url"} else None
+            detail = part.get(part_type) if part_type in {"image_url", "video_url", "audio_url", "input_audio"} else None
             detail = detail if isinstance(detail, dict) else {}
             url = str(detail.get("url") or "").strip()
             if not url:
@@ -1246,7 +1736,7 @@ class SingleModelCustomerCeshiRuntime:
                     raise ValueError("customer_ceshi video_fps must be between 0.2 and 5")
                 content.append({"type": "input_video", "video_url": url, "fps": fps})
                 kinds.append("video")
-            elif part_type == "audio_url":
+            elif part_type in {"audio_url", "input_audio"}:
                 content.append({"type": "input_audio", "audio_url": url})
                 kinds.append("audio")
         user_text = _text(raw)
@@ -1331,12 +1821,13 @@ class SingleModelCustomerCeshiRuntime:
             return self.multimodal_responses_client.responses.create(**reduced)
 
     def _result(self, *, answer: str, status: str, started: float, model: str, media_types: list[str], memory_rounds: int, context_compacted: bool, finish_reason: str, usage: dict[str, Any] | None = None, provider_error: str = "", observations: list[dict[str, Any]] | None = None, tool_names: list[str] | None = None, model_calls: int | None = None, tool_calls: int | None = None, provider_response_id: str = "", fallback_reason: str = "", media_response_text: str = "", media_candidate_status: str = "not_requested") -> dict[str, Any]:
-        answer = _wechat_plain_text(answer, media_fallback="我暂时无法从该附件中读取足够信息，请上传更清晰的文件或补充文字说明。")
+        answer = limit_reply(_wechat_plain_text(answer, media_fallback="我暂时无法从该附件中读取足够信息，请上传更清晰的文件或补充文字说明。"))
         observations = list(observations or [])
         tool_names = list(tool_names or [])
         metrics = {
             "runtime_mode": "multimodal_responses",
             "requested_runtime_mode": "multimodal_responses",
+            "effective_runtime": "multimodal_responses",
             "orchestrator_model": model,
             "perception_model": "",
             "model_calls": model_calls if model_calls is not None else (1 if status == "success" else 0),
@@ -1346,11 +1837,15 @@ class SingleModelCustomerCeshiRuntime:
             "finish_reason": finish_reason,
             "guard_result": "not_required",
             "context_rounds": memory_rounds,
+            "context_turns": memory_rounds,
             "context_compacted": context_compacted,
             "provider_error": provider_error,
             "fallback_reason": fallback_reason,
             "media_response_text": "present" if media_response_text.strip() else "empty",
             "media_candidate_status": media_candidate_status,
+            "response_id_suffix": provider_response_id[-12:] if provider_response_id else "",
+            "output_length": len(answer),
+            "scenario": "multimodal_symbol" if media_types else "",
             **(usage or {}),
         }
         trace = safe_trace({
@@ -1403,17 +1898,20 @@ class SingleModelCustomerCeshiRuntime:
         metrics = {
             "runtime_mode": "media_update_preflight",
             "requested_runtime_mode": "media_update_preflight",
+            "effective_runtime": "media_update_preflight",
             "orchestrator_model": "",
             "perception_model": "",
             "model_calls": 0,
             "tool_calls": 1,
             "media_calls": 0,
             "context_rounds": 0,
+            "context_turns": 0,
             "context_compacted": False,
             "finish_reason": observation.status,
             "guard_result": "not_required",
             "media_update_evidence": True,
             "provider_error": "",
+            "response_id_suffix": "",
         }
         trace = safe_trace({"agent": "customer_ceshi_responses", "checkpoint_namespace": CHECKPOINT_NAMESPACE, "runtime_mode": "media_update_preflight", "tool_calls": [UPDATE_CANDIDATE_TOOL_NAME], "observations": [observation.model_dump()], "metrics": metrics})
         return {"phase": "done", "status": "success" if observation.status == "success" else "degraded", "generated_answer": answer, "messages": [AIMessage(content=answer)], "generated_tool_calls": [UPDATE_CANDIDATE_TOOL_NAME], "observations": [observation.model_dump()], "metrics": metrics, "route_trace": trace}
@@ -1573,23 +2071,96 @@ class SingleModelCustomerCeshiRuntime:
         messages = list(payload.get("messages") or [])
         human = _latest_human(messages)
         assets = _assets(human)
+        self.text_runtime._active_scenario = classify_scenario(_text(getattr(human, "content", "")), has_media=bool(assets))
         session_key = _session_key(payload, config)
         context_block, memory_rounds, context_compacted = self.memory.render(session_key)
-        if assets:
-            return self._invoke_multimodal(messages, human, assets, session_key, context_block, memory_rounds, context_compacted)
+        # DeepSeek remains the business orchestrator even when attachments are present.
+        # Doubao is available only through NativeToolRuntime.inspect_media.
+        confirmation_text = _text(getattr(human, "content", "")).strip().strip("。！？!?，,；;")
+        draft_session_key = f"customer_ceshi:{session_key}"
+        if _CONFIRM_ONLY.fullmatch(confirmation_text) and self.text_runtime.drafts.get(draft_session_key) is not None:
+            started = time.monotonic()
+            observation = self.text_runtime._draft_operation(
+                COMMIT_SHIP_UPDATE_TOOL_NAME,
+                {"confirmed": True},
+                draft_session_key,
+            )
+            if observation.status == "partial":
+                answer = "更新请求已通过测试校验，但未执行生产写入；当前不能确认船舶信息已经更新完成。"
+                guard_result = "accepted_write_not_confirmed"
+            elif observation.status == "invalid_input":
+                answer = "当前没有可确认的有效更新草稿，请先提供需要更新的船舶信息。"
+                guard_result = "no_pending_draft"
+            else:
+                answer = "当前更新草稿未能提交，请核对草稿状态后重试。"
+                guard_result = "draft_commit_not_completed"
+            result = self.text_runtime._result(
+                answer,
+                [observation.model_dump()],
+                [COMMIT_SHIP_UPDATE_TOOL_NAME],
+                0,
+                1,
+                0,
+                "stop",
+                guard_result,
+                started,
+                "",
+                "",
+                "",
+            )
+            result["metrics"].update({"context_rounds": memory_rounds, "context_turns": memory_rounds, "context_compacted": context_compacted, "update_draft_status": str((observation.data or {}).get("adapter_status") or observation.status)})
+            result["route_trace"]["metrics"] = result["metrics"]
+            return result
+        if not assets:
+            preflight = self.text_runtime._prepare_text_update(_text(getattr(human, "content", "")), draft_session_key)
+            if preflight is not None:
+                started = time.monotonic()
+                if preflight.status == "success":
+                    fields = dict(preflight.data or {}).get("fields") or {}
+                    target = dict(preflight.data or {}).get("target") or {}
+                    field_preview = "、".join(f"{key} {value}" for key, value in fields.items())
+                    answer = f"已生成待确认的船舶更新草稿：MMSI {target.get('mmsi', '未提供')}；{field_preview}。请核对无误后回复“确认”。"
+                    guard_result = "draft_prepared"
+                else:
+                    answer = str(preflight.suggested_fix or "请补充完整船位更新字段后再试。")
+                    guard_result = "position_update_fields_required"
+                result = self.text_runtime._result(
+                    answer,
+                    [preflight.model_dump()],
+                    [PREPARE_SHIP_UPDATE_TOOL_NAME],
+                    0,
+                    1,
+                    0,
+                    "stop",
+                    guard_result,
+                    started,
+                    "",
+                    "",
+                    "",
+                )
+                result["metrics"].update({
+                    "context_rounds": memory_rounds,
+                    "context_turns": memory_rounds,
+                    "context_compacted": context_compacted,
+                    "update_draft_status": "prepared" if preflight.status == "success" else preflight.status,
+                })
+                result["route_trace"]["metrics"] = result["metrics"]
+                return result
         direct = self._try_media_update(human, session_key)
         if direct is not None:
-            direct["metrics"].update({"context_rounds": memory_rounds, "context_compacted": context_compacted})
+            direct["metrics"].update({"context_rounds": memory_rounds, "context_turns": memory_rounds, "context_compacted": context_compacted})
             direct["route_trace"]["metrics"] = direct["metrics"]
             return direct
         request = dict(payload)
         request["_customer_ceshi_context"] = context_block
+        request["_customer_ceshi_session_key"] = f"customer_ceshi:{session_key}"
         result = self.text_runtime.invoke(request, config)
         answer = str(result.get("generated_answer") or "")
         if answer and result.get("status") == "success":
             self.memory.record(session_key, user_text=self._user_memory_text(human, []), answer_text=answer, observations=list(result.get("observations") or []))
         metrics = dict(result.get("metrics") or {})
         metrics["context_rounds"] = memory_rounds
+        metrics["context_turns"] = memory_rounds
         metrics["context_compacted"] = context_compacted
         result["metrics"] = metrics
         trace = dict(result.get("route_trace") or {})
@@ -1619,13 +2190,14 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
         raise RuntimeError("Responses API is unavailable and chat_function_calling fallback is disabled")
     if runtime["mode"] == "responses" and selected_mode == "chat_function_calling" and runtime["fallback_mode"] != "chat_function_calling":
         raise RuntimeError("Responses API is unavailable and configured fallback_mode is not chat_function_calling")
-    text_runtime = NativeToolRuntime(client=client, registry=registry, perception=None, config=config, mode=selected_mode, responses_client=responses_client, profile_prompt=read_profile_prompt(profile))
     multimodal_responses_client = getattr(ctx, "customer_ceshi_multimodal_responses_api_client", None) if ctx is not None else None
     if multimodal_responses_client is None:
         api_key = os.getenv("COZE_WORKLOAD_IDENTITY_API_KEY", "").strip()
         base_url = resolve_role_base_url(cfg, "multimodal")
         if api_key and base_url:
             multimodal_responses_client = OpenAI(api_key=api_key, base_url=base_url, default_headers=safe_default_headers(ctx))
+    perception = ResponsesMediaPerception(multimodal_responses_client, config)
+    text_runtime = NativeToolRuntime(client=client, registry=registry, perception=perception, config=config, mode=selected_mode, responses_client=responses_client, profile_prompt=read_profile_prompt(profile))
     return _NamespacedRuntime(
         SingleModelCustomerCeshiRuntime(
             text_runtime=text_runtime,

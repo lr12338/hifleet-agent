@@ -580,9 +580,6 @@ class AgentService:
 
         profile_id = str((payload or {}).get("agent_profile", "") or "customer_support")
         if profile_id != "customer_support":
-            for event in build_customer_support_debug_events(payload):
-                yield self._sse_event(event)
-                await asyncio.sleep(0)
             async for item in self.stream_sse(payload, ctx=ctx, run_opt=run_opt):
                 yield item
             return

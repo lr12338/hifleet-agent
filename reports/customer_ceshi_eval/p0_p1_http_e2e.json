@@ -1,0 +1,591 @@
+{
+  "summary": {
+    "generated_at": "2026-07-17",
+    "kind": "operational_http_e2e_not_semantic_gold",
+    "case_count": 24,
+    "passed": 24,
+    "failed": 0,
+    "scenarios": {
+      "position_update": 13,
+      "static_update": 2,
+      "platform_operation": 4,
+      "troubleshooting": 5
+    }
+  },
+  "results": [
+    {
+      "case_id": "CS-20260704-0017",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 100,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260704-0018",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 94,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260704-0019",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 96,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260704-0022",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 93,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260703-0030",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 98,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260703-0031",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 94,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260703-0032",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 97,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260703-0033",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 97,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260702-0068",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 92,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260702-0069",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 96,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260701-0097",
+      "scenario": "position_update",
+      "risk_level": "P0",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 19198,
+      "tool_names": [
+        "local_kb_search",
+        "web_search",
+        "web_search",
+        "web_search_agent_browser"
+      ],
+      "tool_calls": 4,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260629-0120",
+      "scenario": "static_update",
+      "risk_level": "P0",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 94,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260628-0129",
+      "scenario": "platform_operation",
+      "risk_level": "P0",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 11689,
+      "tool_names": [
+        "local_kb_search",
+        "web_search",
+        "web_search"
+      ],
+      "tool_calls": 3,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260628-0130",
+      "scenario": "static_update",
+      "risk_level": "P0",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 94,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260621-0306",
+      "scenario": "position_update",
+      "risk_level": "P0",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 103,
+      "tool_names": [
+        "prepare_ship_update"
+      ],
+      "tool_calls": 1,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260618-0355",
+      "scenario": "platform_operation",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 15636,
+      "tool_names": [
+        "local_kb_search",
+        "web_search",
+        "web_search",
+        "web_search"
+      ],
+      "tool_calls": 4,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260617-0437",
+      "scenario": "platform_operation",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 9669,
+      "tool_names": [
+        "local_kb_search",
+        "web_search"
+      ],
+      "tool_calls": 2,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260615-0548",
+      "scenario": "troubleshooting",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 11790,
+      "tool_names": [
+        "local_kb_search",
+        "web_search",
+        "web_search_agent_browser"
+      ],
+      "tool_calls": 3,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260615-0553",
+      "scenario": "position_update",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 16290,
+      "tool_names": [
+        "local_kb_search",
+        "local_kb_search",
+        "web_search",
+        "web_search"
+      ],
+      "tool_calls": 4,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260613-0567",
+      "scenario": "troubleshooting",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 6631,
+      "tool_names": [
+        "local_kb_search",
+        "local_kb_search"
+      ],
+      "tool_calls": 2,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260611-0693",
+      "scenario": "troubleshooting",
+      "risk_level": "P0",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 9624,
+      "tool_names": [
+        "local_kb_search",
+        "web_search"
+      ],
+      "tool_calls": 2,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260611-0696",
+      "scenario": "platform_operation",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 9381,
+      "tool_names": [
+        "local_kb_search",
+        "web_search"
+      ],
+      "tool_calls": 2,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260611-0698",
+      "scenario": "troubleshooting",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 7709,
+      "tool_names": [],
+      "tool_calls": 0,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    },
+    {
+      "case_id": "CS-20260611-0699",
+      "scenario": "troubleshooting",
+      "risk_level": "P1",
+      "http_status": 200,
+      "status": "success",
+      "latency_ms": 20688,
+      "tool_names": [
+        "local_kb_search",
+        "web_search",
+        "web_search",
+        "web_search",
+        "local_kb_search",
+        "local_kb_search",
+        "local_kb_search",
+        "web_search"
+      ],
+      "tool_calls": 8,
+      "checks": {
+        "http_ok": true,
+        "response_ok": true,
+        "expected_tools_ok": true,
+        "expected_any_tools_ok": true,
+        "forbidden_tools_ok": true,
+        "reply_length_ok": true,
+        "no_error": true
+      },
+      "passed": true,
+      "error": ""
+    }
+  ]
+}

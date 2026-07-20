@@ -1,0 +1,33 @@
+{
+  "source": "sanitized_dialog_cases; legacy_agent_reply_excluded",
+  "update_case_count": 208,
+  "position_tool_evidence": {
+    "checked": 47,
+    "correct": 47,
+    "accuracy_percent": 100.0,
+    "failed_case_ids": [],
+    "excluded_conflicting_legacy_tool_evidence": [
+      "CS-20260702-0066",
+      "CS-20260702-0067",
+      "CS-20260620-0318",
+      "CS-20260613-0571"
+    ]
+  },
+  "legacy_missing_field_label_correction": {
+    "checked": 14,
+    "current_parser_detected_complete_fields": 13,
+    "current_parser_still_incomplete": 1
+  },
+  "ambiguous_year_safety": {
+    "checked": 2,
+    "correct": 2,
+    "accuracy_percent": 100.0,
+    "failed_case_ids": []
+  },
+  "static_field_coverage": {
+    "checked": 19,
+    "with_at_least_one_valid_field": 19,
+    "coverage_percent": 100.0,
+    "missing_case_ids": []
+  }
+}

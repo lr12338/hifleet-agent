@@ -30,7 +30,7 @@
     "customer_ceshi_v2_max_tool_calls": 8,
     "customer_ceshi_v2_max_runtime_ms": 90000,
     "customer_ceshi_v2_ship_write_enabled": false,
-    "customer_ceshi_single_model_per_request": true,
+    "customer_ceshi_single_model_per_request": false,
     "customer_ceshi_runtime": {
       "mode": "responses",
       "fallback_mode": "chat_function_calling",
@@ -49,6 +49,24 @@
           "thinking": {
             "type": "enabled"
           },
+          "context_management": {
+            "edits": [
+              {
+                "type": "clear_thinking",
+                "keep": {
+                  "type": "thinking_turns",
+                  "value": 3
+                }
+              },
+              {
+                "type": "clear_tool_uses",
+                "trigger": {
+                  "type": "tool_uses",
+                  "value": 5
+                }
+              }
+            ]
+          },
           "reasoning_effort": "high",
           "temperature": 0.2,
           "top_p": 0.9,
@@ -58,9 +76,9 @@
           "store": true,
           "max_output_tokens": 8192,
           "thinking": {
-            "type": "enabled"
+            "type": "disabled"
           },
-          "reasoning_effort": "high",
+          "reasoning_effort": "low",
           "temperature": 0.2,
           "top_p": 0.9,
           "tool_choice": "auto",
@@ -96,7 +114,9 @@
         "max_sources": 2
       },
       "direct_updates": {
-        "enabled": true,
+        "enabled": false,
+        "dry_run": true,
+        "draft_store_path": "/tmp/customer_ceshi_update_drafts.json",
         "media_evidence_ttl_seconds": 600,
         "media_evidence_minimum_confidence": "high"
       }
