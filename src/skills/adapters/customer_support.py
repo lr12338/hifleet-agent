@@ -71,4 +71,5 @@ def compare_legacy_trace_with_v2(
         "write_state": "dry_run_required" if legacy_writes else "no_shadow_write",
         "legacy_write_tools": legacy_writes,
         "source_versions": dict(bundle.source_versions),
+        "prompt_loaded_chars": len(bundle.prompt),
     }

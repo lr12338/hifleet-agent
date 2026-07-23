@@ -32,6 +32,7 @@ from agents.customer_ceshi_responses.scenarios import classify as classify_scena
 from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
 from skills.core.contracts import ToolDescriptor as SharedToolDescriptor
 from skills.core.policy import resolve_skill_runtime
+from skills.ship_info_update import validate_position_update, validate_static_update
 
 
 CHECKPOINT_NAMESPACE = "customer_ceshi_responses"
@@ -1185,8 +1186,28 @@ class NativeToolRuntime:
             normalized_time = TimeNormalizer().normalize(str(fields.get("updatetime") or ""))
             if normalized_time.get("value"):
                 fields["updatetime"] = normalized_time["value"]
+            invalid_fields = validate_position_update({
+                "mmsi": target["mmsi"],
+                "lon": fields.get("lon", fields.get("longitude")),
+                "lat": fields.get("lat", fields.get("latitude")),
+                "updatetime": fields.get("updatetime"),
+                **{key: fields[key] for key in ("speed", "draft") if key in fields},
+            })
+        elif operation == "static_update":
+            invalid_fields = validate_static_update({"mmsi": target["mmsi"], **fields})
+        else:
+            invalid_fields = ["operation_type"]
+        if invalid_fields:
+            return Observation(
+                status="invalid_input",
+                capability=PREPARE_SHIP_UPDATE_TOOL_NAME,
+                warnings=[f"invalid_fields:{','.join(invalid_fields)}"],
+                data={"invalid_fields": invalid_fields, "operation_type": operation},
+                suggested_fix="请修正所有标记的字段后再生成更新草稿。",
+                retry_allowed=False,
+            )
         draft = self.drafts.prepare(session_key=session_key, operation_type=operation, target=target, fields=fields, field_sources={key: "current_turn_text" for key in fields})
-        return Observation(status="success", capability=name, facts=["已生成更新草稿；请核对后明确确认。"], data={"draft_id": draft.draft_id, "operation_type": draft.operation_type, "target": draft.target, "fields": draft.fields, "missing_fields": draft.missing_fields, "requires_confirmation": True, "expires_at": draft.expires_at, "draft_hash": draft.draft_hash}, retry_allowed=False)
+        return Observation(status="success", capability=name, facts=["已生成更新草稿；请核对后明确确认。"], data={"draft_id": draft.draft_id, "operation_type": draft.operation_type, "target": draft.target, "fields": draft.fields, "missing_fields": draft.missing_fields, "invalid_fields": [], "requires_confirmation": True, "expires_at": draft.expires_at, "draft_hash": draft.draft_hash}, retry_allowed=False)
 
     def _prepare_text_position_update(self, text: str, session_key: str) -> Observation | None:
         """Prepare only a complete, unambiguous current-turn position update."""

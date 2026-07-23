@@ -4403,10 +4403,20 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             if customer_support_shadow_enabled(workspace_path):
                 from skills.adapters.customer_support import compare_legacy_trace_with_v2
 
-                route_trace["skills_v2_shadow"] = compare_legacy_trace_with_v2(
+                shadow_record = compare_legacy_trace_with_v2(
                     route_trace=route_trace,
                     final_answer=sanitized,
                     workspace_path=workspace_path,
+                )
+                route_trace["skills_v2_shadow"] = shadow_record
+                logger.info(
+                    "[customer_support][skills_v2_shadow] status=%s legacy_tools=%s v2_tools=%s prompt_chars=%s write_state=%s latency_ms=%s",
+                    shadow_record.get("status"),
+                    len(list((shadow_record.get("tool_selection") or {}).get("legacy") or [])),
+                    len(list((shadow_record.get("tool_selection") or {}).get("v2_allowed") or [])),
+                    shadow_record.get("prompt_loaded_chars"),
+                    shadow_record.get("write_state"),
+                    shadow_record.get("latency_ms"),
                 )
         except Exception as exc:
             logger.warning("customer_support Skills V2 shadow comparison unavailable: %s", type(exc).__name__)

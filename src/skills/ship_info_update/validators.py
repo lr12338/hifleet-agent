@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 
@@ -23,8 +24,9 @@ def validate_position_update(fields: dict[str, Any]) -> list[str]:
         invalid.append("lon")
     if _number(fields.get("lat"), field="lat", minimum=-90, maximum=90) is None:
         invalid.append("lat")
+    normalized_time = re.sub(r"\s+(?:UTC[+-]\d{1,2}|LT)$", "", str(fields.get("updatetime", "")).strip(), flags=re.I)
     try:
-        datetime.strptime(str(fields.get("updatetime", "")), "%Y-%m-%d %H:%M:%S")
+        datetime.strptime(normalized_time, "%Y-%m-%d %H:%M:%S")
     except ValueError:
         invalid.append("updatetime")
     for name in ("speed", "draft"):

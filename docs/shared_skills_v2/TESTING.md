@@ -22,3 +22,10 @@ tools, evidence, claims, Draft states, and P95 agent orchestration time.
 Latest local evidence on 2026-07-23: `67 passed, 7 xfailed` for the focused V2
 and customer_ceshi selection, plus `219 passed` for the protected
 customer_support selection.
+
+For repeatable isolated HTTP validation, start a non-production process and run:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/validate_shared_skills_v2_http.py \
+  --base-url http://127.0.0.1:18128 --profile customer_ceshi
+```

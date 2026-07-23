@@ -46,6 +46,7 @@ and `claim_guard.py`.
 | Duplicate lists | Loader `TOOL_MAP`, `CapabilityRegistry`, `READ_ONLY_TOOL_NAMES`, and scenario contracts overlap. V2 descriptors now supply V2 schemas; legacy lists remain fallback-only. |
 | Search/browser overlap | `knowledge_qa` supplies `web_search` and deep search; `browser_verify` supplies verification and deep search. V2 excludes both deep-search variants. |
 | Write safety | Existing customer_ceshi Draft/confirmation logic remains. V2 offers only transaction-level model tools. |
+| Shared validation | `prepare_ship_update` now invokes the shared V2 position/static validators before creating a Draft and returns `invalid_fields` instead of silently accepting malformed values. |
 | API compatibility | `/run` and `/stream_run` remain in `src/main.py`; V2 changes no request or response field. |
 
 ## Observability

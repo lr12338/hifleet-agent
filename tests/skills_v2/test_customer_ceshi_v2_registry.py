@@ -50,3 +50,20 @@ def test_v2_result_trace_reports_runtime_and_upstream_metadata() -> None:
     result = runtime._result("ok", [], [], 0, 0, 0, "stop", "not_required", monotonic(), "", "", "")
     assert result["metrics"]["skills_runtime"]["mode"] == "v2"
     assert result["route_trace"]["skills_runtime"]["source_versions"]["hifleet_data"]["upstream_commit"] == "abc"
+
+
+def test_prepare_ship_update_enforces_shared_invalid_fields_contract() -> None:
+    runtime = NativeToolRuntime(client=object(), registry=CapabilityRegistry(tools=[]), config={}, mode="responses")
+    result = runtime._draft_operation(
+        "prepare_ship_update",
+        {
+            "operation_type": "position_update",
+            "mmsi": "123",
+            "longitude": "190",
+            "latitude": "91",
+            "updatetime": "not-a-time",
+        },
+        "invalid-fields-session",
+    )
+    assert result.status == "invalid_input"
+    assert result.data["invalid_fields"] == ["mmsi", "lon", "lat", "updatetime"]

@@ -40,6 +40,7 @@ def test_customer_support_shadow_is_opt_in_and_never_replays_writes(monkeypatch:
     assert comparison["executed_tools"] == []
     assert comparison["dry_run"] is True
     assert comparison["write_state"] == "dry_run_required"
+    assert comparison["prompt_loaded_chars"] > 0
     assert "upload_ship_position" in comparison["tool_selection"]["legacy_not_in_v2"]
 
 
