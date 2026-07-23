@@ -16,6 +16,12 @@ effective Skills mode, upstream commit, tool trace, Guard result, or Draft statu
 so this is a real endpoint smoke test, not proof that the running process loaded
 this worktree's V2 code. No tool or write request was made.
 
+Mock-only protocol regression on 2026-07-23 used FastAPI's `/run` entry with a
+fake runtime. It proved unchanged request handling for `user_id`, `session_id`,
+`messages`, `llm_route`, and profile selection, and verified that the V2 runtime
+mode plus upstream version metadata are returned through the existing `metrics`
+field. This is explicitly not a live model/provider validation.
+
 For each request, record HTTP status, answer, effective profile/runtime, model and
 tool calls/arguments, sources, Guard result, Draft state, elapsed time, timeout,
 and legacy/V2 difference. Any fake-provider result must be labelled mock-only.

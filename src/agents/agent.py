@@ -4397,6 +4397,25 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             pending_after=pending_after,
             pending_used=bool(route_trace.get("pending_used") or (route_trace.get("readable_trace") or {}).get("input_summary", {}).get("pending_used")),
         )
+        try:
+            from skills.core.policy import customer_support_shadow_enabled
+
+            if customer_support_shadow_enabled(workspace_path):
+                from skills.adapters.customer_support import compare_legacy_trace_with_v2
+
+                route_trace["skills_v2_shadow"] = compare_legacy_trace_with_v2(
+                    route_trace=route_trace,
+                    final_answer=sanitized,
+                    workspace_path=workspace_path,
+                )
+        except Exception as exc:
+            logger.warning("customer_support Skills V2 shadow comparison unavailable: %s", type(exc).__name__)
+            route_trace["skills_v2_shadow"] = {
+                "status": "failed",
+                "runtime_mode": "shadow",
+                "dry_run": True,
+                "reason": type(exc).__name__,
+            }
         return {
             "phase": "done",
             "status": "success",

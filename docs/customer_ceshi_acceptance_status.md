@@ -39,9 +39,10 @@ Audit date: 2026-07-17. This is an evidence ledger, not a completion claim. `cus
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | Shared manifest registry | PASSED (unit) | `tests/skills_v2/` validates manifests, policy, adapters, validators, version metadata, and known-URL verification. |
-| customer_support default legacy | PASSED (config + regression) | `skill_runtime.customer_support.mode=legacy`; protected regression suite passed 219 tests on 2026-07-23. |
-| customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder now receives V2 descriptors and injected V2 Skill prompts when configured V2. Focused customer_ceshi suite passed 63 tests with 7 expected failures. |
-| External service smoke | PARTIAL | Live `/run` and `/stream_run` safe greeting calls passed, but their response metadata cannot prove the running process used the new V2 worktree. |
+| customer_support default legacy | PASSED (config + regression) | `skill_runtime.customer_support.mode=legacy`; protected regression suite passed 219 tests on 2026-07-23 after the shadow integration. |
+| customer_support V2 shadow | PASSED (local integration) | `CUSTOMER_SUPPORT_SKILLS_SHADOW=true` keeps the legacy reply and records a non-executing, dry-run comparison with V2 allowed tools, versions, evidence count, claim indicator, latency, and write state. |
+| customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder receives V2 descriptors and injected V2 Skill prompts when configured V2; runtime metrics and route trace carry mode plus upstream versions. Focused V2/customer_ceshi suite passed 67 tests with 7 expected failures. |
+| External service smoke | PARTIAL | Live `/run` and `/stream_run` safe greeting calls passed, but the non-reloading running process cannot prove it loaded the new V2 worktree. Mock-only `/run` regression verifies unchanged protocol and V2 metadata transport. |
 | Attachment semantic 5/5 / ≥95% | NOT_COMPLETE | No new live semantic corpus result is claimed. |
 | Production shadow / gradual rollout | NOT_COMPLETE | Configuration and adapter boundary exist; no production rollout is claimed. |
 

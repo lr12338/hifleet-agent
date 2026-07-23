@@ -34,5 +34,18 @@ def resolve_skill_runtime(profile_id: str, workspace_path: str | Path | None = N
     return mode if mode in {"legacy", "v2", "shadow"} else default
 
 
+def customer_support_shadow_enabled(workspace_path: str | Path | None = None) -> bool:
+    """Return whether the legacy customer_support response should run V2 shadow analysis.
+
+    The primary chain remains legacy regardless of this setting. This flag only
+    enables an in-process, no-tool-execution comparison record.
+    """
+    override = os.getenv("CUSTOMER_SUPPORT_SKILLS_SHADOW")
+    if override is not None:
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    configured = (load_skill_runtime_config(workspace_path).get("customer_support") or {}).get("shadow_enabled", False)
+    return bool(configured)
+
+
 def profile_allows_tool(skill_id: str, tool_name: str) -> bool:
     return skill_id in EXTERNAL_V2_SKILLS and tool_name not in DENIED_EXTERNAL_TOOLS

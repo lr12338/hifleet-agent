@@ -843,7 +843,7 @@ class ResponsesMediaPerception:
 
 
 class NativeToolRuntime:
-    def __init__(self, *, client: Any, registry: CapabilityRegistry, perception: Any = None, config: dict[str, Any], mode: str, responses_client: Any | None = None, profile_prompt: str = "", tool_descriptors: tuple[SharedToolDescriptor, ...] = ()) -> None:
+    def __init__(self, *, client: Any, registry: CapabilityRegistry, perception: Any = None, config: dict[str, Any], mode: str, responses_client: Any | None = None, profile_prompt: str = "", tool_descriptors: tuple[SharedToolDescriptor, ...] = (), skill_runtime_metadata: dict[str, Any] | None = None) -> None:
         self.client = client
         self.registry = registry
         self.perception = perception
@@ -852,6 +852,7 @@ class NativeToolRuntime:
         self.responses_client = responses_client
         self.profile_prompt = profile_prompt.strip()
         self.tool_descriptors = tuple(tool_descriptors)
+        self.skill_runtime_metadata = dict(skill_runtime_metadata or {})
         self.direct_updates_enabled = _direct_update_enabled(config)
         self.search_settings = _search_settings(config)
         self._last_response_usage: dict[str, Any] = {}
@@ -1653,6 +1654,7 @@ class NativeToolRuntime:
             "output_tokens": self._last_response_usage.get("output_tokens"),
             "reasoning_tokens": self._last_response_usage.get("reasoning_tokens"),
             "provider_status": self._last_response_usage.get("provider_status", ""),
+            "skills_runtime": self.skill_runtime_metadata,
             "reasoning_level": str(self.config.get("reasoning_effort") or ""),
             "finish_reason": finish_reason,
             "fallback_reason": fallback_reason,
@@ -1662,7 +1664,16 @@ class NativeToolRuntime:
             "output_length": len(answer),
             "scenario": self._active_scenario.name if self._active_scenario is not None else "",
         }
-        trace = safe_trace({"agent": "customer_ceshi_responses", "checkpoint_namespace": CHECKPOINT_NAMESPACE, "runtime_mode": self.mode, "provider_response_id": provider_response_id[-12:] if provider_response_id else "", "tool_calls": tool_names, "observations": observations, "metrics": metrics})
+        trace = safe_trace({
+            "agent": "customer_ceshi_responses",
+            "checkpoint_namespace": CHECKPOINT_NAMESPACE,
+            "runtime_mode": self.mode,
+            "provider_response_id": provider_response_id[-12:] if provider_response_id else "",
+            "tool_calls": tool_names,
+            "observations": observations,
+            "metrics": metrics,
+            "skills_runtime": self.skill_runtime_metadata,
+        })
         degraded = finish_reason.startswith("error:") or finish_reason.startswith("responses_unavailable")
         return {"phase": "done", "status": "degraded" if degraded else "success", "generated_answer": answer, "messages": [AIMessage(content=answer)], "generated_tool_calls": tool_names, "observations": observations, "metrics": metrics, "route_trace": trace}
 
@@ -1851,6 +1862,7 @@ class SingleModelCustomerCeshiRuntime:
             "response_id_suffix": provider_response_id[-12:] if provider_response_id else "",
             "output_length": len(answer),
             "scenario": "multimodal_symbol" if media_types else "",
+            "skills_runtime": self.skill_runtime_metadata,
             **(usage or {}),
         }
         trace = safe_trace({
@@ -1863,6 +1875,7 @@ class SingleModelCustomerCeshiRuntime:
             "tool_calls": tool_names,
             "observations": observations,
             "metrics": metrics,
+            "skills_runtime": self.skill_runtime_metadata,
         })
         return {"phase": "done", "status": status, "generated_answer": answer, "messages": [AIMessage(content=answer)], "generated_tool_calls": tool_names, "observations": observations, "metrics": metrics, "route_trace": trace}
 
@@ -2223,6 +2236,10 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
         responses_client=responses_client,
         profile_prompt="\n\n---\n\n".join(part for part in (read_profile_prompt(profile), skill_prompt) if part),
         tool_descriptors=v2_bundle.descriptors if v2_bundle is not None else (),
+        skill_runtime_metadata={
+            "mode": "v2" if v2_bundle is not None else "legacy",
+            "source_versions": dict(v2_bundle.source_versions) if v2_bundle is not None else {},
+        },
     )
     return _NamespacedRuntime(
         SingleModelCustomerCeshiRuntime(

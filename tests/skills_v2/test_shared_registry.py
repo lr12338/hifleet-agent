@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 
 from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
-from skills.adapters.customer_support import build_customer_support_shadow_bundle
+from skills.adapters.customer_support import build_customer_support_shadow_bundle, compare_legacy_trace_with_v2
 from skills.core.manifest_loader import load_manifest
-from skills.core.policy import resolve_skill_runtime
+from skills.core.policy import customer_support_shadow_enabled, resolve_skill_runtime
 from skills.ship_info_update.validators import validate_position_update, validate_static_update
 
 
@@ -25,6 +25,22 @@ def test_v2_defaults_keep_customer_support_on_legacy(monkeypatch: pytest.MonkeyP
 def test_environment_override_allows_configuration_only_rollback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CUSTOMER_CESHI_SKILLS_MODE", "legacy")
     assert resolve_skill_runtime("customer_ceshi", ROOT) == "legacy"
+
+
+def test_customer_support_shadow_is_opt_in_and_never_replays_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUSTOMER_SUPPORT_SKILLS_SHADOW", raising=False)
+    assert customer_support_shadow_enabled(ROOT) is False
+    monkeypatch.setenv("CUSTOMER_SUPPORT_SKILLS_SHADOW", "true")
+    assert customer_support_shadow_enabled(ROOT) is True
+    comparison = compare_legacy_trace_with_v2(
+        route_trace={"task_type": "ship_update", "tool_call_sequence": ["upload_ship_position"], "evidence_items": [{"source": "legacy"}]},
+        final_answer="更新成功",
+        workspace_path=ROOT,
+    )
+    assert comparison["executed_tools"] == []
+    assert comparison["dry_run"] is True
+    assert comparison["write_state"] == "dry_run_required"
+    assert "upload_ship_position" in comparison["tool_selection"]["legacy_not_in_v2"]
 
 
 def test_customer_adapters_share_business_contracts() -> None:
