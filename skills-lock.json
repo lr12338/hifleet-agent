@@ -8,8 +8,31 @@
       "version": "0.3.21",
       "commit": "e4acf599192f3f1d247ef2da00e78d0cff89819c",
       "lastKnownGood": "e4acf599192f3f1d247ef2da00e78d0cff89819c",
-      "contentHash": "90faea9a55de29c6ddf6a34920d5d0987968ee60363858c936b51e411f47fce4",
-      "verification": "manifest-and-contract-reviewed"
+      "contentHash": "7118592bea375511a477bf29c7b882e01726fcc8f2e38df1c2bf60927c0e0f8a",
+      "requiredEnv": [
+        "HIFLEET_API_KEY"
+      ],
+      "approvedReadOnlyCapabilities": [
+        "get_archive",
+        "get_area_traffic",
+        "get_areas",
+        "get_avoidredsea_traffic",
+        "get_casualty",
+        "get_maritime_penalty",
+        "get_port",
+        "get_position",
+        "get_psc",
+        "get_psc_anomalies",
+        "get_psc_openclaw_stats",
+        "get_sanction",
+        "get_strait_traffic"
+      ],
+      "reviewRequiredCapabilities": [
+        "charter_contact_dedup",
+        "charter_enrich_helpers",
+        "open_console"
+      ],
+      "verification": "static-contract-reviewed"
     },
     "agent-browser": {
       "source": "vercel-labs/agent-browser",

@@ -19,7 +19,7 @@ The five-case fixture is a semantic specification, not a claimed 5/5 live result
 Before customer_support promotion, run it over both chains and record legacy/V2
 tools, evidence, claims, Draft states, and P95 agent orchestration time.
 
-Latest local evidence on 2026-07-23: `71 passed, 7 xfailed` for the focused V2
+Latest local evidence on 2026-07-23: `76 passed, 7 xfailed` for the focused V2
 and customer_ceshi selection, plus `219 passed` for the protected
 customer_support selection. A broader customer_ceshi invocation completed with
 `174 passed, 1 skipped, 7 xfailed, 1 failed`; the single failure,
@@ -55,3 +55,9 @@ The public runner was rerun against an isolated current-worktree service on
 2026-07-23 without attachment URLs: M02, M04, and M05 passed; M01 and M03 were
 blocked as `attachment_url_not_supplied`; no case failed. This is a `3 passed,
 2 blocked` partial result, not a semantic 5/5 acceptance result.
+
+The upstream candidate verifier was also exercised against the locked
+`e4acf599192f3f1d247ef2da00e78d0cff89819c` revision. It passed trusted-source,
+required-file, required-environment, API-host, and static Python contract checks;
+the focused sync tests cover rejected candidates and unchanged last-known-good
+locks.
