@@ -1,0 +1,43 @@
+schema_version: 1
+skill_id: ship_info_update
+skill_version: 2.0.0
+prompt_file: SKILL.md
+capabilities:
+  - id: prepare_ship_update
+    description: Prepare and validate a user-visible ship-update draft.
+    read_only: false
+    requires_confirmation: true
+    risk_level: high
+    timeout_seconds: 20
+    input_schema:
+      type: object
+      properties:
+        operation_type: {type: string, enum: [position_update, static_update]}
+        mmsi: {type: string}
+        longitude: {type: string}
+        latitude: {type: string}
+        updatetime: {type: string}
+        fields: {type: object}
+      required: [operation_type]
+  - id: commit_ship_update
+    description: Commit the current draft only after this session explicitly confirms it.
+    read_only: false
+    requires_confirmation: true
+    risk_level: high
+    timeout_seconds: 30
+    input_schema:
+      type: object
+      properties:
+        draft_id: {type: string}
+        confirmed: {type: boolean}
+      required: [confirmed]
+  - id: cancel_ship_update
+    description: Cancel the current session's pending ship-update draft.
+    read_only: false
+    requires_confirmation: true
+    risk_level: medium
+    timeout_seconds: 10
+    input_schema:
+      type: object
+      properties: {}
+      required: []

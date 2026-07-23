@@ -1,0 +1,21 @@
+schema_version: 1
+skill_id: hifleet_data
+skill_version: 0.3.21
+prompt_file: SKILL.md
+upstream_repository: https://github.com/charleiWang/hifleet-skills
+upstream_commit: e4acf599192f3f1d247ef2da00e78d0cff89819c
+capabilities:
+  - {id: ship_search, tool_name: ship_search, description: Search vessels by a user-supplied identifier., read_only: true, risk_level: low, timeout_seconds: 20}
+  - {id: get_ship_position, tool_name: get_ship_position, description: Read the latest vessel position., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_ship_archive, tool_name: get_ship_archive, description: Read vessel archive data., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_psc_records, tool_name: get_psc_records, description: Read vessel PSC records., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_area_traffic, tool_name: get_area_traffic, description: Read area traffic statistics., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_strait_traffic, tool_name: get_strait_traffic, description: Read strait traffic statistics., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_ship_trajectory, tool_name: get_ship_trajectory, description: Read vessel trajectory data., read_only: true, risk_level: medium, timeout_seconds: 30}
+  - {id: get_ship_call_ports, tool_name: get_ship_call_ports, description: Read vessel port calls., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_ship_voyages, tool_name: get_ship_voyages, description: Read vessel voyages., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_last_departure, tool_name: get_last_departure, description: Read the last vessel departure., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_current_stop, tool_name: get_current_stop, description: Read the current vessel stop., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: get_avoid_redsea_traffic, tool_name: get_avoid_redsea_traffic, description: Read red-sea avoidance traffic., read_only: true, risk_level: medium, timeout_seconds: 20}
+  - {id: search_ports, tool_name: search_ports, description: Search ports., read_only: true, risk_level: low, timeout_seconds: 20}
+  - {id: get_port_detail, tool_name: get_port_detail, description: Read a port profile., read_only: true, risk_level: medium, timeout_seconds: 20}

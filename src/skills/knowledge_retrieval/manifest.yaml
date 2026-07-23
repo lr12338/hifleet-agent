@@ -1,0 +1,11 @@
+schema_version: 1
+skill_id: knowledge_retrieval
+skill_version: 2.0.0
+prompt_file: SKILL.md
+capabilities:
+  - id: local_kb_search
+    tool_name: local_kb_search
+    description: Search the internal HiFleet knowledge base and return source evidence.
+    read_only: true
+    risk_level: medium
+    timeout_seconds: 20
