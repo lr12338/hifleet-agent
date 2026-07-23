@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -28,9 +29,13 @@ from agents.customer_ceshi_v2.tracing import safe_trace
 from agents.customer_ceshi_responses.ship_updates import PositionNormalizer, ShipIdentityNormalizer, ShipUpdateDraftStore, StaticFieldNormalizer, TimeNormalizer
 from agents.customer_ceshi_responses.claim_guard import guard_claims, limit_reply
 from agents.customer_ceshi_responses.scenarios import classify as classify_scenario
+from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
+from skills.core.contracts import ToolDescriptor as SharedToolDescriptor
+from skills.core.policy import resolve_skill_runtime
 
 
 CHECKPOINT_NAMESPACE = "customer_ceshi_responses"
+logger = logging.getLogger(__name__)
 DEFAULT_MAX_STEPS = 8
 DEFAULT_CONTEXT_MAX_ROUNDS = 10
 DEFAULT_CONTEXT_RECENT_FULL_ROUNDS = 3
@@ -598,16 +603,10 @@ def _update_candidate_schema(*, responses: bool) -> dict[str, Any]:
 
 
 def _ship_update_transaction_schemas(*, responses: bool) -> list[dict[str, Any]]:
-    definitions = [
-        (PREPARE_SHIP_UPDATE_TOOL_NAME, "Prepare a ship-update draft. Never commits a write.", {"operation_type": {"type": "string", "enum": ["position_update", "static_update"]}, "mmsi": {"type": "string"}, "longitude": {"type": "string"}, "latitude": {"type": "string"}, "updatetime": {"type": "string"}, "fields": {"type": "object"}}, ["operation_type"]),
-        (COMMIT_SHIP_UPDATE_TOOL_NAME, "Commit only the current session's explicitly confirmed draft. The user never needs to know a draft ID.", {"draft_id": {"type": "string", "description": "Optional internal draft ID when available."}, "confirmed": {"type": "boolean"}}, ["confirmed"]),
-        (CANCEL_SHIP_UPDATE_TOOL_NAME, "Cancel the current session's pending ship-update draft.", {}, []),
-    ]
-    items = []
-    for name, description, properties, required in definitions:
-        item = {"type": "function", "name": name, "description": description, "parameters": {"type": "object", "properties": properties, "required": required}}
-        items.append(item if responses else {"type": "function", "function": {key: value for key, value in item.items() if key != "type"}})
-    return items
+    from skills.ship_info_update import transaction_descriptors
+
+    descriptors = transaction_descriptors()
+    return [descriptor.responses_schema() if responses else descriptor.chat_schema() for descriptor in descriptors]
 
 
 def _media_update_evidence_schema() -> dict[str, Any]:
@@ -844,7 +843,7 @@ class ResponsesMediaPerception:
 
 
 class NativeToolRuntime:
-    def __init__(self, *, client: Any, registry: CapabilityRegistry, perception: Any = None, config: dict[str, Any], mode: str, responses_client: Any | None = None, profile_prompt: str = "") -> None:
+    def __init__(self, *, client: Any, registry: CapabilityRegistry, perception: Any = None, config: dict[str, Any], mode: str, responses_client: Any | None = None, profile_prompt: str = "", tool_descriptors: tuple[SharedToolDescriptor, ...] = ()) -> None:
         self.client = client
         self.registry = registry
         self.perception = perception
@@ -852,6 +851,7 @@ class NativeToolRuntime:
         self.mode = mode
         self.responses_client = responses_client
         self.profile_prompt = profile_prompt.strip()
+        self.tool_descriptors = tuple(tool_descriptors)
         self.direct_updates_enabled = _direct_update_enabled(config)
         self.search_settings = _search_settings(config)
         self._last_response_usage: dict[str, Any] = {}
@@ -863,8 +863,13 @@ class NativeToolRuntime:
         self.dry_run_writes = bool(_nested_config(config, "customer_ceshi_runtime", "direct_updates").get("dry_run", False))
         self._active_scenario = None
 
+    def _read_only_chat_schemas(self) -> list[dict[str, Any]]:
+        if self.tool_descriptors:
+            return [descriptor.chat_schema() for descriptor in self.tool_descriptors if descriptor.read_only and self.registry.has(descriptor.name)]
+        return [_tool_schema(tool) for name, tool in self.registry._tools.items() if name in READ_ONLY_TOOL_NAMES]
+
     def _bound_client(self, *, exclude_media: bool = False) -> Any:
-        tools = [_tool_schema(tool) for name, tool in self.registry._tools.items() if name in READ_ONLY_TOOL_NAMES]
+        tools = self._read_only_chat_schemas()
         if self.perception is not None and not exclude_media:
             tools.append(_media_schema())
         tools.extend(_ship_update_transaction_schemas(responses=False))
@@ -873,7 +878,7 @@ class NativeToolRuntime:
         return self.client.bind_tools(tools)
 
     def _responses_tools(self, *, inspect_only: bool = False, exclude_media: bool = False) -> list[dict[str, Any]]:
-        chat_schemas = [_tool_schema(tool) for name, tool in self.registry._tools.items() if name in READ_ONLY_TOOL_NAMES]
+        chat_schemas = self._read_only_chat_schemas()
         tools = [
             {
                 "type": "function",
@@ -2175,6 +2180,17 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
     client = getattr(ctx, "customer_ceshi_responses_client", None) if ctx is not None else None
     client = client or build_chat_model(ctx, cfg, role="text", streaming=True, model_override=str(deepseek_settings.get("model") or text_settings.get("model") or config.get("customer_ceshi_responses_text_model") or config.get("customer_ceshi_v2_text_model") or config.get("text_model") or ""), timeout=text_settings.get("timeout_seconds", config.get("customer_ceshi_responses_timeout_seconds", config.get("customer_ceshi_v2_timeout_seconds", 30))), allow_runtime_model_override=False)
     registry = getattr(ctx, "customer_ceshi_responses_tool_registry", None) if ctx is not None else None
+    v2_bundle = None
+    if registry is None and resolve_skill_runtime("customer_ceshi", workspace_path) == "v2":
+        try:
+            v2_bundle = build_customer_ceshi_bundle(workspace_path)
+            registry = CapabilityRegistry(
+                tools=list(v2_bundle.tools),
+                shared_descriptors=v2_bundle.descriptors,
+                enforce_known_public_urls=True,
+            )
+        except Exception as exc:
+            logger.warning("customer_ceshi Skills V2 is unavailable; using the existing constrained runtime: %s", type(exc).__name__)
     registry = registry or CapabilityRegistry(skill_names=list(getattr(profile, "skills", []) or []))
     if client is None:
         raise RuntimeError("customer_ceshi native tool runtime is unavailable: model credentials or base URL are missing")
@@ -2197,7 +2213,17 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
         if api_key and base_url:
             multimodal_responses_client = OpenAI(api_key=api_key, base_url=base_url, default_headers=safe_default_headers(ctx))
     perception = ResponsesMediaPerception(multimodal_responses_client, config)
-    text_runtime = NativeToolRuntime(client=client, registry=registry, perception=perception, config=config, mode=selected_mode, responses_client=responses_client, profile_prompt=read_profile_prompt(profile))
+    skill_prompt = v2_bundle.prompt if v2_bundle is not None else ""
+    text_runtime = NativeToolRuntime(
+        client=client,
+        registry=registry,
+        perception=perception,
+        config=config,
+        mode=selected_mode,
+        responses_client=responses_client,
+        profile_prompt="\n\n---\n\n".join(part for part in (read_profile_prompt(profile), skill_prompt) if part),
+        tool_descriptors=v2_bundle.descriptors if v2_bundle is not None else (),
+    )
     return _NamespacedRuntime(
         SingleModelCustomerCeshiRuntime(
             text_runtime=text_runtime,
