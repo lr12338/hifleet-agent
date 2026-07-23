@@ -29,3 +29,20 @@ For repeatable isolated HTTP validation, start a non-production process and run:
 PYTHONPATH=src .venv/bin/python scripts/validate_shared_skills_v2_http.py \
   --base-url http://127.0.0.1:18128 --profile customer_ceshi
 ```
+
+The five-case public regression runner uses the same `/run` entry and records
+`passed`, `failed`, or `blocked` without treating unavailable image files as a
+pass. Supply an HTTP-served attachment directory for image cases:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/run_shared_skills_v2_regression.py \
+  --base-url http://127.0.0.1:18128 \
+  --attachment-base-url http://127.0.0.1:18080/fixtures \
+  --report reports/shared_skills_v2/public-regression.json
+```
+
+The latest isolated M02 probe on 2026-07-23 used the plain public input
+`HiFleet 平台上传不了航线。` and completed with one successful
+`local_kb_search`, zero successful `web_search` calls, and a conservative
+follow-up request. The runtime finalizes platform and membership replies from
+direct internal evidence rather than exposing another search turn.

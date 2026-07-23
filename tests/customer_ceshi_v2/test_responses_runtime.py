@@ -147,6 +147,61 @@ def test_responses_native_tool_loop_continues_two_calls_with_previous_response_i
     assert result["route_trace"]["checkpoint_namespace"] == CHECKPOINT_NAMESPACE
 
 
+def test_v2_search_budget_removes_exhausted_search_schema_from_next_turn():
+    client = ResponsesClient()
+    runtime = NativeToolRuntime(
+        client=client,
+        registry=CapabilityRegistry(tools=[local_kb_search]),
+        perception=PerceptionService(FakePerception()),
+        config={"customer_ceshi_max_steps": 5},
+        mode="responses",
+        responses_client=client,
+        skill_runtime_metadata={"mode": "v2"},
+    )
+
+    _NamespacedRuntime(runtime).invoke({"messages": [HumanMessage(content="Check ETA and ETD")]}, {"configurable": {"thread_id": "v2-search-budget"}})
+
+    second_request_tools = [item["name"] for item in client.responses.calls[1]["tools"]]
+    assert "local_kb_search" not in second_request_tools
+
+
+def test_platform_operation_finalizes_after_one_internal_evidence_retrieval():
+    class PlatformResponses:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(id="platform-1", output=[SimpleNamespace(type="function_call", name="local_kb_search", arguments='{"query":"航线上传"}', call_id="kb-1")], output_text="")
+            return SimpleNamespace(id="platform-2", output=[], output_text="依据帮助文档，请在计划面板上传航线。")
+
+    client = ResponsesClient()
+    responses = PlatformResponses()
+    client.responses = responses
+
+    @tool("local_kb_search")
+    def platform_kb(query: str) -> dict:
+        """Find product instructions."""
+        return {"status": "success", "items": [{"content": "在计划面板上传航线。"}], "facts": ["计划面板有上传入口。"]}
+
+    runtime = NativeToolRuntime(
+        client=client,
+        registry=CapabilityRegistry(tools=[platform_kb]),
+        perception=PerceptionService(FakePerception()),
+        config={},
+        mode="responses",
+        responses_client=client,
+        skill_runtime_metadata={"mode": "v2"},
+    )
+
+    result = _NamespacedRuntime(runtime).invoke({"messages": [HumanMessage(content="HiFleet 平台上传不了航线")]}, {"configurable": {"thread_id": "platform-one-kb"}})
+
+    assert result["generated_tool_calls"] == ["local_kb_search"]
+    assert responses.calls[1]["tools"] == []
+    assert responses.calls[1]["tool_choice"] == "none"
+
+
 def test_responses_failure_uses_native_chat_function_calling_fallback():
     chat = ChatToolClient()
 

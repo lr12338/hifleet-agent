@@ -44,6 +44,7 @@ Audit date: 2026-07-17. This is an evidence ledger, not a completion claim. `cus
 | customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder receives V2 descriptors and injected V2 Skill prompts when configured V2; runtime metrics and route trace carry mode plus upstream versions. `prepare_ship_update` invokes shared validators and reports `invalid_fields` before Draft creation. Focused V2/customer_ceshi suite passed 68 tests with 7 expected failures. |
 | External service smoke | PASSED (isolated safe service) | Current-worktree isolated `/run` and `/stream_run` calls passed with `customer_ceshi` V2 metadata including the locked upstream commit. Mock-only `/run` regression also verifies unchanged protocol and V2 metadata transport. |
 | Attachment semantic 5/5 / ≥95% | NOT_COMPLETE | No new live semantic corpus result is claimed. |
+| M02 route-upload semantic probe | PASSED (isolated V2) | Plain public input executed exactly one `local_kb_search`, zero successful web searches, and returned a conservative follow-up. The evidence-directed probe also matched plan-panel and RTZ/XLS/TXT/CSV content; query metadata no longer counts as permission evidence. The other image-dependent public cases remain unrun without scoped attachment URLs. |
 | Production shadow / gradual rollout | NOT_COMPLETE | Configuration and adapter boundary exist; no production rollout is claimed. |
 
 ## Completion Decision

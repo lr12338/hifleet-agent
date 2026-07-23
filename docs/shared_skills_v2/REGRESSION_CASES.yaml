@@ -34,6 +34,7 @@ cases:
     input: "MMSI 123456789，经度 121.5，纬度 31.2，时间 2026-07-23 10:00:00，请更新船位。"
     attachment: null
     scenario: position_update
+    session_group: position-update-confirmation
     allowed_tools: [prepare_ship_update]
     forbidden_tools: [upload_ship_position, update_ship_static_info]
     evidence: "Normalized Draft and explicit confirmation required before commit."
@@ -44,6 +45,7 @@ cases:
     input: "确认"
     attachment: null
     scenario: position_update
+    session_group: position-update-confirmation
     allowed_tools: [commit_ship_update, cancel_ship_update]
     forbidden_tools: [upload_ship_position, update_ship_static_info]
     evidence: "Require same-session, unexpired Draft."

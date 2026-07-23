@@ -1,11 +1,44 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
 
 _HIGH_RISK = re.compile(r"(支持|权限|会员|价格|套餐|入口|按钮|部门|发布|制定|目的港|ETA|自动解析|立即生效|更新成功|没有数据|未找到)", re.I)
 _SENTENCE = re.compile(r"[^。！？!?]*[。！？!?]|[^。！？!?]+$")
+
+
+def _structured_evidence_text(item: dict[str, Any]) -> str:
+    """Extract source content, excluding tool queries and control metadata."""
+    fragments: list[str] = []
+
+    def append_document_content(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        entries = payload.get("items")
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            for key in ("content", "snippet", "text"):
+                value = entry.get(key)
+                if value:
+                    fragments.append(str(value))
+
+    for fact in list(item.get("facts") or []):
+        value = str(fact)
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            fragments.append(value)
+        else:
+            append_document_content(parsed)
+    data = item.get("data")
+    if isinstance(data, dict):
+        append_document_content(data)
+    return " ".join(fragments)
 
 
 def guard_claims(answer: str, observations: list[dict[str, Any]]) -> tuple[str, list[str]]:
@@ -15,7 +48,7 @@ def guard_claims(answer: str, observations: list[dict[str, Any]]) -> tuple[str, 
     product capability, policy, attribution, UI entry, or completion claim.
     """
     evidence = " ".join(
-        " ".join(str(fact) for fact in item.get("facts", []))
+        _structured_evidence_text(item)
         for item in observations
         if item.get("status") in {"success", "partial"}
     ).lower()

@@ -856,6 +856,9 @@ class NativeToolRuntime:
         self.skill_runtime_metadata = dict(skill_runtime_metadata or {})
         self.direct_updates_enabled = _direct_update_enabled(config)
         self.search_settings = _search_settings(config)
+        if self.skill_runtime_metadata.get("mode") == "v2":
+            self.search_settings["max_local_kb_calls"] = 1
+            self.search_settings["max_web_calls"] = 1
         self._last_response_usage: dict[str, Any] = {}
         self.max_steps = int(config.get("customer_ceshi_max_steps", config.get("customer_ceshi_v2_max_steps", DEFAULT_MAX_STEPS)))
         self.max_tool_calls = int(config.get("customer_ceshi_max_tool_calls", config.get("customer_ceshi_v2_max_tool_calls", 8)))
@@ -865,13 +868,14 @@ class NativeToolRuntime:
         self.dry_run_writes = bool(_nested_config(config, "customer_ceshi_runtime", "direct_updates").get("dry_run", False))
         self._active_scenario = None
 
-    def _read_only_chat_schemas(self) -> list[dict[str, Any]]:
+    def _read_only_chat_schemas(self, *, disabled_tool_names: set[str] | None = None) -> list[dict[str, Any]]:
+        disabled = disabled_tool_names or set()
         if self.tool_descriptors:
-            return [descriptor.chat_schema() for descriptor in self.tool_descriptors if descriptor.read_only and self.registry.has(descriptor.name)]
-        return [_tool_schema(tool) for name, tool in self.registry._tools.items() if name in READ_ONLY_TOOL_NAMES]
+            return [descriptor.chat_schema() for descriptor in self.tool_descriptors if descriptor.read_only and descriptor.name not in disabled and self.registry.has(descriptor.name)]
+        return [_tool_schema(tool) for name, tool in self.registry._tools.items() if name in READ_ONLY_TOOL_NAMES and name not in disabled]
 
-    def _bound_client(self, *, exclude_media: bool = False) -> Any:
-        tools = self._read_only_chat_schemas()
+    def _bound_client(self, *, exclude_media: bool = False, disabled_tool_names: set[str] | None = None) -> Any:
+        tools = self._read_only_chat_schemas(disabled_tool_names=disabled_tool_names)
         if self.perception is not None and not exclude_media:
             tools.append(_media_schema())
         tools.extend(_ship_update_transaction_schemas(responses=False))
@@ -879,8 +883,8 @@ class NativeToolRuntime:
             tools = [tool for tool in tools if tool["function"]["name"] in self._active_scenario.allowed_tools]
         return self.client.bind_tools(tools)
 
-    def _responses_tools(self, *, inspect_only: bool = False, exclude_media: bool = False) -> list[dict[str, Any]]:
-        chat_schemas = self._read_only_chat_schemas()
+    def _responses_tools(self, *, inspect_only: bool = False, exclude_media: bool = False, disabled_tool_names: set[str] | None = None) -> list[dict[str, Any]]:
+        chat_schemas = self._read_only_chat_schemas(disabled_tool_names=disabled_tool_names)
         tools = [
             {
                 "type": "function",
@@ -903,6 +907,27 @@ class NativeToolRuntime:
         if inspect_only:
             tools = [tool for tool in tools if tool["name"] == "inspect_media"]
         return tools
+
+    def _exhausted_search_tools(self, search_counts: dict[str, int], *, is_chart_symbol: bool = False) -> set[str]:
+        exhausted: set[str] = set()
+        limits = {
+            "local_kb_search": 1 if is_chart_symbol else self.search_settings["max_local_kb_calls"],
+            "web_search": 1 if is_chart_symbol else self.search_settings["max_web_calls"],
+        }
+        for name, limit in limits.items():
+            if search_counts.get(name, 0) >= limit:
+                exhausted.add(name)
+        return exhausted
+
+    @staticmethod
+    def _has_internal_retrieval_evidence(observation: Observation) -> bool:
+        if observation.status not in {"success", "partial"}:
+            return False
+        data = observation.data if isinstance(observation.data, dict) else {}
+        return any(
+            isinstance(item, dict) and bool(str(item.get("content") or item.get("snippet") or "").strip())
+            for item in list(data.get("items") or [])
+        )
 
     def _responses_request_options(self) -> dict[str, Any]:
         values = _responses_settings(self.config, "deepseek")
@@ -1342,6 +1367,7 @@ class NativeToolRuntime:
         search_fingerprints: set[str] = set()
         search_counts: dict[str, int] = {"local_kb_search": 0, "web_search": 0}
         is_chart_symbol = self._active_scenario is not None and self._active_scenario.name == "multimodal_symbol"
+        finalize_after_internal_evidence = False
         tool_call_limit = 3 if is_chart_symbol else self.max_tool_calls
         current_user_text = user_text
         response_id = str(getattr(response, "id", "") or (response.get("id", "") if isinstance(response, dict) else ""))
@@ -1433,7 +1459,36 @@ class NativeToolRuntime:
                 compact["evidence_id"] = observed["evidence_id"]
                 outputs.append({"type": "function_call_output", "call_id": call["id"], "output": json.dumps(compact, ensure_ascii=False)})
                 # Tool metadata can describe coverage but never decides that the model must stop.
-            request = {"model": request["model"], "input": outputs, "tools": self._responses_tools(exclude_media=is_chart_symbol and media_calls >= 1), **self._responses_request_options()}
+                if (
+                    name == "local_kb_search"
+                    and self._active_scenario is not None
+                    and self._active_scenario.name in {"platform_operation", "membership_permissions"}
+                    and self._has_internal_retrieval_evidence(observation)
+                ):
+                    finalize_after_internal_evidence = True
+            if finalize_after_internal_evidence:
+                final_request = {
+                    "model": request["model"],
+                    "input": outputs,
+                    "tools": [],
+                    **self._responses_request_options(),
+                    "tool_choice": "none",
+                }
+                if response_id:
+                    final_request["previous_response_id"] = response_id
+                final_response = self._responses_create(final_request)
+                self._capture_response_usage(final_response)
+                final_response_id = str(getattr(final_response, "id", "") or (final_response.get("id", "") if isinstance(final_response, dict) else ""))
+                return self._responses_text(final_response), observations, names, model_calls + 1, tool_calls, final_response_id, "internal_evidence_finalized"
+            request = {
+                "model": request["model"],
+                "input": outputs,
+                "tools": self._responses_tools(
+                    exclude_media=is_chart_symbol and media_calls >= 1,
+                    disabled_tool_names=self._exhausted_search_tools(search_counts, is_chart_symbol=is_chart_symbol),
+                ),
+                **self._responses_request_options(),
+            }
             if response_id:
                 request["previous_response_id"] = response_id
             response = self._responses_create(request)
@@ -1587,7 +1642,10 @@ class NativeToolRuntime:
             search_fingerprints: set[str] = set()
             search_counts: dict[str, int] = {"local_kb_search": 0, "web_search": 0}
             for _ in range(self.max_steps):
-                model = self._bound_client(exclude_media=is_chart_symbol and media_calls >= 1)
+                model = self._bound_client(
+                    exclude_media=is_chart_symbol and media_calls >= 1,
+                    disabled_tool_names=self._exhausted_search_tools(search_counts, is_chart_symbol=is_chart_symbol),
+                )
                 response = model.invoke(model_messages)
                 model_calls += 1
                 calls = list(getattr(response, "tool_calls", []) or [])

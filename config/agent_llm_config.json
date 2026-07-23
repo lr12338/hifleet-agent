@@ -108,8 +108,8 @@
         "session_ttl_seconds": 86400
       },
       "search": {
-        "max_local_kb_calls": 2,
-        "max_web_calls": 2,
+        "max_local_kb_calls": 1,
+        "max_web_calls": 1,
         "max_facts": 3,
         "max_sources": 2
       },
