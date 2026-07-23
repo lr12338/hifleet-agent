@@ -19,9 +19,13 @@ The five-case fixture is a semantic specification, not a claimed 5/5 live result
 Before customer_support promotion, run it over both chains and record legacy/V2
 tools, evidence, claims, Draft states, and P95 agent orchestration time.
 
-Latest local evidence on 2026-07-23: `67 passed, 7 xfailed` for the focused V2
+Latest local evidence on 2026-07-23: `71 passed, 7 xfailed` for the focused V2
 and customer_ceshi selection, plus `219 passed` for the protected
-customer_support selection.
+customer_support selection. A broader customer_ceshi invocation completed with
+`174 passed, 1 skipped, 7 xfailed, 1 failed`; the single failure,
+`test_standard_agent_success_claim_without_write_is_blocked`, reproduces unchanged
+on `origin/main` at `333b2c156682dc2f978d113babe117b0a2824338` and is therefore
+recorded as a pre-existing baseline failure, not a Shared Skills V2 regression.
 
 For repeatable isolated HTTP validation, start a non-production process and run:
 
@@ -46,3 +50,8 @@ The latest isolated M02 probe on 2026-07-23 used the plain public input
 `local_kb_search`, zero successful `web_search` calls, and a conservative
 follow-up request. The runtime finalizes platform and membership replies from
 direct internal evidence rather than exposing another search turn.
+
+The public runner was rerun against an isolated current-worktree service on
+2026-07-23 without attachment URLs: M02, M04, and M05 passed; M01 and M03 were
+blocked as `attachment_url_not_supplied`; no case failed. This is a `3 passed,
+2 blocked` partial result, not a semantic 5/5 acceptance result.

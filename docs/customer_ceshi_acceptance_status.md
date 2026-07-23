@@ -41,11 +41,18 @@ Audit date: 2026-07-17. This is an evidence ledger, not a completion claim. `cus
 | Shared manifest registry | PASSED (unit) | `tests/skills_v2/` validates manifests, policy, adapters, validators, version metadata, and known-URL verification. |
 | customer_support default legacy | PASSED (config + regression) | `skill_runtime.customer_support.mode=legacy`; protected regression suite passed 219 tests on 2026-07-23 after the shadow integration. |
 | customer_support V2 shadow | PASSED (local + isolated HTTP) | `CUSTOMER_SUPPORT_SKILLS_SHADOW=true` keeps the legacy reply and records a non-executing, dry-run comparison with V2 allowed tools, prompt load size, versions, evidence count, claim indicator, latency, and write state. An isolated HTTP run logged `completed_contract_shadow` with no shadow write. |
-| customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder receives V2 descriptors and injected V2 Skill prompts when configured V2; runtime metrics and route trace carry mode plus upstream versions. `prepare_ship_update` invokes shared validators and reports `invalid_fields` before Draft creation. Focused V2/customer_ceshi suite passed 68 tests with 7 expected failures. |
+| customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder receives V2 descriptors and injected V2 Skill prompts when configured V2; runtime metrics and route trace carry mode plus upstream versions. `prepare_ship_update` invokes shared validators and reports `invalid_fields` before Draft creation. Focused V2/customer_ceshi suite passed 71 tests with 7 expected failures. |
 | External service smoke | PASSED (isolated safe service) | Current-worktree isolated `/run` and `/stream_run` calls passed with `customer_ceshi` V2 metadata including the locked upstream commit. Mock-only `/run` regression also verifies unchanged protocol and V2 metadata transport. |
-| Attachment semantic 5/5 / ≥95% | NOT_COMPLETE | No new live semantic corpus result is claimed. |
+| Attachment semantic 5/5 / ≥95% | NOT_COMPLETE | The isolated public runner passed M02, M04, and M05 on 2026-07-23, while M01 and M03 were blocked because no scoped attachment URLs were supplied. No 5/5 or expanded-corpus ≥95% result is claimed. |
 | M02 route-upload semantic probe | PASSED (isolated V2) | Plain public input executed exactly one `local_kb_search`, zero successful web searches, and returned a conservative follow-up. The evidence-directed probe also matched plan-panel and RTZ/XLS/TXT/CSV content; query metadata no longer counts as permission evidence. The other image-dependent public cases remain unrun without scoped attachment URLs. |
 | Production shadow / gradual rollout | NOT_COMPLETE | Configuration and adapter boundary exist; no production rollout is claimed. |
+
+The broader 2026-07-23 customer_ceshi invocation completed with `174 passed, 1
+skipped, 7 xfailed, 1 failed`. The one failing test,
+`test_standard_agent_success_claim_without_write_is_blocked`, was rerun against
+unchanged `origin/main` commit `333b2c156682dc2f978d113babe117b0a2824338` and
+fails identically; it is a pre-existing baseline issue rather than a Shared
+Skills V2 regression.
 
 ## Completion Decision
 
