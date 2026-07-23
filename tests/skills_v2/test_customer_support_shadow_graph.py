@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,27 @@ def test_customer_support_shadow_keeps_legacy_reply_and_records_dry_run(monkeypa
                 ]
             }
 
+    class FakeShadowModel:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def invoke(self, messages):
+            self.messages = list(messages)
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "scenario": "ship_update",
+                        "recommended_tools": ["prepare_ship_update"],
+                        "parameter_summary": {},
+                        "evidence_requirements": ["confirmation"],
+                        "high_risk_claims": [],
+                        "proposed_reply": "请确认草稿。",
+                        "confidence": "medium",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
     monkeypatch.setenv("CUSTOMER_SUPPORT_SKILLS_SHADOW", "true")
     monkeypatch.setattr("agents.agent._build_standard_agent", lambda *args, **kwargs: FakeStandardAgent())
     monkeypatch.setattr("agents.agent._load_all_tools", lambda _profile: [])
@@ -29,8 +51,9 @@ def test_customer_support_shadow_keeps_legacy_reply_and_records_dry_run(monkeypa
         "agents.agent._run_lightweight_customer_understanding",
         lambda **_kwargs: {"intent": "knowledge", "evidence_required": False, "search_query_candidates": []},
     )
+    shadow_model = FakeShadowModel()
     graph = _build_lightweight_customer_support_agent(
-        ctx=SimpleNamespace(headers={}, run_id="shadow-run"),
+        ctx=SimpleNamespace(headers={}, run_id="shadow-run", customer_support_v2_shadow_model=shadow_model),
         cfg={},
         workspace_path=str(ROOT),
         profile=AgentProfile(profile_id="customer_support", skills=[]),
@@ -43,6 +66,8 @@ def test_customer_support_shadow_keeps_legacy_reply_and_records_dry_run(monkeypa
 
     assert result["messages"][-1].content == "本次船舶信息更新尚未执行成功。"
     shadow = result["route_trace"]["skills_v2_shadow"]
-    assert shadow["status"] == "completed_contract_shadow"
+    assert shadow["status"] == "completed_prompt_shadow"
     assert shadow["dry_run"] is True
     assert shadow["executed_tools"] == []
+    assert shadow["shadow_inference"]["prompt_injected"] is True
+    assert "HiFleet Data V2" in shadow_model.messages[0].content

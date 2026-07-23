@@ -3612,6 +3612,15 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     allowed_tool_names = [tool.name for tool in loaded_tools]
     write_tool_names = [name for name in allowed_tool_names if name in {"upload_ship_position", "update_ship_static_info"}]
     standard_tool_names = [name for name in allowed_tool_names if name not in {"upload_ship_position", "update_ship_static_info"}]
+    shadow_model = getattr(ctx, "customer_support_v2_shadow_model", None) if ctx is not None else None
+    if shadow_model is None:
+        try:
+            from skills.core.policy import customer_support_shadow_enabled
+
+            if customer_support_shadow_enabled(workspace_path):
+                shadow_model = _build_llm(ctx, cfg, streaming=False)
+        except Exception as exc:
+            logger.info("customer_support Skills V2 prompt shadow model unavailable: %s", type(exc).__name__)
 
     def _extract_tool_sequence(messages: list[AnyMessage]) -> list[str]:
         sequence: list[str] = []
@@ -4407,14 +4416,17 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
                     route_trace=route_trace,
                     final_answer=sanitized,
                     workspace_path=workspace_path,
+                    shadow_model=shadow_model,
+                    user_text=str(state.get("task_goal") or latest_customer_user_text(messages)),
                 )
                 route_trace["skills_v2_shadow"] = shadow_record
                 logger.info(
-                    "[customer_support][skills_v2_shadow] status=%s legacy_tools=%s v2_tools=%s prompt_chars=%s write_state=%s latency_ms=%s",
+                    "[customer_support][skills_v2_shadow] status=%s legacy_tools=%s v2_tools=%s prompt_chars=%s prompt_injected=%s write_state=%s latency_ms=%s",
                     shadow_record.get("status"),
                     len(list((shadow_record.get("tool_selection") or {}).get("legacy") or [])),
                     len(list((shadow_record.get("tool_selection") or {}).get("v2_allowed") or [])),
                     shadow_record.get("prompt_loaded_chars"),
+                    (shadow_record.get("shadow_inference") or {}).get("prompt_injected"),
                     shadow_record.get("write_state"),
                     shadow_record.get("latency_ms"),
                 )

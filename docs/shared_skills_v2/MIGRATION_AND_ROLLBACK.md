@@ -6,18 +6,24 @@
 - `customer_ceshi` uses V2 when manifest loading succeeds; on V2 load failure it
   logs the reason and uses its existing constrained runtime.
 - The customer_support adapter is shadow-only. Set
-  `CUSTOMER_SUPPORT_SKILLS_SHADOW=true` to record a V2 contract comparison while
-  the legacy graph continues producing the customer-visible answer. A shadow write
-  is always dry-run-only and never invokes a duplicate low-level write.
+  `CUSTOMER_SUPPORT_SKILLS_SHADOW=true` to record a V2 comparison while the legacy
+  graph continues producing the customer-visible answer. When the existing text
+  model is available, the shadow receives the shared V2 Skill prompt and produces
+  one no-tool JSON assessment; otherwise it records the contract-only fallback.
+  A shadow write is always dry-run-only and never invokes a duplicate low-level
+  write.
 
 ## Shadow comparison
 
 For the same customer_support request, retain the legacy user response and record
 the V2 scenario, allowed tools, legacy-only tools, evidence count, high-risk
 success claim indicator, reply length, source versions, write state, tool count,
-and orchestration latency. Parameters and evidence are not replayed, because a
-shadow run must not duplicate reads or writes. Promotion remains internal account
-→ 5% → 20% → 50% → 100%. This repository does not claim a production rollout.
+and orchestration latency. A prompt-backed record additionally includes the V2
+scenario, filtered recommended tools, parameter/evidence requirements, confidence,
+and proposed-reply risk indicators. It never binds or executes tools; parameters
+and evidence are not replayed, so a shadow run cannot duplicate reads or writes.
+Promotion remains internal account → 5% → 20% → 50% → 100%. This repository does
+not claim a production rollout.
 
 ## Rollback
 

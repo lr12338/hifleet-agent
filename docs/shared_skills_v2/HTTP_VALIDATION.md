@@ -19,9 +19,12 @@ write request was made.
 
 An isolated `customer_support` request with `CUSTOMER_SUPPORT_SKILLS_SHADOW=true`
 returned the legacy customer answer while server logs recorded
-`completed_contract_shadow`, `legacy_tools=0`, `v2_tools=20`, and
-`write_state=no_shadow_write`. The external response deliberately does not expose
-the full shadow record to customers.
+`completed_prompt_shadow`, `legacy_tools=6`, `v2_tools=20`,
+`prompt_injected=True`, `write_state=no_shadow_write`, and 10,983 ms shadow
+orchestration latency. The V2 shadow model received the injected shared Skill
+prompt but was never bound to or allowed to execute tools; the external response
+deliberately does not expose the full shadow record to customers. This is one
+safe sample, not a P95 comparison or production rollout result.
 
 Mock-only protocol regression on 2026-07-23 used FastAPI's `/run` entry with a
 fake runtime. It proved unchanged request handling for `user_id`, `session_id`,

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
 from skills.adapters.customer_support import build_customer_support_shadow_bundle, compare_legacy_trace_with_v2
@@ -42,6 +43,67 @@ def test_customer_support_shadow_is_opt_in_and_never_replays_writes(monkeypatch:
     assert comparison["write_state"] == "dry_run_required"
     assert comparison["prompt_loaded_chars"] > 0
     assert "upload_ship_position" in comparison["tool_selection"]["legacy_not_in_v2"]
+
+
+def test_customer_support_shadow_injects_v2_prompt_into_no_tool_model() -> None:
+    class FakeShadowModel:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def invoke(self, messages):
+            self.messages = list(messages)
+            return AIMessage(
+                content=json.dumps(
+                    {
+                        "scenario": "ship_update",
+                        "recommended_tools": ["prepare_ship_update", "upload_ship_position"],
+                        "parameter_summary": {"mmsi": "123456789"},
+                        "evidence_requirements": ["explicit confirmation"],
+                        "high_risk_claims": ["write success requires a real response"],
+                        "proposed_reply": "我会先生成草稿，等待确认。",
+                        "confidence": "medium",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    shadow_model = FakeShadowModel()
+    comparison = compare_legacy_trace_with_v2(
+        route_trace={"task_type": "ship_update", "tool_call_sequence": ["upload_ship_position"]},
+        final_answer="本次更新尚未确认成功。",
+        workspace_path=ROOT,
+        shadow_model=shadow_model,
+        user_text="请更新船位",
+    )
+
+    assert comparison["status"] == "completed_prompt_shadow"
+    assert comparison["executed_tools"] == []
+    assert isinstance(shadow_model.messages[0], SystemMessage)
+    assert "HiFleet Data V2" in shadow_model.messages[0].content
+    assert isinstance(shadow_model.messages[1], HumanMessage)
+    inference = comparison["shadow_inference"]
+    assert inference["prompt_injected"] is True
+    assert inference["recommended_tools"] == ["prepare_ship_update"]
+    assert inference["unapproved_recommended_tools"] == ["upload_ship_position"]
+    assert inference["proposed_reply_has_success_claim"] is False
+
+
+def test_customer_support_shadow_model_failure_keeps_contract_only_record() -> None:
+    class FailingShadowModel:
+        def invoke(self, _messages):
+            raise RuntimeError("model unavailable")
+
+    comparison = compare_legacy_trace_with_v2(
+        route_trace={},
+        final_answer="保守回复",
+        workspace_path=ROOT,
+        shadow_model=FailingShadowModel(),
+        user_text="普通咨询",
+    )
+
+    assert comparison["status"] == "completed_contract_shadow"
+    assert comparison["shadow_inference"]["status"] == "failed"
+    assert comparison["executed_tools"] == []
 
 
 def test_customer_adapters_share_business_contracts() -> None:

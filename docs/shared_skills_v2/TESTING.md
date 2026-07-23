@@ -21,9 +21,9 @@ plus 12 required extension cases. It is a semantic specification, not a claimed
 both chains and record legacy/V2 tools, evidence, claims, Draft states, and P95
 agent orchestration time.
 
-Latest local evidence on 2026-07-23: `80 passed, 7 xfailed` for the focused V2
+Latest local evidence on 2026-07-23: `82 passed, 7 xfailed` for the focused V2
 and customer_ceshi selection, plus `219 passed` for the protected
-customer_support selection. A broader customer_ceshi invocation completed with
+customer_support selection after the prompt-backed shadow change. A broader customer_ceshi invocation completed with
 `174 passed, 1 skipped, 7 xfailed, 1 failed`; the single failure,
 `test_standard_agent_success_claim_without_write_is_blocked`, reproduces unchanged
 on `origin/main` at `333b2c156682dc2f978d113babe117b0a2824338` and is therefore
