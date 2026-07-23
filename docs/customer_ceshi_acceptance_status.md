@@ -34,6 +34,17 @@ Audit date: 2026-07-17. This is an evidence ledger, not a completion claim. `cus
 | Full P0/P1 scenario E2E | PASSED | Operational HTTP runner executed all 24 manual-review cases: 24 passed on 2026-07-17. No forbidden write tool executed. This is not semantic Gold evaluation. |
 | Required observability | PASSED | Customer responses now expose requested/effective runtime, models, model/tool/media calls, cache hits, reasoning level, response-id tail, context turns, guard/fallback/finish results, output length, scenario, and Draft status without raw reasoning, keys, or signed URLs. |
 
+## Shared Skills V2 Update (2026-07-23)
+
+| Requirement | Status | Evidence |
+| --- | --- | --- |
+| Shared manifest registry | PASSED (unit) | `tests/skills_v2/` validates manifests, policy, adapters, validators, version metadata, and known-URL verification. |
+| customer_support default legacy | PASSED (config + regression) | `skill_runtime.customer_support.mode=legacy`; protected regression suite passed 219 tests on 2026-07-23. |
+| customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder now receives V2 descriptors and injected V2 Skill prompts when configured V2. Focused customer_ceshi suite passed 63 tests with 7 expected failures. |
+| External service smoke | PARTIAL | Live `/run` and `/stream_run` safe greeting calls passed, but their response metadata cannot prove the running process used the new V2 worktree. |
+| Attachment semantic 5/5 / ≥95% | NOT_COMPLETE | No new live semantic corpus result is claimed. |
+| Production shadow / gradual rollout | NOT_COMPLETE | Configuration and adapter boundary exist; no production rollout is claimed. |
+
 ## Completion Decision
 
 **NOT_COMPLETE.** The goal cannot be declared complete while failed, partially passed, `NOT_IMPLEMENTED`, or `NOT_RUN` requirements remain. No `SKIPPED`, `NOT_RUN`, or `NOT_IMPLEMENTED` item is represented as passed.
