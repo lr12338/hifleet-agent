@@ -15,11 +15,13 @@ service and model credentials; this task does not restart a service or send real
 ship writes. See `HTTP_VALIDATION.md` for the accurate current status.
 
 No live model latency baseline or attachment corpus is available in this workspace.
-The five-case fixture is a semantic specification, not a claimed 5/5 live result.
-Before customer_support promotion, run it over both chains and record legacy/V2
-tools, evidence, claims, Draft states, and P95 agent orchestration time.
+The public regression catalogue contains the original five attachment/flow cases
+plus 12 required extension cases. It is a semantic specification, not a claimed
+5/5 live result. Before customer_support promotion, run the applicable cases over
+both chains and record legacy/V2 tools, evidence, claims, Draft states, and P95
+agent orchestration time.
 
-Latest local evidence on 2026-07-23: `76 passed, 7 xfailed` for the focused V2
+Latest local evidence on 2026-07-23: `80 passed, 7 xfailed` for the focused V2
 and customer_ceshi selection, plus `219 passed` for the protected
 customer_support selection. A broader customer_ceshi invocation completed with
 `174 passed, 1 skipped, 7 xfailed, 1 failed`; the single failure,
@@ -34,7 +36,7 @@ PYTHONPATH=src .venv/bin/python scripts/validate_shared_skills_v2_http.py \
   --base-url http://127.0.0.1:18128 --profile customer_ceshi
 ```
 
-The five-case public regression runner uses the same `/run` entry and records
+The public regression runner uses the same `/run` entry and records
 `passed`, `failed`, or `blocked` without treating unavailable image files as a
 pass. Supply an HTTP-served attachment directory for image cases:
 
@@ -45,16 +47,24 @@ PYTHONPATH=src .venv/bin/python scripts/run_shared_skills_v2_regression.py \
   --report reports/shared_skills_v2/public-regression.json
 ```
 
+Use `--case M02 --case M04 --case M05` for the stable no-attachment subset. The
+controlled-evidence cases E09–E12 are marked `contract_only` and remain blocked
+until their deterministic fixture service is supplied; they are never counted as
+live semantic passes.
+
 The latest isolated M02 probe on 2026-07-23 used the plain public input
 `HiFleet 平台上传不了航线。` and completed with one successful
 `local_kb_search`, zero successful `web_search` calls, and a conservative
 follow-up request. The runtime finalizes platform and membership replies from
 direct internal evidence rather than exposing another search turn.
 
-The public runner was rerun against an isolated current-worktree service on
-2026-07-23 without attachment URLs: M02, M04, and M05 passed; M01 and M03 were
-blocked as `attachment_url_not_supplied`; no case failed. This is a `3 passed,
-2 blocked` partial result, not a semantic 5/5 acceptance result.
+The stable M02/M04/M05 subset was rerun against an isolated current-worktree
+service on 2026-07-23. All three cases passed the strengthened tool budget,
+forbidden-claim, answer, and Draft-state assertions; M04 stayed `prepared`, and
+M05 stayed `accepted` without production-write confirmation. M01, M03, E03, and
+E04 still require scoped image files, while E09–E12 require controlled fixture
+services. This is a `3 passed` subset result, not a semantic 5/5 or corpus-wide
+acceptance result.
 
 The upstream candidate verifier was also exercised against the locked
 `e4acf599192f3f1d247ef2da00e78d0cff89819c` revision. It passed trusted-source,
