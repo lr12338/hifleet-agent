@@ -20,3 +20,17 @@ def test_registry_filters_mutating_tools_from_profile_discovery():
 
     assert registry.has("local_kb_search")
     assert not registry.has("upsert_local_kb_entry")
+
+
+def test_registry_filters_browser_search_expansion_tools():
+    class Tool:
+        def __init__(self, name):
+            self.name = name
+
+    registry = CapabilityRegistry(
+        tools=[Tool("web_search"), Tool("web_search_agent_browser"), Tool("agent_browser_deep_search")]
+    )
+
+    assert registry.has("web_search")
+    assert not registry.has("web_search_agent_browser")
+    assert not registry.has("agent_browser_deep_search")

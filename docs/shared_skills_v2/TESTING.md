@@ -21,7 +21,7 @@ plus 12 required extension cases. It is a semantic specification, not a claimed
 both chains and record legacy/V2 tools, evidence, claims, Draft states, and P95
 agent orchestration time.
 
-Latest local evidence on 2026-07-23: `82 passed, 7 xfailed` for the focused V2
+Latest local evidence on 2026-07-23: `84 passed, 7 xfailed` for the focused V2
 and customer_ceshi selection, plus `219 passed` for the protected
 customer_support selection after the prompt-backed shadow change. A broader customer_ceshi invocation completed with
 `174 passed, 1 skipped, 7 xfailed, 1 failed`; the single failure,
@@ -71,3 +71,9 @@ The upstream candidate verifier was also exercised against the locked
 required-file, required-environment, API-host, and static Python contract checks;
 the focused sync tests cover rejected candidates and unchanged last-known-good
 locks.
+
+The V2-load failure regression forces manifest construction to fail and verifies
+that the resulting `legacy_constrained` runtime omits direct writes, knowledge
+administration, `web_search_agent_browser`, and `agent_browser_deep_search` while
+retaining known-URL enforcement for public-page verification. This is a local
+deterministic fallback test, not a production failure simulation.

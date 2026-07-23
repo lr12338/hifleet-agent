@@ -41,7 +41,7 @@ DEFAULT_MAX_STEPS = 8
 DEFAULT_CONTEXT_MAX_ROUNDS = 10
 DEFAULT_CONTEXT_RECENT_FULL_ROUNDS = 3
 READ_ONLY_TOOL_NAMES = {
-    "local_kb_search", "web_search", "web_search_agent_browser", "verify_public_page", "agent_browser_deep_search",
+    "local_kb_search", "web_search", "verify_public_page",
     "ship_search", "get_ship_position", "get_ship_archive", "get_psc_records", "get_ship_trajectory",
     "get_ship_call_ports", "get_ship_voyages", "get_last_departure", "get_current_stop", "search_ports", "get_port_detail",
     "inspect_media",
@@ -51,7 +51,7 @@ PREPARE_SHIP_UPDATE_TOOL_NAME = "prepare_ship_update"
 COMMIT_SHIP_UPDATE_TOOL_NAME = "commit_ship_update"
 CANCEL_SHIP_UPDATE_TOOL_NAME = "cancel_ship_update"
 MEDIA_UPDATE_EVIDENCE_TOOL_NAME = "record_media_update_candidate"
-_SEARCH_TOOL_NAMES = {"local_kb_search", "web_search", "web_search_agent_browser", "verify_public_page", "agent_browser_deep_search"}
+_SEARCH_TOOL_NAMES = {"local_kb_search", "web_search", "verify_public_page"}
 _UPDATE_INTENT = re.compile(r"(?:上传|更新|修改|补充|更正|录入).{0,24}(?:船位|位置|航速|航向|静态信息|船名|imo|呼号|船型|目的港|eta|吃水)|(?:船位|位置|航速|航向|静态信息|船名|imo|呼号|船型|目的港|eta|吃水).{0,24}(?:上传|更新|修改|补充|更正|录入)", re.I)
 _MEDIA_UPDATE_COMMAND = re.compile(r"(?:更新|上传|修改|更正|录入).{0,24}(?:船位|位置|ais|数据)?|(?:根据|按).{0,24}(?:图片|上图|附件|ais).{0,24}(?:更新|上传|修改)", re.I)
 _POSITION_UPDATE_TIME = re.compile(r"\d{4,5}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:?\d{2}(?::\d{2})?(?:\s*\(?UTC(?:[+-]\d{1,2})?\)?)?", re.I)
@@ -2273,7 +2273,9 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
     client = client or build_chat_model(ctx, cfg, role="text", streaming=True, model_override=str(deepseek_settings.get("model") or text_settings.get("model") or config.get("customer_ceshi_responses_text_model") or config.get("customer_ceshi_v2_text_model") or config.get("text_model") or ""), timeout=text_settings.get("timeout_seconds", config.get("customer_ceshi_responses_timeout_seconds", config.get("customer_ceshi_v2_timeout_seconds", 30))), allow_runtime_model_override=False)
     registry = getattr(ctx, "customer_ceshi_responses_tool_registry", None) if ctx is not None else None
     v2_bundle = None
-    if registry is None and resolve_skill_runtime("customer_ceshi", workspace_path) == "v2":
+    v2_fallback_reason = ""
+    requested_v2 = resolve_skill_runtime("customer_ceshi", workspace_path) == "v2"
+    if registry is None and requested_v2:
         try:
             v2_bundle = build_customer_ceshi_bundle(workspace_path)
             registry = CapabilityRegistry(
@@ -2282,8 +2284,12 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
                 enforce_known_public_urls=True,
             )
         except Exception as exc:
-            logger.warning("customer_ceshi Skills V2 is unavailable; using the existing constrained runtime: %s", type(exc).__name__)
-    registry = registry or CapabilityRegistry(skill_names=list(getattr(profile, "skills", []) or []))
+            v2_fallback_reason = type(exc).__name__
+            logger.warning("customer_ceshi Skills V2 is unavailable; using the existing constrained runtime: %s", v2_fallback_reason)
+    registry = registry or CapabilityRegistry(
+        skill_names=list(getattr(profile, "skills", []) or []),
+        enforce_known_public_urls=True,
+    )
     if client is None:
         raise RuntimeError("customer_ceshi native tool runtime is unavailable: model credentials or base URL are missing")
     runtime = runtime_config(cfg)
@@ -2316,8 +2322,9 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
         profile_prompt="\n\n---\n\n".join(part for part in (read_profile_prompt(profile), skill_prompt) if part),
         tool_descriptors=v2_bundle.descriptors if v2_bundle is not None else (),
         skill_runtime_metadata={
-            "mode": "v2" if v2_bundle is not None else "legacy",
+            "mode": "v2" if v2_bundle is not None else ("legacy_constrained" if requested_v2 else "legacy"),
             "source_versions": dict(v2_bundle.source_versions) if v2_bundle is not None else {},
+            **({"fallback_reason": v2_fallback_reason} if v2_fallback_reason else {}),
         },
     )
     return _NamespacedRuntime(

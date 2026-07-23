@@ -15,7 +15,14 @@ from skills.core.result_normalizer import normalize_tool_result
 
 
 WRITE_TOOL_NAMES = {"upload_ship_position", "update_ship_static_info"}
-DENIED_TOOL_NAMES = WRITE_TOOL_NAMES | {"upsert_local_kb_entry", "download_public_file_to_artifact", "run_sandboxed_python", "upload_customer_artifact"}
+DENIED_TOOL_NAMES = WRITE_TOOL_NAMES | {
+    "agent_browser_deep_search",
+    "web_search_agent_browser",
+    "upsert_local_kb_entry",
+    "download_public_file_to_artifact",
+    "run_sandboxed_python",
+    "upload_customer_artifact",
+}
 
 
 @dataclass(frozen=True)

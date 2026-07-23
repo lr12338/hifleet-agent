@@ -4,7 +4,10 @@
 
 - `customer_support` remains `legacy` by default.
 - `customer_ceshi` uses V2 when manifest loading succeeds; on V2 load failure it
-  logs the reason and uses its existing constrained runtime.
+  logs the exception class and uses a `legacy_constrained` runtime. That fallback
+  still denies direct writes, knowledge administration, and both autonomous
+  browser-search tools; `verify_public_page` remains limited to URLs returned by
+  the current runtime's `web_search`.
 - The customer_support adapter is shadow-only. Set
   `CUSTOMER_SUPPORT_SKILLS_SHADOW=true` to record a V2 comparison while the legacy
   graph continues producing the customer-visible answer. When the existing text
