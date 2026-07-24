@@ -209,3 +209,28 @@ curl -N -X POST http://127.0.0.1:10123/stream_run \
 ```
 
 若当前会话没有有效媒体候选、字段不完整或运行环境不允许写入，系统应拒绝执行或继续追问，而不是宣称更新成功。测试链路的内部模型、媒体转换和证据门禁见 [CUSTOMER_CESHI_ARCHITECTURE.md](CUSTOMER_CESHI_ARCHITECTURE.md)。
+
+## 对话测试工作台与调试接口
+
+### /run 与 /stream_run 用途区别
+
+- `POST /run`：非流式，模拟外部服务真实调用。默认 `response_mode=compact` 模拟外部消费者；可切 `full`。保留原始 HTTP 状态码、响应体、`run_id`、总耗时。本地 E2E 必须真正请求 `http://127.0.0.1:10123/run`。
+- `POST /stream_run`：SSE 流式，验证执行步骤、工具调用、输出过程和最终回复。普通流保持客户安全输出；管理台通过服务端内部调试 Token（`x-internal-debug-trace`，仅 `/admin/test/run` 代理注入）获取 DebugEvent V1 流。
+
+### 两个 Profile 运行时区别
+
+- `customer_support`：正式 Chat API/Chat Function Calling/LangGraph 客服链。
+- `customer_ceshi`：Responses API 优先，能力不可用时回退到同链路 Chat Function Calling。当前 Provider 不支持原生 Responses token 流，V1 流为“步骤流”。
+
+### 管理台测试代理契约
+
+`/admin/test/run` 代理（`src/admin_api/service.py`）：
+- **SSRF allowlist**：仅允许 `AGENT_BASE_URL` 与 `AGENT_ALLOWLIST` 配置地址；拒绝云元数据/链路本地地址。
+- **分级超时**：connect/read/write/pool 分离，非单一总超时。
+- **/run** 返回 upstream status、脱敏 headers、body、latency_ms、run_id。
+- **/stream_run** 保留上游状态码/Content-Type/`x-run-id`；客户端断开关闭上游；空闲发 heartbeat；`finally` 记录 ended/cancelled/failed。
+- **取消**：`POST /admin/test/cancel/{run_id}` 转发到 Agent `/cancel/{run_id}`。
+
+### 请求/响应对外契约兼容
+
+`/run` 与 `/stream_run` 的对外请求格式不变（共用 `messages`/`session_id`/`user_id`/`source_channel`/`agent_profile`），调试字段不进入普通客户响应。详见 `docs/DEBUG_EVENT_PROTOCOL.md` 与 `docs/ADMIN_CHAT_DEBUG.md`。
