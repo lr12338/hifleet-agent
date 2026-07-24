@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
+import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException, Request, UploadFile
+
+from debug_events.redaction import redact_headers
 
 from observability import repository
 from observability.schemas import LogListFilters
@@ -17,6 +24,8 @@ from llm_config import build_thinking_payload, export_llm_config_view, load_llm_
 from storage.s3.s3_storage import S3SyncStorage
 
 from .schemas import AdminTestRunRequest, ArkAttachment, ArkChatRequest, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LLMConfigRequest, LogListQuery, SessionListQuery
+
+logger = logging.getLogger(__name__)
 
 
 def list_logs(query: LogListQuery) -> dict[str, Any]:
@@ -151,6 +160,21 @@ def list_chat_debug_sessions(limit: int = 20) -> dict[str, Any]:
 
 
 def save_chat_debug_session(req: ChatDebugSessionSaveRequest) -> dict[str, Any]:
+    # Persist explicit contract fields inside the payload JSONB so they survive
+    # restore and remain queryable without a schema migration. The full session
+    # object (including meta.endpoint/response_mode/agent_profile) is the source
+    # of truth; these top-level fields make the contract explicit.
+    enriched_payload = dict(req.payload) if isinstance(req.payload, dict) else {"value": req.payload}
+    contract = {
+        "agent_profile": req.agent_profile,
+        "endpoint": req.endpoint,
+        "response_mode": req.response_mode,
+    }
+    if isinstance(enriched_payload.get("meta"), dict):
+        for key, value in contract.items():
+            if value is not None:
+                enriched_payload["meta"].setdefault(key, value)
+    enriched_payload["_contract"] = {k: v for k, v in contract.items() if v is not None}
     repository.upsert_chat_debug_session(
         session_key=req.session_key,
         title=req.title,
@@ -159,7 +183,7 @@ def save_chat_debug_session(req: ChatDebugSessionSaveRequest) -> dict[str, Any]:
         user_id=req.user_id,
         source_channel=req.source_channel,
         model=req.model,
-        payload=req.payload,
+        payload=enriched_payload,
     )
     return {"ok": True, "session_key": req.session_key}
 
@@ -169,6 +193,9 @@ def remove_chat_debug_session(session_key: str) -> dict[str, Any]:
     return {"ok": True, "session_key": session_key}
 
 
+_BLOCKED_METADATA_HOSTS = {"169.254.169.254", "metadata.google.internal", "metadata.azure.com"}
+
+
 def _default_target_agent_url() -> str:
     configured = os.getenv("AGENT_BASE_URL", "").strip()
     if configured:
@@ -176,18 +203,100 @@ def _default_target_agent_url() -> str:
     return "http://127.0.0.1:10123"
 
 
+def _allowlist_targets() -> list[str]:
+    """Targets the admin proxy may forward to. Defaults to the configured Agent URL."""
+    targets: list[str] = []
+    configured = os.getenv("AGENT_BASE_URL", "").strip()
+    if configured:
+        targets.append(configured.rstrip("/"))
+    extra = os.getenv("AGENT_ALLOWLIST", "").strip()
+    if extra:
+        for item in extra.split(","):
+            item = item.strip().rstrip("/")
+            if item:
+                targets.append(item)
+    if not targets:
+        targets.append(_default_target_agent_url())
+    return targets
+
+
+def _host_key(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    return f"{host}:{port}" if port else host
+
+
+def _is_blocked_metadata_target(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host in _BLOCKED_METADATA_HOSTS:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_link_local or ip in ipaddress.ip_network("169.254.0.0/16")
+
+
+def _resolve_allowed_target_url(req: AdminTestRunRequest) -> str:
+    """Resolve the agent target URL strictly from the allowlist to prevent SSRF.
+
+    A caller-supplied ``target_agent_url`` is only honoured when its host:port is
+    in the configured allowlist; cloud metadata / link-local addresses are always
+    rejected.
+    """
+    allowlist = _allowlist_targets()
+    requested = (req.target_agent_url or "").strip().rstrip("/")
+    if requested:
+        if _is_blocked_metadata_target(requested):
+            raise HTTPException(status_code=400, detail="target_agent_url points to a blocked metadata endpoint")
+        allowed_hosts = {_host_key(t) for t in allowlist}
+        if _host_key(requested) not in allowed_hosts:
+            raise HTTPException(status_code=400, detail="target_agent_url is not in the SSRF allowlist")
+        return requested
+    return allowlist[0]
+
+
+def _graded_timeout(req: AdminTestRunRequest) -> httpx.Timeout:
+    """Separate connect/read/write/pool timeouts instead of one blunt total."""
+    total = max(1, int(req.timeout_s))
+    return httpx.Timeout(connect=min(10, total), read=total, write=min(30, total), pool=min(10, total))
+
+
+def _proxy_headers(req: AdminTestRunRequest) -> dict[str, str]:
+    return {"x-run-id": req.run_id} if req.run_id else {}
+
+
+def _internal_debug_header() -> dict[str, str]:
+    """Internal debug token injected only by the admin proxy (server-side).
+
+    External callers passing the same header name cannot enable debug trace
+    unless they know the server-side token; the agent validates it.
+    """
+    token = os.getenv("INTERNAL_DEBUG_TRACE_TOKEN", "").strip()
+    return {"x-internal-debug-trace": token} if token else {}
+
+
 async def proxy_test_run(req: AdminTestRunRequest) -> dict[str, Any]:
-    base_url = (req.target_agent_url or _default_target_agent_url()).rstrip("/")
-    url = f"{base_url}{req.endpoint}"
-    timeout = httpx.Timeout(req.timeout_s)
-    headers = {"x-run-id": req.run_id} if req.run_id else None
+    base = _resolve_allowed_target_url(req)
+    url = f"{base}{req.endpoint}"
+    started = time.perf_counter()
+    timeout = _graded_timeout(req)
+    headers = _proxy_headers(req)
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(url, json=req.payload, headers=headers)
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    body = _try_json(response)
+    run_id = str((body.get("run_id") if isinstance(body, dict) else "") or req.run_id or "")
+    logger.info("/run proxy completed: run_id=%s status=%s latency_ms=%s", run_id, response.status_code, latency_ms)
     return {
         "target_url": url,
         "status_code": response.status_code,
-        "headers": dict(response.headers),
-        "body": _try_json(response),
+        "headers": redact_headers(dict(response.headers)),
+        "body": body,
+        "latency_ms": latency_ms,
+        "run_id": run_id,
     }
 
 
@@ -198,26 +307,73 @@ def _try_json(response: httpx.Response) -> Any:
         return {"raw_text": response.text}
 
 
-async def stream_test_run(req: AdminTestRunRequest):
-    base_url = (req.target_agent_url or _default_target_agent_url()).rstrip("/")
-    url = f"{base_url}{req.endpoint}"
-    timeout = httpx.Timeout(req.timeout_s)
+_STREAM_IDLE_TIMEOUT = 15.0
+
+
+async def stream_test_run(req: AdminTestRunRequest, client_request: Request):
+    """Proxy a real SSE stream from the agent with SSRF guard, graded timeouts,
+    upstream status validation, client-disconnect detection, heartbeat on idle,
+    and guaranteed upstream close in ``finally``."""
+    base = _resolve_allowed_target_url(req)
+    url = f"{base}{req.endpoint}"
+    timeout = _graded_timeout(req)
+    headers = {**_proxy_headers(req), **_internal_debug_header()}
 
     client = httpx.AsyncClient(timeout=timeout)
-    headers = {"x-run-id": req.run_id} if req.run_id else None
-    request = client.build_request("POST", url, json=req.payload, headers=headers)
-    response = await client.send(request, stream=True)
+    upstream_request = client.build_request("POST", url, json=req.payload, headers=headers)
+    response = await client.send(upstream_request, stream=True)
+
+    if response.status_code >= 400:
+        body = await response.aread()
+        await response.aclose()
+        await client.aclose()
+        detail = body.decode("utf-8", errors="ignore") or "upstream error"
+        logger.warning("/stream_run proxy upstream error: status=%s", response.status_code)
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    run_id = req.run_id or ""
 
     async def _iterator():
+        outcome = "ended"
         try:
-            async for chunk in response.aiter_raw():
+            raw_iter = response.aiter_raw()
+            while True:
+                if await client_request.is_disconnected():
+                    outcome = "client_disconnected"
+                    logger.info("/stream_run proxy client disconnected: run_id=%s", run_id)
+                    break
+                try:
+                    chunk = await asyncio.wait_for(raw_iter.__anext__(), timeout=_STREAM_IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    yield b": heartbeat\n\n"
+                    continue
+                except StopAsyncIteration:
+                    break
                 if chunk:
                     yield chunk
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as exc:  # noqa: BLE001 - log and end the stream cleanly
+            outcome = f"failed:{type(exc).__name__}"
+            logger.exception("/stream_run proxy iterator error: run_id=%s", run_id)
         finally:
             await response.aclose()
             await client.aclose()
+            logger.info("/stream_run proxy stream %s: run_id=%s", outcome, run_id)
 
     return response, _iterator()
+
+
+async def cancel_test_run(run_id: str) -> dict[str, Any]:
+    """Forward a cancel to the agent's /cancel/{run_id} (allowlist-guarded)."""
+    base = _resolve_allowed_target_url(AdminTestRunRequest(payload={}))
+    url = f"{base}/cancel/{run_id}"
+    timeout = httpx.Timeout(connect=5, read=10, write=5, pool=5)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url)
+    logger.info("/cancel proxy: run_id=%s status=%s", run_id, response.status_code)
+    return {"status_code": response.status_code, "body": _try_json(response)}
 
 
 def _build_oss_public_url(bucket_name: str, object_key: str, endpoint: str) -> str:

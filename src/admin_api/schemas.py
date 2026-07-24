@@ -70,6 +70,9 @@ class ChatDebugSessionSaveRequest(BaseModel):
     source_channel: str
     model: str
     payload: dict[str, Any]
+    agent_profile: Literal['customer_support', 'customer_ceshi'] | None = None
+    endpoint: Literal['/run', '/stream_run'] | None = None
+    response_mode: Literal['compact', 'full'] | None = None
 
 
 class ChatDebugSessionListQuery(BaseModel):

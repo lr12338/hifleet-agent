@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from .auth import verify_admin_api_key
 from .schemas import AdminTestRunRequest, ArkChatRequest, ChatDebugSessionListQuery, ChatDebugSessionSaveRequest, DashboardSummaryQuery, LLMConfigRequest, LogListQuery, SessionListQuery
 from .service import (
+    cancel_test_run,
     get_dashboard_summary,
     get_llm_config,
     get_log_detail,
@@ -128,16 +129,25 @@ async def admin_chat_debug_session_delete(session_key: str):
 
 
 @router.post("/test/run")
-async def admin_test_run(req: AdminTestRunRequest):
+async def admin_test_run(req: AdminTestRunRequest, request: Request):
     is_streaming = req.stream or req.endpoint == "/stream_run"
     if not is_streaming:
         return await proxy_test_run(req)
-    upstream_response, iterator = await stream_test_run(req)
-    return StreamingResponse(
+    upstream_response, iterator = await stream_test_run(req, request)
+    response = StreamingResponse(
         iterator,
         media_type=upstream_response.headers.get("content-type", "text/event-stream"),
         status_code=upstream_response.status_code,
     )
+    run_id = req.run_id or ""
+    if run_id:
+        response.headers["x-run-id"] = run_id
+    return response
+
+
+@router.post("/test/cancel/{run_id}")
+async def admin_test_cancel(run_id: str):
+    return await cancel_test_run(run_id)
 
 
 @router.post("/files/upload")
