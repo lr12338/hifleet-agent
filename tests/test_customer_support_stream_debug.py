@@ -5,59 +5,51 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agents.customer_support_stream_debug import (
     DebugRuntimeCursor,
-    build_customer_support_debug_events,
     build_customer_support_debug_events_from_update,
 )
 
 
-def _events_for(text, attachment=None):
-    content = []
-    if attachment:
-        content.append({"type": "image_url", "image_url": {"url": attachment}})
-    content.append({"type": "text", "text": text})
-    return build_customer_support_debug_events({"messages": [{"role": "user", "content": content}]})
+def test_no_filename_special_casing_for_01_query():
+    """附件名 01_query.png 不得被推断为'安全水域浮标'。"""
+    cursor = DebugRuntimeCursor()
+    update = {
+        "delegate": {
+            "route": "knowledge",
+            "task_type": "platform_knowledge",
+            "attachments": [{"type": "image", "filename": "01_query.png", "url": "https://b.oss.com/k?Signature=s"}],
+            "route_trace": {"tool_call_sequence": ["smart_search"]},
+        }
+    }
+    events = build_customer_support_debug_events_from_update(update, cursor)
+    text = " ".join(str(item.get("text", "")) for item in events)
+    assert "安全水域浮标" not in text
+    assert "锚地" not in text
+    # No fabricated tool_request / planned tool_response
+    assert not any(item["type"] == "tool_request" for item in events)
+    assert not any(item["type"] == "tool_response" for item in events)
+    # thinking events must be marked runtime_summary, not provider reasoning
+    thinking = [item for item in events if item["type"] == "thinking"]
+    assert thinking and all(item.get("source") == "runtime_summary" for item in thinking)
 
 
-def test_reference_01_stream_debug_explains_chart_symbol_search():
-    events = _events_for("这个在全球海图里是什么意思", "/home/ecs-user/coze_ai/docs/参考链路/01_query.png")
-    text = "\n".join(str(item.get("text", "")) for item in events)
-
-    assert any(item["type"] == "thinking" for item in events)
-    assert any(item["type"] == "tool_request" for item in events)
-    assert "安全水域浮标" in text
-    assert "HiFleet 全球海图 海图符号" in text
-    assert "后置内容质检" in text
+def test_no_pre_fabricated_tool_calls_or_planned_results():
+    """运行路径不得在工具未真实执行时生成 tool_request/planned tool_response。"""
+    cursor = DebugRuntimeCursor()
+    update = {"delegate": {"route": "knowledge", "task_type": "platform_knowledge"}}
+    events = build_customer_support_debug_events_from_update(update, cursor)
+    assert not any(item["type"] == "tool_request" for item in events)
+    assert not any(item["type"] == "tool_response" for item in events)
 
 
-def test_reference_02_stream_debug_has_upload_route_searches():
-    events = _events_for("hifleet平台上传不了航线怎么办")
-    text = "\n".join(str(item.get("text", "")) for item in events)
-    queries = [item for item in events if item["type"] == "tool_request"]
-
-    assert len(queries) >= 3
-    assert "上传航线" in text
-    assert "文件格式" in text
-    assert "标准客服 Agent" in text
-
-
-def test_reference_03_stream_debug_explains_anchor_area_circles():
-    events = _events_for("图中的小圈圈是什么意思？", "/home/ecs-user/coze_ai/docs/参考链路/03_query.png")
-    text = "\n".join(str(item.get("text", "")) for item in events)
-
-    assert "锚地" in text
-    assert "附件输入分析" in text
-    assert any(item["type"] == "tool_response" for item in events)
-
-
-def test_reference_04_stream_debug_is_safe_methodology():
-    events = _events_for("基于上述对输入的思考与回复，总结是如何思索和检索资源并审查确定的，详细介绍逻辑")
-    text = "\n".join(str(item.get("text", "")) for item in events)
-
-    assert "前置安全" in text
-    assert "本地知识库" in text
-    assert "不展示内部工具名" in text
-    assert "api_key" not in text.lower()
-    assert "system prompt" not in text.lower()
+def test_runtime_summary_is_factual_not_stepwise_masquerade():
+    cursor = DebugRuntimeCursor()
+    update = {"delegate": {"route": "knowledge", "task_type": "platform_knowledge"}}
+    events = build_customer_support_debug_events_from_update(update, cursor)
+    thinking = [item for item in events if item["type"] == "thinking"][0]
+    assert thinking["source"] == "runtime_summary"
+    assert "运行时摘要" in thinking["text"]
+    # Must not present fabricated step-by-step model reasoning
+    assert "1. 前置安全" not in thinking["text"]
 
 
 def test_runtime_update_debug_events_follow_real_delegate_state():
@@ -72,14 +64,13 @@ def test_runtime_update_debug_events_follow_real_delegate_state():
             },
         }
     }
-
     events = build_customer_support_debug_events_from_update(update, cursor)
-    text = "\n".join(str(item.get("text", "")) for item in events)
+    text = " ".join(str(item.get("text", "")) for item in events)
 
     assert any(item["type"] == "message_start" for item in events)
-    assert any(item["type"] == "tool_response" for item in events)
-    assert "标准客服 Agent" in text
-    assert "附件输入分析" in text
+    # No fake tool_response/completed; recorded tools surfaced as runtime_summary fact only
+    assert not any(item["type"] == "tool_response" for item in events)
+    assert any(item.get("source") == "runtime_summary" for item in events)
 
 
 def test_runtime_update_debug_events_follow_post_guard_state():
@@ -93,13 +84,13 @@ def test_runtime_update_debug_events_follow_post_guard_state():
             }
         }
     }
-
     events = build_customer_support_debug_events_from_update(update, cursor)
-    text = "\n".join(str(item.get("text", "")) for item in events)
+    text = " ".join(str(item.get("text", "")) for item in events)
 
     assert any(item["type"] == "thinking" for item in events)
     assert "后置内容质检" in text
     assert "安全兜底" in text
+    assert all(item.get("source") == "runtime_summary" for item in events if item["type"] == "thinking")
 
 
 def test_runtime_update_debug_events_emit_final_answer():
@@ -109,9 +100,21 @@ def test_runtime_update_debug_events_emit_final_answer():
             "messages": [{"role": "assistant", "content": "HiFleet 绿点一般表示船位状态正常。"}]
         }
     }
-
     events = build_customer_support_debug_events_from_update(update, cursor)
 
     assert events[0]["type"] == "answer"
     assert "绿点" in events[0]["text"]
     assert events[-1]["type"] == "message_end"
+
+
+def test_no_sensitive_attachment_url_in_events():
+    cursor = DebugRuntimeCursor()
+    update = {
+        "delegate": {
+            "route": "knowledge",
+            "attachments": [{"type": "image", "url": "https://b.oss.com/k?Signature=SECRET&Expires=1"}],
+        }
+    }
+    events = build_customer_support_debug_events_from_update(update, cursor)
+    blob = repr(events)
+    assert "Signature=SECRET" not in blob
