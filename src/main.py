@@ -45,9 +45,9 @@ from agents.profiles import PROFILE_HEADER, resolve_profile_id, set_current_agen
 from agents.customer_support_guard import sanitize_customer_output
 from agents.customer_support_stream_debug import (
     DebugRuntimeCursor,
-    build_customer_support_debug_events,
     build_customer_support_debug_events_from_update,
 )
+from agents.debug_stream_v1 import is_debug_request as _is_debug_v1_request
 from llm_config import load_llm_config, messages_have_multimodal_content, resolve_model_selection
 from utils.context_headers import ensure_context_headers
 from utils.llm_route_state import clear_current_llm_route, set_current_llm_route
@@ -616,6 +616,35 @@ class AgentService:
                 for event in build_customer_support_debug_events_from_update(data, cursor):
                     yield self._sse_event(event)
                     await asyncio.sleep(0)
+        finally:
+            self.running_tasks.pop(run_id, None)
+            clear_current_llm_route()
+        schedule_cozeloop_flush()
+
+    async def debug_v1_stream(self, payload: Dict[str, Any], ctx, run_id: str, agent_profile: str, model: str | None = None) -> AsyncGenerator[str, None]:
+        """Emit a DebugEvent V1 SSE stream (admin debug mode only).
+
+        Normal customer stream is untouched; this path is only reached when the
+        internal debug header carries the server-side token.
+        """
+        from agents.debug_stream_v1 import stream_debug_v1
+
+        graph = self._get_graph(ctx)
+        run_config = init_agent_config(graph, ctx)
+        session_id = str(payload.get("session_id", "")).strip() if isinstance(payload, dict) else ""
+        thread_id = session_id or run_id
+        if not isinstance(run_config, dict):
+            run_config = {}
+        configurable = run_config.get("configurable")
+        if not isinstance(configurable, dict):
+            configurable = {}
+            run_config["configurable"] = configurable
+        configurable["thread_id"] = thread_id
+        try:
+            async for frame in stream_debug_v1(
+                agent_profile, graph, payload, run_config, ctx, run_id, session_id=session_id, model=model
+            ):
+                yield frame.decode("utf-8")
         finally:
             self.running_tasks.pop(run_id, None)
             clear_current_llm_route()
@@ -1215,7 +1244,28 @@ async def http_stream_run(request: Request):
         f"llm_thinking={llm_route.get('thinking_type')}, llm_effort={llm_route.get('reasoning_effort')}"
     )
     stream_payload = ensure_stream_compatible_payload(payload)
-    
+
+    if _is_debug_v1_request(dict(request.headers)):
+        debug_generator = service.debug_v1_stream(
+            stream_payload, ctx, run_id, agent_profile, model=llm_route.get("model")
+        )
+        response = StreamingResponse(debug_generator, media_type="text/event-stream")
+        response.headers["x-debug-v1"] = "1"
+        _log_api_call_event(
+            run_id=run_id,
+            route="/stream_run",
+            status="streaming",
+            http_status_code=200,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            payload=payload,
+            response_json={"message": "debug v1 stream started"},
+            session_id=session_id,
+            user_id=user_id,
+            source_channel=source_channel,
+            intent_hint=intent_hint,
+        )
+        return response
+
     try:
         stream_generator = agent_stream_handler(
             payload=stream_payload,
