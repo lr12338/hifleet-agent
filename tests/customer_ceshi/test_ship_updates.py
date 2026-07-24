@@ -129,3 +129,31 @@ def test_text_static_preflight_prepares_only_current_turn_fields(tmp_path):
     assert observation is not None
     assert observation.status == "success"
     assert observation.data["fields"] == {"destination": "PIRAEUS", "eta": "2026-07-18 10:00"}
+
+
+def test_position_normalizer_handles_dms_with_seconds_and_labelled_newlines():
+    text = "纬度\n39°01′55″ N\n经度\n121°42′55″ E"
+    value = PositionNormalizer().normalize(text)
+    assert round(value["latitude"], 6) == 39.031944
+    assert round(value["longitude"], 6) == 121.715278
+    assert value["confidence"] == "deterministic"
+
+
+def test_position_normalizer_handles_labelled_dms_without_hemisphere():
+    value = PositionNormalizer().normalize("经度：121°42′55″  纬度：39°01′55″")
+    assert round(value["longitude"], 6) == 121.715278
+    assert round(value["latitude"], 6) == 39.031944
+    assert value["confidence"] == "deterministic"
+
+
+def test_static_field_normalizer_handles_newline_labelled_hifleet_paste():
+    text = "更新船位，更新于2026-07-06 14:13:00 UTC+8\nMMSI\n730285526\nIMO\n-\n船旗\n哥伦比亚\n类型\n未知类型船舶\n吃水\n-\nETA\n-"
+    fields = StaticFieldNormalizer().normalize(text)
+    assert fields["fields"] == {"flag": "哥伦比亚", "ship_type": "未知类型船舶"}
+    assert {"imo", "draft", "eta"}.issubset(set(fields["invalid_fields"]))
+
+
+def test_time_normalizer_handles_utc_plus_eight_suffix():
+    value = TimeNormalizer().normalize("2026-07-06 14:13:00 UTC+8")
+    assert value["value"] == "2026-07-06 14:13:00 UTC+8"
+    assert value["validation_errors"] == []

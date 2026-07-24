@@ -86,6 +86,8 @@ HIFLEET_KB_UPDATE_KEY=...
 
 `PGDATABASE_URL` 与 `COZE_CHECKPOINTER_MODE=postgres` 用于共享持久会话；没有可用的共享记忆时，服务默认单 worker 以避免会话串扰。管理台需要额外的 `ADMIN_API_KEY`。
 
+完整的 Agent 定义、场景地图、知识检索、Skills 架构、外部接口和模拟验证要求见 `docs/HIFLEET_CUSTOMER_SUPPORT_AGENT_REQUIREMENTS.md`。
+
 ### 排障顺序
 
 1. 通过 `/health`、服务日志和 `/admin-ui` 确认服务、模型配置和依赖可用。

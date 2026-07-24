@@ -851,3 +851,102 @@ def test_customer_ceshi_profile_prompt_is_injected_into_native_runtime():
     )
 
     assert "HiFleet 企业客服" in runtime._system([]).content
+
+
+def test_ship_lookup_scenario_keeps_knowledge_tools_available():
+    from agents.customer_ceshi_responses.scenarios import classify
+
+    runtime = NativeToolRuntime(
+        client=ResponsesClient(),
+        registry=CapabilityRegistry(tools=[local_kb_search]),
+        perception=PerceptionService(FakePerception()),
+        config={},
+        mode="responses",
+        responses_client=ResponsesClient(),
+    )
+    runtime._active_scenario = classify("咱们的船位跟踪是北京时间，还是GMT时间哈")
+    assert runtime._active_scenario.name == "ship_lookup"
+    tool_names = {tool["name"] for tool in runtime._responses_tools()}
+    assert "local_kb_search" in tool_names
+    assert "prepare_ship_update" in tool_names
+
+
+def test_platform_operation_scenario_still_restricts_to_knowledge_tools():
+    from agents.customer_ceshi_responses.scenarios import classify
+
+    runtime = NativeToolRuntime(
+        client=ResponsesClient(),
+        registry=CapabilityRegistry(tools=[local_kb_search]),
+        perception=PerceptionService(FakePerception()),
+        config={},
+        mode="responses",
+        responses_client=ResponsesClient(),
+    )
+    runtime._active_scenario = classify("HiFleet 平台上传不了航线")
+    assert runtime._active_scenario.name == "platform_operation"
+    tool_names = {tool["name"] for tool in runtime._responses_tools()}
+    assert "local_kb_search" in tool_names
+    assert "prepare_ship_update" not in tool_names
+
+
+def test_trajectory_span_exceeds_limit_returns_actionable_error():
+    runtime = NativeToolRuntime(client=object(), registry=CapabilityRegistry(tools=[]), config={}, mode="chat_function_calling")
+    observation = runtime._trajectory_span_check({"starttime": "2026-01-01", "endtime": "2026-07-23"})
+    assert observation is not None
+    assert observation.status == "upstream_error"
+    assert "trajectory_span_exceeds_limit" in observation.warnings
+    assert observation.retry_allowed is True
+    assert "缩小" in observation.suggested_fix
+    assert runtime._trajectory_span_check({"starttime": "2026-07-20", "endtime": "2026-07-23"}) is None
+
+
+def test_trajectory_default_range_injected_when_missing():
+    runtime = NativeToolRuntime(client=object(), registry=CapabilityRegistry(tools=[]), config={}, mode="chat_function_calling")
+    defaulted = runtime._trajectory_default_range({})
+    assert defaulted["starttime"]
+    assert defaulted["endtime"]
+    assert runtime._trajectory_default_range({"starttime": "2026-07-01"}) == {"starttime": "2026-07-01"}
+
+
+def test_trajectory_dedup_and_budget_prevent_budget_burn():
+    runtime = NativeToolRuntime(client=object(), registry=CapabilityRegistry(tools=[]), config={"customer_ceshi_trajectory_max_calls": 2}, mode="chat_function_calling")
+    executed = []
+
+    def fake_execute(name, arguments, assets):
+        executed.append(dict(arguments))
+        return Observation(status="success", capability=name, facts=["trajectory point"])
+
+    runtime._execute = fake_execute
+    fingerprints = set()
+    counts = {"local_kb_search": 0, "web_search": 0}
+    args = {"mmsi": "414726000", "starttime": "2026-07-20", "endtime": "2026-07-23"}
+    assert runtime._resolve_bounded_observation("get_ship_trajectory", args, {}, fingerprints, counts, False).status == "success"
+    assert runtime._resolve_bounded_observation("get_ship_trajectory", {**args, "endtime": "2026-07-22"}, {}, fingerprints, counts, False).status == "success"
+    dup = runtime._resolve_bounded_observation("get_ship_trajectory", args, {}, fingerprints, counts, False)
+    assert dup.status == "forbidden" and "duplicate_trajectory_query" in dup.warnings
+    over = runtime._resolve_bounded_observation("get_ship_trajectory", {**args, "endtime": "2026-07-21"}, {}, fingerprints, counts, False)
+    assert over.status == "forbidden" and "trajectory_budget_exhausted" in over.warnings
+    assert len(executed) == 2
+
+
+def test_text_position_update_flows_to_llm_without_preflight_short_circuit():
+    class UpdateResponses:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                payload = {"operation_type": "position_update", "mmsi": "730285526", "longitude": "121°42′55″ E", "latitude": "39°01′55″ N", "updatetime": "2026-07-06 14:13:00 UTC+8"}
+                return SimpleNamespace(id="upd-1", output=[SimpleNamespace(type="function_call", name="prepare_ship_update", arguments=__import__("json").dumps(payload), call_id="upd-call-1")], output_text="", usage={})
+            return SimpleNamespace(id="upd-2", output=[], output_text="已生成更新草稿，请确认。", usage={})
+
+    client = ResponsesClient()
+    client.responses = UpdateResponses()
+    text_runtime = NativeToolRuntime(client=client, registry=CapabilityRegistry(tools=[]), perception=PerceptionService(FakePerception()), config={"customer_ceshi_max_steps": 5}, mode="responses", responses_client=client)
+    runtime = SingleModelCustomerCeshiRuntime(text_runtime=text_runtime)
+    result = runtime.invoke({"messages": [HumanMessage(content="更新船位，MMSI 730285526，更新于2026-07-06 14:13:00 UTC+8，纬度 39°01′55″ N，经度 121°42′55″ E")]}, {"configurable": {"thread_id": "text-update"}})
+    assert result["generated_tool_calls"] == ["prepare_ship_update"]
+    assert result["metrics"]["model_calls"] >= 1
+    prepared = [o for o in result["observations"] if o.get("capability") == "prepare_ship_update"]
+    assert prepared and prepared[0]["status"] == "success"

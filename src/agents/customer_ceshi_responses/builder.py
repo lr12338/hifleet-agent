@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator
 from urllib.parse import urlparse
@@ -64,6 +64,8 @@ _MEDIA_UPDATE_FIELDS = (
 _ACTION_SUCCESS_CLAIM = re.compile(r"(?:(?:本次|已|已经|操作|写入|上传).{0,8}(?:更新|上传|写入).{0,8}(?:成功|完成)|(?:更新|上传|写入)已(?:成功|完成))", re.I)
 _NO_RESULT_CLAIM = re.compile(r"(?:未找到|没有(?:查询到|找到)|暂无).{0,12}(?:船位|数据|结果|记录)", re.I)
 _QUERY_TOOL_NAMES = {"ship_search", "get_ship_position", "get_ship_archive", "get_psc_records", "get_ship_trajectory", "get_ship_call_ports", "get_ship_voyages", "get_last_departure", "get_current_stop", "search_ports", "get_port_detail"}
+_SCENARIO_RESTRICTED = frozenset({"platform_operation", "membership_permissions", "multimodal_symbol"})
+_TRAJECTORY_TOOL_NAME = "get_ship_trajectory"
 
 
 @dataclass(frozen=True)
@@ -863,6 +865,8 @@ class NativeToolRuntime:
         self.max_steps = int(config.get("customer_ceshi_max_steps", config.get("customer_ceshi_v2_max_steps", DEFAULT_MAX_STEPS)))
         self.max_tool_calls = int(config.get("customer_ceshi_max_tool_calls", config.get("customer_ceshi_v2_max_tool_calls", 8)))
         self.max_media_calls = int(config.get("customer_ceshi_max_media_calls", config.get("customer_ceshi_v2_max_media_calls", 4)))
+        self.trajectory_max_days = int(config.get("customer_ceshi_trajectory_max_days", os.getenv("CUSTOMER_CESHI_TRAJECTORY_MAX_DAYS", "30")))
+        self.trajectory_max_calls = int(config.get("customer_ceshi_trajectory_max_calls", os.getenv("CUSTOMER_CESHI_TRAJECTORY_MAX_CALLS", "3")))
         draft_path = _nested_config(config, "customer_ceshi_runtime", "direct_updates").get("draft_store_path")
         self.drafts = ShipUpdateDraftStore(draft_path)
         self.dry_run_writes = bool(_nested_config(config, "customer_ceshi_runtime", "direct_updates").get("dry_run", False))
@@ -879,7 +883,7 @@ class NativeToolRuntime:
         if self.perception is not None and not exclude_media:
             tools.append(_media_schema())
         tools.extend(_ship_update_transaction_schemas(responses=False))
-        if self._active_scenario is not None:
+        if self._active_scenario is not None and self._active_scenario.name in _SCENARIO_RESTRICTED:
             tools = [tool for tool in tools if tool["function"]["name"] in self._active_scenario.allowed_tools]
         return self.client.bind_tools(tools)
 
@@ -902,7 +906,7 @@ class NativeToolRuntime:
                 "parameters": _media_schema()["function"]["parameters"],
             })
         tools.extend(_ship_update_transaction_schemas(responses=True))
-        if self._active_scenario is not None:
+        if self._active_scenario is not None and self._active_scenario.name in _SCENARIO_RESTRICTED:
             tools = [tool for tool in tools if tool["name"] in self._active_scenario.allowed_tools]
         if inspect_only:
             tools = [tool for tool in tools if tool["name"] == "inspect_media"]
@@ -1435,19 +1439,7 @@ class NativeToolRuntime:
                 elif name == "inspect_media" and media_calls >= (1 if is_chart_symbol else self.max_media_calls):
                     observation = Observation(status="forbidden", capability=name, warnings=["media_budget_exhausted"], retry_allowed=False, suggested_fix="请基于当前附件观察和已有证据直接回答，不要再次读取同一附件。")
                 else:
-                    fingerprint = f"{name}:{self._normalized_query(arguments)}" if name in _SEARCH_TOOL_NAMES else ""
-                    limit = self.search_settings["max_local_kb_calls"] if name == "local_kb_search" else self.search_settings["max_web_calls"] if name == "web_search" else None
-                    if is_chart_symbol and name in {"local_kb_search", "web_search"}:
-                        limit = 1
-                    if fingerprint and fingerprint in search_fingerprints:
-                        observation = Observation(status="forbidden", capability=name, warnings=["duplicate_search_query"], retry_allowed=False, suggested_fix="请基于已有证据回答，或提出一个不同的明确证据缺口。")
-                    elif limit is not None and search_counts.get(name, 0) >= limit:
-                        observation = Observation(status="forbidden", capability=name, warnings=["search_budget_exhausted"], retry_allowed=False, suggested_fix="请基于当前检索结果直接回答。")
-                    else:
-                        observation = self._execute(name, arguments, {asset.asset_id: asset for asset in assets})
-                        if fingerprint:
-                            search_fingerprints.add(fingerprint)
-                            search_counts[name] = search_counts.get(name, 0) + 1
+                    observation = self._resolve_bounded_observation(name, arguments, {asset.asset_id: asset for asset in assets}, search_fingerprints, search_counts, is_chart_symbol)
                 if name == "inspect_media":
                     media_calls += 1
                 tool_calls += 1
@@ -1513,11 +1505,12 @@ class NativeToolRuntime:
             "Do not claim a high-risk product capability, policy, UI element, media detail, or operation success without supporting evidence. "
             "Reply in concise Chinese plain text: ordinary answers should usually be 80–180 Chinese characters; troubleshooting uses at most four lines. "
             "For a simple greeting, respond naturally in one short sentence and do not enumerate capabilities or add a menu.",
+            "Answer knowledge or meta questions (for example, whether ship positions use Beijing time or UTC) directly from known rules without calling tools; only call a data tool when the user asks for live vessel data. For an explicit ship update, call prepare_ship_update with the fields extracted from the current message. When a trajectory result says the time span exceeds the limit, narrow the range instead of repeating the same request.",
             scenario_instruction,
         ) if part))
 
     def _execute(self, name: str, arguments: dict[str, Any], assets: dict[str, MediaAsset]) -> Observation:
-        if self._active_scenario is not None and name not in self._active_scenario.allowed_tools:
+        if self._active_scenario is not None and self._active_scenario.name in _SCENARIO_RESTRICTED and name not in self._active_scenario.allowed_tools:
             return Observation(status="forbidden", capability=name, warnings=[f"tool_not_allowed_for_scenario:{self._active_scenario.name}"], retry_allowed=False)
         if name == "inspect_media":
             if self.perception is None:
@@ -1564,10 +1557,87 @@ class NativeToolRuntime:
             )
         if name not in READ_ONLY_TOOL_NAMES:
             return Observation(status="forbidden", capability=name, warnings=["tool_not_in_customer_ceshi_read_only_allowlist"], retry_allowed=False)
+        if name == _TRAJECTORY_TOOL_NAME:
+            arguments = self._trajectory_default_range(arguments)
+            span_observation = self._trajectory_span_check(arguments)
+            if span_observation is not None:
+                return span_observation
         started = time.monotonic()
         observation = self.registry.invoke(ToolCall(name=name, arguments=arguments))
         observation.data.pop("information_gain", None)
         observation.data["tool_latency_ms"] = int((time.monotonic() - started) * 1000)
+        if name == _TRAJECTORY_TOOL_NAME:
+            observation = self._rewrite_trajectory_upstream_error(observation)
+        return observation
+
+    def _resolve_bounded_observation(self, name: str, arguments: dict[str, Any], assets: dict[str, MediaAsset], search_fingerprints: set[str], search_counts: dict[str, int], is_chart_symbol: bool) -> Observation:
+        if name in _SEARCH_TOOL_NAMES:
+            fingerprint = f"{name}:{self._normalized_query(arguments)}"
+            limit = self.search_settings["max_local_kb_calls"] if name == "local_kb_search" else self.search_settings["max_web_calls"]
+            if is_chart_symbol and name in {"local_kb_search", "web_search"}:
+                limit = 1
+            duplicate_warning = "duplicate_search_query"
+            budget_warning = "search_budget_exhausted"
+            duplicate_fix = "请基于已有证据回答，或提出一个不同的明确证据缺口。"
+            budget_fix = "请基于当前检索结果直接回答。"
+        elif name == _TRAJECTORY_TOOL_NAME:
+            fingerprint = f"{name}:{arguments.get('mmsi', '')}:{arguments.get('starttime', '')}:{arguments.get('endtime', '')}"
+            limit = self.trajectory_max_calls
+            duplicate_warning = "duplicate_trajectory_query"
+            budget_warning = "trajectory_budget_exhausted"
+            duplicate_fix = "请基于已返回的轨迹数据回答，或缩小/调整时间范围后重试。"
+            budget_fix = "请基于已返回的轨迹数据回答，或缩小时间范围后重试。"
+        else:
+            fingerprint = ""
+            limit = None
+            duplicate_warning = ""
+            budget_warning = ""
+            duplicate_fix = ""
+            budget_fix = ""
+        if fingerprint and fingerprint in search_fingerprints:
+            return Observation(status="forbidden", capability=name, warnings=[duplicate_warning], retry_allowed=False, suggested_fix=duplicate_fix)
+        if limit is not None and search_counts.get(name, 0) >= limit:
+            return Observation(status="forbidden", capability=name, warnings=[budget_warning], retry_allowed=False, suggested_fix=budget_fix)
+        observation = self._execute(name, arguments, assets)
+        if fingerprint:
+            search_fingerprints.add(fingerprint)
+            search_counts[name] = search_counts.get(name, 0) + 1
+        return observation
+
+    def _trajectory_default_range(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if str(arguments.get("starttime") or "").strip() or str(arguments.get("endtime") or "").strip():
+            return arguments
+        end = datetime.now()
+        start = end - timedelta(days=self.trajectory_max_days)
+        return {**arguments, "starttime": start.strftime("%Y-%m-%d"), "endtime": end.strftime("%Y-%m-%d")}
+
+    def _trajectory_span_check(self, arguments: dict[str, Any]) -> Observation | None:
+        start = self._parse_trajectory_date(str(arguments.get("starttime") or ""))
+        end = self._parse_trajectory_date(str(arguments.get("endtime") or ""))
+        if start is None or end is None:
+            return None
+        span_days = abs((end - start).days)
+        if span_days <= self.trajectory_max_days:
+            return None
+        message = f"历史轨迹时间跨度约 {span_days} 天，超过接口上限（{self.trajectory_max_days} 天）。请将时间范围缩小到 {self.trajectory_max_days} 天以内后重试。"
+        return Observation(status="upstream_error", capability=_TRAJECTORY_TOOL_NAME, warnings=["trajectory_span_exceeds_limit"], facts=[message], retry_allowed=True, suggested_fix=message)
+
+    @staticmethod
+    def _parse_trajectory_date(value: str) -> datetime | None:
+        cleaned = re.split(r"\s*UTC|\(", value.strip(), maxsplit=1)[0].strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(cleaned, fmt)
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _rewrite_trajectory_upstream_error(observation: Observation) -> Observation:
+        blob = " ".join(str(fact) for fact in observation.facts) + " " + json.dumps(observation.data or {}, ensure_ascii=False)
+        if "exceeds time interval" in blob.lower():
+            message = "历史轨迹时间跨度超过接口上限，请缩小时间范围后重试。"
+            return Observation(status="upstream_error", capability=observation.capability, facts=[message], data=dict(observation.data or {}), sources=list(observation.sources), warnings=list(observation.warnings) + ["trajectory_span_exceeds_limit"], retry_allowed=True, suggested_fix=message)
         return observation
 
     @staticmethod
@@ -1669,19 +1739,7 @@ class NativeToolRuntime:
                     elif name == "inspect_media" and media_calls >= (1 if is_chart_symbol else self.max_media_calls):
                         observation = Observation(status="forbidden", capability=name, warnings=["media_budget_exhausted"], retry_allowed=False, suggested_fix="请基于当前附件观察和已有证据直接回答，不要再次读取同一附件。")
                     else:
-                        fingerprint = f"{name}:{self._normalized_query(arguments)}" if name in _SEARCH_TOOL_NAMES else ""
-                        limit = self.search_settings["max_local_kb_calls"] if name == "local_kb_search" else self.search_settings["max_web_calls"] if name == "web_search" else None
-                        if is_chart_symbol and name in {"local_kb_search", "web_search"}:
-                            limit = 1
-                        if fingerprint and fingerprint in search_fingerprints:
-                            observation = Observation(status="forbidden", capability=name, warnings=["duplicate_search_query"], retry_allowed=False, suggested_fix="请基于已有证据直接回答，或只提出一个不同的明确证据缺口。")
-                        elif limit is not None and search_counts.get(name, 0) >= limit:
-                            observation = Observation(status="forbidden", capability=name, warnings=["search_budget_exhausted"], retry_allowed=False, suggested_fix="请基于当前检索结果直接回答。")
-                        else:
-                            observation = self._execute(name, arguments, asset_map)
-                            if fingerprint:
-                                search_fingerprints.add(fingerprint)
-                                search_counts[name] = search_counts.get(name, 0) + 1
+                        observation = self._resolve_bounded_observation(name, arguments, asset_map, search_fingerprints, search_counts, is_chart_symbol)
                     if name == "inspect_media":
                         media_calls += 1
                     tool_calls += 1
@@ -2208,41 +2266,6 @@ class SingleModelCustomerCeshiRuntime:
             result["metrics"].update({"context_rounds": memory_rounds, "context_turns": memory_rounds, "context_compacted": context_compacted, "update_draft_status": str((observation.data or {}).get("adapter_status") or observation.status)})
             result["route_trace"]["metrics"] = result["metrics"]
             return result
-        if not assets:
-            preflight = self.text_runtime._prepare_text_update(_text(getattr(human, "content", "")), draft_session_key)
-            if preflight is not None:
-                started = time.monotonic()
-                if preflight.status == "success":
-                    fields = dict(preflight.data or {}).get("fields") or {}
-                    target = dict(preflight.data or {}).get("target") or {}
-                    field_preview = "、".join(f"{key} {value}" for key, value in fields.items())
-                    answer = f"已生成待确认的船舶更新草稿：MMSI {target.get('mmsi', '未提供')}；{field_preview}。请核对无误后回复“确认”。"
-                    guard_result = "draft_prepared"
-                else:
-                    answer = str(preflight.suggested_fix or "请补充完整船位更新字段后再试。")
-                    guard_result = "position_update_fields_required"
-                result = self.text_runtime._result(
-                    answer,
-                    [preflight.model_dump()],
-                    [PREPARE_SHIP_UPDATE_TOOL_NAME],
-                    0,
-                    1,
-                    0,
-                    "stop",
-                    guard_result,
-                    started,
-                    "",
-                    "",
-                    "",
-                )
-                result["metrics"].update({
-                    "context_rounds": memory_rounds,
-                    "context_turns": memory_rounds,
-                    "context_compacted": context_compacted,
-                    "update_draft_status": "prepared" if preflight.status == "success" else preflight.status,
-                })
-                result["route_trace"]["metrics"] = result["metrics"]
-                return result
         direct = self._try_media_update(human, session_key)
         if direct is not None:
             direct["metrics"].update({"context_rounds": memory_rounds, "context_turns": memory_rounds, "context_compacted": context_compacted})

@@ -12,18 +12,20 @@ from pathlib import Path
 from typing import Any
 
 
-_COORDINATE = re.compile(r"(?P<value>\d{1,3}(?:\.\d+)?)(?:\s*(?:°|-|\s)\s*(?P<minutes>\d{1,2}(?:\.\d+)?)(?:['′])?)?\s*(?P<hemisphere>[NSEW])", re.I)
-_PREFIX_COORDINATE = re.compile(r"(?<![\d°′'])(?P<hemisphere>[NSEW])(?P<value>\d{1,3}(?:\.\d+)?)(?:\s*(?:°|-|\s)\s*(?P<minutes>\d{1,2}(?:\.\d+)?)(?:['′])?)?", re.I)
-_LABELLED_DECIMAL = re.compile(r"(?P<label>经度|longitude|lon|纬度|latitude|lat)\s*[:：]?\s*(?P<value>[+-]?\d{1,3}(?:\.\d+)?)(?![\d.°′'])", re.I)
+_COORDINATE = re.compile(r"(?P<value>\d{1,3}(?:\.\d+)?)(?:\s*(?:°|-|\s)\s*(?P<minutes>\d{1,2}(?:\.\d+)?)[′']?(?:\s*(?P<seconds>\d{1,2}(?:\.\d+)?)″?)?)?\s*(?P<hemisphere>[NSEW])", re.I)
+_PREFIX_COORDINATE = re.compile(r"(?<![\d°′'])(?P<hemisphere>[NSEW])(?P<value>\d{1,3}(?:\.\d+)?)(?:\s*(?:°|-|\s)\s*(?P<minutes>\d{1,2}(?:\.\d+)?)[′']?(?:\s*(?P<seconds>\d{1,2}(?:\.\d+)?)″?)?)?", re.I)
+_LABELLED_DECIMAL = re.compile(r"(?P<label>经度|longitude|lon|纬度|latitude|lat)\s*[:：]?\s*(?P<value>[+-]?\d{1,3}(?:\.\d+)?)(?![\d.°′'″])", re.I)
+_LABELLED_DMS = re.compile(r"(?P<label>经度|longitude|lon|纬度|latitude|lat)\s*[:：]?\s*(?P<degrees>\d{1,3}(?:\.\d+)?)\s*°\s*(?P<minutes>\d{1,2}(?:\.\d+)?)[′']?(?:\s*(?P<seconds>\d{1,2}(?:\.\d+)?)″?\s*)?(?P<hemisphere>[NSEW])?", re.I)
 _TIME = re.compile(r"^(?P<year>\d{4,5})[-/](?P<month>\d{1,2})[-/](?P<day>\d{1,2})\s+(?P<hour>\d{1,2})(?::?(?P<minute>\d{2}))(?::(?P<second>\d{2}))?(?:\s*\(?(?P<tz>UTC(?:[+-]\d{1,2})?)\)?)?$", re.I)
-_PLACEHOLDER = re.compile(r"^(?:--(?:\s*/\s*--)?|—|－|n/?a|未知|无|null|none)$", re.I)
+_PLACEHOLDER = re.compile(r"^(?:--(?:\s*/\s*--)?|-|—|－|n/?a|未知|无|null|none)$", re.I)
 
 
 def _coordinate_value(match: re.Match[str]) -> tuple[str, float, str]:
     degree = float(match.group("value"))
     minutes = float(match.group("minutes") or 0)
+    seconds = float(match.group("seconds") or 0)
     hemisphere = match.group("hemisphere").upper()
-    value = degree + minutes / 60
+    value = degree + minutes / 60 + seconds / 3600
     if hemisphere in {"W", "S"}:
         value = -value
     return ("longitude" if hemisphere in {"E", "W"} else "latitude"), value, match.group(0)
@@ -42,6 +44,21 @@ class PositionNormalizer:
             key = "longitude" if label in {"经度", "longitude", "lon"} else "latitude"
             values[key] = float(match.group("value"))
             originals[key] = match.group(0)
+        for match in _LABELLED_DMS.finditer(text or ""):
+            hemisphere = (match.group("hemisphere") or "").upper()
+            if hemisphere:
+                key = "longitude" if hemisphere in {"E", "W"} else "latitude"
+            else:
+                label = match.group("label").lower()
+                key = "longitude" if label in {"经度", "longitude", "lon"} else "latitude"
+            degree = float(match.group("degrees"))
+            minutes = float(match.group("minutes") or 0)
+            seconds = float(match.group("seconds") or 0)
+            value = degree + minutes / 60 + seconds / 3600
+            if hemisphere in {"W", "S"}:
+                value = -value
+            values.setdefault(key, value)
+            originals.setdefault(key, match.group(0))
         errors = []
         if "longitude" in values and not -180 <= values["longitude"] <= 180:
             errors.append("longitude_out_of_range")
@@ -101,7 +118,7 @@ class StaticFieldNormalizer:
         invalid: list[str] = []
         for key, aliases in self._ALIASES.items():
             for alias in aliases:
-                match = re.search(rf"(?:^|[，,；;\n\s]){re.escape(alias)}\s*[:：=]\s*([^，,；;\n]+)", text or "", re.I)
+                match = re.search(rf"(?:^|[，,；;\n\s]){re.escape(alias)}(?:\s*[:：=]\s*|\s*\n\s*)([^，,；;\n]+)", text or "", re.I)
                 if match is None:
                     continue
                 value = match.group(1).strip().strip("。.")
