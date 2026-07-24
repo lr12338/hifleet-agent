@@ -1,44 +1,63 @@
 # Shared Skills V2 Test and Validation Record
 
 `tests/skills_v2/` covers manifests, duplicate names, mode defaults and rollback,
-adapter contract equivalence, forbidden external tools, update validators, result
-version metadata, known-URL browser verification, mocked `/run` protocol
+adapter contract equivalence, forbidden external tools (including
+`verify_public_page`), update validators, result version metadata, the
+lock-anchored `source_versions`, the sync closed loop, mocked `/run` protocol
 compatibility, and the customer_support opt-in dry-run shadow record.
 
 ```bash
-PYTHONPATH=src .venv/bin/pytest -q tests/skills_v2
+PYTHONPATH=src .venv/bin/python -m pytest -q tests/skills_v2
 ```
 
-The `/run` and `/stream_run` implementation was audited in `src/main.py` and was
-not changed. HTTP verification requires a separately configured non-production
-service and model credentials; this task does not restart a service or send real
-ship writes. See `HTTP_VALIDATION.md` for the accurate current status.
+`tests/customer_ceshi/` and `tests/customer_ceshi_v2/` cover the scenario
+contracts, Claim Guard (negation/conflict/weak-relevance), ship-update Drafts and
+confirmation, trajectory reverse/single-side/boundary handling, placeholder
+rejection, and the native Responses/Chat runtime loop.
 
-No live model latency baseline or attachment corpus is available in this workspace.
-The public regression catalogue contains the original five attachment/flow cases
-plus 12 required extension cases. It is a semantic specification, not a claimed
-5/5 live result. Before customer_support promotion, run the applicable cases over
-both chains and record legacy/V2 tools, evidence, claims, Draft states, and P95
-agent orchestration time.
+The `/run` and `/stream_run` implementation in `src/main.py` was not changed.
+HTTP verification requires a separately configured non-production service and
+model credentials; this task does not restart a service or send real ship
+writes. See `HTTP_VALIDATION.md` for the accurate current status.
 
-Latest local evidence on 2026-07-23: `84 passed, 7 xfailed` for the focused V2
-and customer_ceshi selection, plus `219 passed` for the protected
-customer_support selection after the prompt-backed shadow change. A broader customer_ceshi invocation completed with
-`174 passed, 1 skipped, 7 xfailed, 1 failed`; the single failure,
-`test_standard_agent_success_claim_without_write_is_blocked`, reproduces unchanged
-on `origin/main` at `333b2c156682dc2f978d113babe117b0a2824338` and is therefore
-recorded as a pre-existing baseline failure, not a Shared Skills V2 regression.
-
-For repeatable isolated HTTP validation, start a non-production process and run:
+## Current counts (HEAD of `codex/shared-skills-v2`)
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/validate_shared_skills_v2_http.py \
-  --base-url http://127.0.0.1:18128 --profile customer_ceshi
+PYTHONPATH=src .venv/bin/python -m pytest -q tests/skills_v2 tests/customer_ceshi tests/customer_ceshi_v2
 ```
 
-The public regression runner uses the same `/run` entry and records
-`passed`, `failed`, or `blocked` without treating unavailable image files as a
-pass. Supply an HTTP-served attachment directory for image cases:
+| Suite | passed | skipped | xfailed | failed |
+| --- | --- | --- | --- | --- |
+| `tests/skills_v2` | 35 | 0 | 0 | 0 |
+| `tests/customer_ceshi` | 54 | 0 | 0 | 0 |
+| `tests/customer_ceshi_v2` | 106 | 1 | 7 | 0 |
+| **combined** | **195** | **1** | **7** | **0** |
+
+The 7 `xfailed` items are obsolete Doubao-led media assertions (media is now
+DeepSeek-led through `inspect_media`); they carry specific reasons and are not
+masks for real failures. See `XFAIL_AUDIT.md`.
+
+## Public regression runner statuses
+
+`scripts/run_shared_skills_v2_regression.py` no longer reports only
+`passed`/`failed`/`blocked`. Each case gets one of:
+
+- `fixture_prepared` - a valid fixture exists but no serving URL was supplied;
+- `invalid_fixture` - `fixture_quality: invalid`;
+- `mock_only` - exercised against a mock, not real `/run`;
+- `real_http_passed` - real `/run` succeeded with policy/budgets satisfied but
+  no image-semantic verification (text case, or no structured assertions);
+- `semantic_passed` - a real image travelled through `/run`/`/stream_run` into
+  the model **and** the structured semantic assertions
+  (`required_observations`, `required_uncertainty`, `forbidden_certainty`,
+  `required_layer_distinctions`) were satisfied;
+- `failed` - HTTP failure or a policy/semantic assertion failed;
+- `blocked` - `contract_only` cases or a required attachment that is unavailable.
+
+HTTP 200, an `inspect_media` call, or the absence of a fixed forbidden string
+never count as `semantic_passed` on their own. `semantic_score` is required and
+non-empty for every case; it is the human criterion encoded by the structured
+assertions.
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/run_shared_skills_v2_regression.py \
@@ -47,33 +66,24 @@ PYTHONPATH=src .venv/bin/python scripts/run_shared_skills_v2_regression.py \
   --report reports/shared_skills_v2/public-regression.json
 ```
 
-Use `--case M02 --case M04 --case M05` for the stable no-attachment subset. The
-controlled-evidence cases E09–E12 are marked `contract_only` and remain blocked
-until their deterministic fixture service is supplied; they are never counted as
-live semantic passes.
+M03/M05 carry `fixture_quality: valid` (the real HiFleet chart fixture); without
+a serving URL they report `fixture_prepared`, not a pass. M01 is
+`reference_only`. The controlled-evidence cases E09-E12 are `contract_only` and
+remain `blocked` until their deterministic fixture service is supplied; they are
+never counted as live semantic passes.
 
-The latest isolated M02 probe on 2026-07-23 used the plain public input
-`HiFleet 平台上传不了航线。` and completed with one successful
-`local_kb_search`, zero successful `web_search` calls, and a conservative
-follow-up request. The runtime finalizes platform and membership replies from
-direct internal evidence rather than exposing another search turn.
+## Live results available in this workspace
 
-The stable M02/M04/M05 subset was rerun against an isolated current-worktree
-service on 2026-07-23. All three cases passed the strengthened tool budget,
-forbidden-claim, answer, and Draft-state assertions; M04 stayed `prepared`, and
-M05 stayed `accepted` without production-write confirmation. M01, M03, E03, and
-E04 still require scoped image files, while E09–E12 require controlled fixture
-services. This is a `3 passed` subset result, not a semantic 5/5 or corpus-wide
-acceptance result.
-
-The upstream candidate verifier was also exercised against the locked
-`e4acf599192f3f1d247ef2da00e78d0cff89819c` revision. It passed trusted-source,
-required-file, required-environment, API-host, and static Python contract checks;
-the focused sync tests cover rejected candidates and unchanged last-known-good
-locks.
+No live model latency baseline or full attachment corpus is available in this
+workspace. The 2026-07-23 isolated M02/M04/M05 probe (3 passed subset) and the
+isolated `/run`/`/stream_run` HTTP samples in `HTTP_VALIDATION.md` remain the
+most recent live evidence; they are not a 5/5 or corpus-wide acceptance result.
+Before customer_support promotion, run the applicable cases over both chains and
+record legacy/V2 tools, evidence, claims, Draft states, and P95 orchestration
+time.
 
 The V2-load failure regression forces manifest construction to fail and verifies
 that the resulting `legacy_constrained` runtime omits direct writes, knowledge
-administration, `web_search_agent_browser`, and `agent_browser_deep_search` while
-retaining known-URL enforcement for public-page verification. This is a local
-deterministic fallback test, not a production failure simulation.
+administration, `verify_public_page`, `web_search_agent_browser`, and
+`agent_browser_deep_search`. This is a local deterministic fallback test, not a
+production failure simulation.

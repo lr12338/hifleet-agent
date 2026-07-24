@@ -41,7 +41,7 @@ DEFAULT_MAX_STEPS = 8
 DEFAULT_CONTEXT_MAX_ROUNDS = 10
 DEFAULT_CONTEXT_RECENT_FULL_ROUNDS = 3
 READ_ONLY_TOOL_NAMES = {
-    "local_kb_search", "web_search", "verify_public_page",
+    "local_kb_search", "web_search",
     "ship_search", "get_ship_position", "get_ship_archive", "get_psc_records", "get_ship_trajectory",
     "get_ship_call_ports", "get_ship_voyages", "get_last_departure", "get_current_stop", "search_ports", "get_port_detail",
     "inspect_media",
@@ -51,12 +51,12 @@ PREPARE_SHIP_UPDATE_TOOL_NAME = "prepare_ship_update"
 COMMIT_SHIP_UPDATE_TOOL_NAME = "commit_ship_update"
 CANCEL_SHIP_UPDATE_TOOL_NAME = "cancel_ship_update"
 MEDIA_UPDATE_EVIDENCE_TOOL_NAME = "record_media_update_candidate"
-_SEARCH_TOOL_NAMES = {"local_kb_search", "web_search", "verify_public_page"}
+_SEARCH_TOOL_NAMES = {"local_kb_search", "web_search"}
 _UPDATE_INTENT = re.compile(r"(?:上传|更新|修改|补充|更正|录入).{0,24}(?:船位|位置|航速|航向|静态信息|船名|imo|呼号|船型|目的港|eta|吃水)|(?:船位|位置|航速|航向|静态信息|船名|imo|呼号|船型|目的港|eta|吃水).{0,24}(?:上传|更新|修改|补充|更正|录入)", re.I)
 _MEDIA_UPDATE_COMMAND = re.compile(r"(?:更新|上传|修改|更正|录入).{0,24}(?:船位|位置|ais|数据)?|(?:根据|按).{0,24}(?:图片|上图|附件|ais).{0,24}(?:更新|上传|修改)", re.I)
 _POSITION_UPDATE_TIME = re.compile(r"\d{4,5}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:?\d{2}(?::\d{2})?(?:\s*\(?UTC(?:[+-]\d{1,2})?\)?)?", re.I)
 _CONFIRM_ONLY = re.compile(r"^(?:请)?(?:确认|确认执行|执行确认|好的确认|好，?确认)$", re.I)
-_PLACEHOLDER_VALUE = re.compile(r"^(?:--|—|－|n/?a|未知|无|null|none)$", re.I)
+_PLACEHOLDER_VALUE = re.compile(r"^(?:--(?:\s*/\s*--)?|-|－|n/?a|未知|无|null|none)$", re.I)
 _MEDIA_UPDATE_FIELDS = (
     "operation_type", "mmsi", "ship_name", "imo", "lon", "lat", "updatetime", "speed", "heading", "course",
     "destination", "eta", "draft", "navstatus", "ship_type", "minotype", "length", "width", "dwt", "flag", "callsign", "built_year",
@@ -1605,18 +1605,33 @@ class NativeToolRuntime:
         return observation
 
     def _trajectory_default_range(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if str(arguments.get("starttime") or "").strip() or str(arguments.get("endtime") or "").strip():
-            return arguments
-        end = datetime.now()
-        start = end - timedelta(days=self.trajectory_max_days)
-        return {**arguments, "starttime": start.strftime("%Y-%m-%d"), "endtime": end.strftime("%Y-%m-%d")}
+        starttime = str(arguments.get("starttime") or "").strip()
+        endtime = str(arguments.get("endtime") or "").strip()
+        if not starttime and not endtime:
+            end = datetime.now()
+            start = end - timedelta(days=self.trajectory_max_days)
+            return {**arguments, "starttime": start.strftime("%Y-%m-%d"), "endtime": end.strftime("%Y-%m-%d")}
+        if starttime and not endtime:
+            start = self._parse_trajectory_date(starttime)
+            if start is not None:
+                end = min(datetime.now(), start + timedelta(days=self.trajectory_max_days))
+                return {**arguments, "endtime": end.strftime("%Y-%m-%d")}
+        if endtime and not starttime:
+            end = self._parse_trajectory_date(endtime)
+            if end is not None:
+                start = end - timedelta(days=self.trajectory_max_days)
+                return {**arguments, "starttime": start.strftime("%Y-%m-%d")}
+        return arguments
 
     def _trajectory_span_check(self, arguments: dict[str, Any]) -> Observation | None:
         start = self._parse_trajectory_date(str(arguments.get("starttime") or ""))
         end = self._parse_trajectory_date(str(arguments.get("endtime") or ""))
         if start is None or end is None:
             return None
-        span_days = abs((end - start).days)
+        if end < start:
+            message = "历史轨迹的结束时间早于开始时间，请核对时间顺序后重试。"
+            return Observation(status="upstream_error", capability=_TRAJECTORY_TOOL_NAME, warnings=["trajectory_reverse_range"], facts=[message], retry_allowed=True, suggested_fix=message)
+        span_days = (end - start).days
         if span_days <= self.trajectory_max_days:
             return None
         message = f"历史轨迹时间跨度约 {span_days} 天，超过接口上限（{self.trajectory_max_days} 天）。请将时间范围缩小到 {self.trajectory_max_days} 天以内后重试。"

@@ -5,7 +5,7 @@
 | `knowledge_qa.local_kb_search` | `knowledge_retrieval.local_kb_search` | External profiles |
 | `knowledge_qa.web_search` | base `web_search` | External profiles; one entry only |
 | `knowledge_qa.web_search_agent_browser` | none | Removed |
-| `browser_verify.verify_public_page` | base `verify_public_page` | Only URL returned by current-runtime web search |
+| `browser_verify.verify_public_page` | none | Removed from customer_ceshi V2 (legacy customer_support keeps it) |
 | `browser_verify.agent_browser_deep_search` | none | Removed |
 | Read-only `hifleet_ship_service` tools | `hifleet_data` descriptors | External profiles after local manifest validation |
 | `upload_ship_position` | internal adapter behind `commit_ship_update` | Never model-visible |

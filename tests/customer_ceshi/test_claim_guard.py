@@ -32,3 +32,19 @@ def test_reply_limit_keeps_complete_sentences_when_possible():
     assert limited.endswith("。")
     assert "第二句" not in limited
     assert sum("\u4e00" <= char <= "\u9fff" for char in limited) <= 180
+
+
+def test_negated_evidence_does_not_prove_positive_claim():
+    answer, blocked = guard_claims("该功能支持前台编辑。", [{"status": "success", "facts": ["官方说明：该功能不支持前台编辑。"]}])
+    assert blocked == ["该功能支持前台编辑。"]
+    assert "缺少可直接核验" in answer
+
+
+def test_weakly_related_evidence_does_not_prove_claim():
+    answer, blocked = guard_claims("HiFleet支持航线导出。", [{"status": "success", "facts": ["帮助文档：支持 RTZ 文件上传。"]}])
+    assert blocked == ["HiFleet支持航线导出。"]
+
+
+def test_conflicting_numeric_claim_is_blocked():
+    answer, blocked = guard_claims("会员可以关注100条船。", [{"status": "success", "facts": ["会员最多关注50条船。"]}])
+    assert blocked == ["会员可以关注100条船。"]

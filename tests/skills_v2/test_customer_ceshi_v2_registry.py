@@ -29,7 +29,7 @@ def _descriptor(name: str) -> ToolDescriptor:
     return ToolDescriptor(name=name, skill_id="foundation", description=name, input_schema={"type": "object", "properties": {}}, skill_version="2")
 
 
-def test_verify_public_page_requires_a_web_search_url() -> None:
+def test_v2_denies_public_page_verification_even_after_web_search() -> None:
     registry = CapabilityRegistry(
         tools=[
             _Tool("web_search", {"status": "success", "urls": ["https://example.com/page"]}),
@@ -38,12 +38,10 @@ def test_verify_public_page_requires_a_web_search_url() -> None:
         shared_descriptors=[_descriptor("web_search"), _descriptor("verify_public_page")],
         enforce_known_public_urls=True,
     )
+    registry.invoke(ToolCall(name="web_search", arguments={"query": "example"}))
     blocked = registry.invoke(ToolCall(name="verify_public_page", arguments={"url": "https://example.com/page"}))
     assert blocked.status == "forbidden"
-    registry.invoke(ToolCall(name="web_search", arguments={"query": "example"}))
-    allowed = registry.invoke(ToolCall(name="verify_public_page", arguments={"url": "https://example.com/page"}))
-    assert allowed.status == "success"
-    assert allowed.data["skill_version"] == "2"
+    assert "verify_public_page" not in registry._tools
 
 
 def test_v2_result_trace_reports_runtime_and_upstream_metadata() -> None:
@@ -96,3 +94,33 @@ def test_v2_load_failure_uses_constrained_legacy_registry(monkeypatch) -> None:
     }
     assert {"agent_browser_deep_search", "web_search_agent_browser", "upload_ship_position", "update_ship_static_info", "upsert_local_kb_entry"}.isdisjoint(text_runtime.registry._tools)
     assert text_runtime.registry._enforce_known_public_urls is True
+
+
+def test_hifleet_source_versions_are_anchored_to_the_lock(monkeypatch) -> None:
+    """Runtime source_versions must come from skills-lock.json, not a stale manifest."""
+    import json
+
+    from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
+
+    bundle = build_customer_ceshi_bundle(str(ROOT))
+    record = json.loads((ROOT / "skills-lock.json").read_text(encoding="utf-8"))["skills"]["hifleet-skills"]
+    sv = bundle.source_versions["hifleet_data"]
+    assert sv["upstream_commit"] == record["commit"]
+    assert sv["skill_version"] == record["version"]
+    assert sv["content_hash"] == record["contentHash"]
+    # The V2 bundle exposes web_search only; no browser verification tool.
+    foundation = {item.name for item in bundle.descriptors if item.skill_id == "foundation"}
+    assert foundation == {"web_search"}
+
+
+def test_lock_override_beats_stale_manifest_commit(monkeypatch) -> None:
+    """If the manifest commit diverges from the lock, the lock wins at runtime."""
+    import json
+
+    from skills.core.registry import SharedSkillRegistry
+
+    registry = SharedSkillRegistry(str(ROOT))
+    manifests = registry.load_manifests(("hifleet_data",))
+    record = json.loads((ROOT / "skills-lock.json").read_text(encoding="utf-8"))["skills"]["hifleet-skills"]
+    assert manifests["hifleet_data"].upstream_commit == record["commit"]
+    assert manifests["hifleet_data"].upstream_lock_key == "hifleet-skills"

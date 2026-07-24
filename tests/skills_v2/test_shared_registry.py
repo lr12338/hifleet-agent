@@ -119,8 +119,8 @@ def test_external_v2_never_exposes_low_level_writes_or_knowledge_admin() -> None
     names = {item.name for item in bundle.descriptors}
     assert {"upload_ship_position", "update_ship_static_info", "upsert_local_kb_entry"}.isdisjoint(names)
     assert names & {"prepare_ship_update", "commit_ship_update", "cancel_ship_update"}
-    assert {"web_search", "verify_public_page"}.issubset(names)
-    assert "agent_browser_deep_search" not in names
+    assert "web_search" in names
+    assert {"verify_public_page", "agent_browser_deep_search", "web_search_agent_browser"}.isdisjoint(names)
 
 
 def test_manifests_are_machine_readable_and_unique() -> None:
@@ -133,3 +133,22 @@ def test_ship_update_validators_reject_invalid_and_conflicting_data() -> None:
     assert validate_position_update({"mmsi": "123", "lon": 190, "lat": 91, "updatetime": "now"}) == ["mmsi", "lon", "lat", "updatetime"]
     invalid = validate_static_update({"mmsi": "123456789", "ship_type": "cargo", "minotype": "tanker"})
     assert invalid == ["ship_type_minotype_conflict"]
+
+
+def test_knowledge_retrieval_is_an_independent_read_only_skill() -> None:
+    manifest = load_manifest(ROOT / "src" / "skills" / "knowledge_retrieval" / "manifest.yaml")
+    assert manifest.skill_id == "knowledge_retrieval"
+    assert manifest.upstream_commit == ""
+    names = [str(cap.get("tool_name") or cap.get("id")) for cap in manifest.capabilities]
+    assert names == ["local_kb_search"]
+    assert all(cap.get("read_only") is True for cap in manifest.capabilities)
+
+
+def test_ship_info_update_skills_require_confirmation_and_validators() -> None:
+    manifest = load_manifest(ROOT / "src" / "skills" / "ship_info_update" / "manifest.yaml")
+    names = [str(cap.get("id")) for cap in manifest.capabilities]
+    assert names == ["prepare_ship_update", "commit_ship_update", "cancel_ship_update"]
+    assert all(cap.get("requires_confirmation") is True for cap in manifest.capabilities)
+    # Deterministic validators reject both position and static invalid data.
+    assert validate_position_update({"mmsi": "123456789", "lon": 121.5, "lat": 31.2, "updatetime": "2026-07-23 10:00:00"}) == []
+    assert validate_static_update({"mmsi": "123456789", "ship_type": "cargo", "minotype": "cargo"}) == []

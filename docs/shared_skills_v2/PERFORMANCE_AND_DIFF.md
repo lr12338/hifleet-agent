@@ -3,8 +3,8 @@
 Status: **PARTIAL: isolated V2 and prompt-shadow samples; no P95 baseline comparison**.
 
 V2 removes `web_search_agent_browser` and `agent_browser_deep_search` from the
-customer_ceshi model list; it retains one `web_search` and known-URL-only
-`verify_public_page`. It also removes direct `upload_ship_position`,
+customer_ceshi model list and also removes `verify_public_page`; it retains one
+`web_search` for public-web evidence. It also removes direct `upload_ship_position`,
 `update_ship_static_info`, and `knowledge_admin` from external contracts.
 
 An isolated current-worktree `customer_ceshi` V2 `/run` greeting took 3904 ms end

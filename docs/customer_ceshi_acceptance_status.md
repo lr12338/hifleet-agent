@@ -38,21 +38,45 @@ Audit date: 2026-07-17. This is an evidence ledger, not a completion claim. `cus
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
-| Shared manifest registry | PASSED (unit) | `tests/skills_v2/` validates manifests, policy, adapters, validators, version metadata, known-URL verification, and the constrained fallback used when V2 loading fails. |
+| Shared manifest registry | PASSED (unit) | `tests/skills_v2/` validates manifests, policy, adapters, validators, version metadata, the lock-anchored source versions, the sync closed loop, and the constrained fallback used when V2 loading fails. |
 | customer_support default legacy | PASSED (config + regression) | `skill_runtime.customer_support.mode=legacy`; protected regression suite passed 219 tests on 2026-07-23 after the shadow integration. |
 | customer_support V2 shadow | PASSED (deterministic + isolated HTTP) | `CUSTOMER_SUPPORT_SKILLS_SHADOW=true` keeps the legacy reply. With an available text model, the shared V2 Skill prompt is injected into one no-tool JSON assessment; its allowed recommendations, evidence requirements, and reply-risk indicators are traced without executing reads or writes. A deterministic graph test proves prompt injection, and an isolated 2026-07-23 HTTP request logged `completed_prompt_shadow`, `prompt_injected=True`, and `no_shadow_write`. |
-| customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder receives V2 descriptors and injected V2 Skill prompts when configured V2; runtime metrics and route trace carry mode plus upstream versions. `prepare_ship_update` invokes shared validators and reports `invalid_fields` before Draft creation. Focused V2/customer_ceshi suite passed 84 tests with 7 expected failures. |
+| customer_ceshi V2 adapter | PASSED (unit/integration) | Existing Responses builder receives V2 descriptors and injected V2 Skill prompts when configured V2; runtime metrics and route trace carry mode plus upstream versions. `prepare_ship_update` invokes shared validators and reports `invalid_fields` before Draft creation. Focused V2/customer_ceshi unit suite passed 162 tests (54 `customer_ceshi` + 106 `customer_ceshi_v2`) with 1 skipped and 7 obsolete-behavior xfails; `tests/skills_v2` passed 35. |
 | External service smoke | PASSED (isolated safe service) | Current-worktree isolated `/run` and `/stream_run` calls passed with `customer_ceshi` V2 metadata including the locked upstream commit. Mock-only `/run` regression also verifies unchanged protocol and V2 metadata transport. |
 | Attachment semantic 5/5 / ≥95% | NOT_COMPLETE | The strengthened isolated M02/M04/M05 subset passed on 2026-07-23. M01, M03, E03, and E04 remain blocked without scoped images; controlled evidence cases E09–E12 require their fixture service. No 5/5 or expanded-corpus ≥95% result is claimed. |
 | M02 route-upload semantic probe | PASSED (isolated V2) | Plain public input executed exactly one `local_kb_search`, zero successful web searches, and returned a conservative follow-up. The evidence-directed probe also matched plan-panel and RTZ/XLS/TXT/CSV content; query metadata no longer counts as permission evidence. The other image-dependent public cases remain unrun without scoped attachment URLs. |
 | Production shadow / gradual rollout | NOT_COMPLETE | Configuration and adapter boundary exist; no production rollout is claimed. |
 
-The broader 2026-07-23 customer_ceshi invocation completed with `174 passed, 1
-skipped, 7 xfailed, 1 failed`. The one failing test,
-`test_standard_agent_success_claim_without_write_is_blocked`, was rerun against
-unchanged `origin/main` commit `333b2c156682dc2f978d113babe117b0a2824338` and
-fails identically; it is a pre-existing baseline issue rather than a Shared
-Skills V2 regression.
+The combined V2 unit selection (`tests/skills_v2 tests/customer_ceshi
+tests/customer_ceshi_v2`) on the current HEAD completes with `195 passed, 1
+skipped, 7 xfailed, 0 failed`. The live model-dependent tests
+(`tests/test_customer_ceshi_pending_state.py`,
+`tests/test_customer_ceshi_write_robustness.py`, and the
+`tests/test_customer_support_*` router suite) require real model credentials and
+hang in this workspace; they are blocked by the external condition, not by a V2
+regression. The previously noted
+`test_standard_agent_success_claim_without_write_is_blocked` lives in that
+live/credential-dependent set.
+
+## 2026-07-24 round (Shared Skills V2 continuation)
+
+| Requirement | Status | Evidence |
+| --- | --- | --- |
+| customer_ceshi V2 web-search-only | PASSED (unit) | `verify_public_page`, `agent_browser_deep_search`, `web_search_agent_browser` removed from foundation descriptors, scenarios, builder allowlists, `DENIED_TOOL_NAMES`, the V2 prompt, and all 17 regression cases. |
+| hifleet-skills sync closed loop | PASSED (unit) | `skills-lock.json` is single source of truth via `upstream_lock_key`; `--apply` updates lock + manifest + SKILL.md; runtime `source_versions` carries lock `content_hash`/`last_known_good`; new upstream capabilities stay `review_required`. |
+| Independent knowledge retrieval Skill | PASSED (unit) | `knowledge_retrieval` manifest exposes only `local_kb_search`, read-only, no upstream. |
+| Independent ship info update Skill | PASSED (unit) | `ship_info_update` exposes only `prepare/commit/cancel_ship_update`, all confirmation-gated; shared deterministic validators reject invalid position/static data. |
+| Claim Guard beyond lexical matching | PASSED (unit) | Requires non-negated evidence + a >=4-char shared phrase; blocks negation, weak relevance, and numeric conflicts. |
+| Trajectory query fix | PASSED (unit) | Reverse ranges rejected; single-side ranges derive the missing bound; 30-day span allowed, 31-day rejected. |
+| Semantic regression runner | PASSED (unit) | `semantic_passed` requires a real image + satisfied structured assertions; statuses distinguish `fixture_prepared`/`invalid_fixture`/`mock_only`/`real_http_passed`/`semantic_passed`/`failed`/`blocked`. |
+| ASCII `-` placeholder | PASSED (unit) | `_PLACEHOLDER_VALUE` unified with `_PLACEHOLDER`; single `-`, `--`, `-- / --` rejected. |
+| customer_support unaffected | PASSED (read-only) | No customer_support runtime/config/behavior changed; legacy browser capability retained. |
+| M01/M03/M05 live semantic | BLOCKED | No live model endpoint / scoped serving URL in this workspace; M03/M05 are `fixture_prepared`, M01 is `reference_only`. |
+| `/run` / `/stream_run` live | BLOCKED | Requires a configured non-production service + credentials; see `HTTP_VALIDATION.md` for the 2026-07-23 isolated samples. |
+
+`docs/CUSTOMER_SUPPORT.md` and `docs/HIFLEET_CUSTOMER_SUPPORT_AGENT_REQUIREMENTS.md`
+were both committed in `0e4bad0` and are not re-deleted or re-described as
+unsubmitted this round.
 
 ## Completion Decision
 

@@ -1,5 +1,7 @@
 # `/run` and `/stream_run` Validation Report
 
+> Note (2026-07-24): customer_ceshi V2 is now web-search-only; `verify_public_page` and browser tools are denied. The 2026-07-23 samples below remain the most recent live evidence in this workspace; no new live run was possible without a configured non-production service and credentials.
+
 Status: **PASSED (isolated current-worktree service; safe no-write cases)**.
 
 The request parser and profile resolution in `src/main.py` were audited. Existing

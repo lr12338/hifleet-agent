@@ -157,3 +157,14 @@ def test_time_normalizer_handles_utc_plus_eight_suffix():
     value = TimeNormalizer().normalize("2026-07-06 14:13:00 UTC+8")
     assert value["value"] == "2026-07-06 14:13:00 UTC+8"
     assert value["validation_errors"] == []
+
+
+def test_single_ascii_dash_is_treated_as_placeholder():
+    fields = StaticFieldNormalizer().normalize("目的港：PIRAEUS，吃水：-，船旗：-")
+    assert fields["fields"] == {"destination": "PIRAEUS"}
+    assert set(fields["invalid_fields"]) == {"draft", "flag"}
+    # The builder-level placeholder guard also rejects a lone ASCII dash and double dash.
+    assert NativeToolRuntime._valid_update_value("-") is False
+    assert NativeToolRuntime._valid_update_value("--") is False
+    assert NativeToolRuntime._valid_update_value("-- / --") is False
+    assert NativeToolRuntime._valid_update_value("12.3") is True

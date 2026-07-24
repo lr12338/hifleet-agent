@@ -40,6 +40,7 @@ def load_manifest(path: str | Path) -> SkillManifest:
             capabilities=tuple(capabilities),
             upstream_commit=str(payload.get("upstream_commit", "")),
             upstream_repository=str(payload.get("upstream_repository", "")),
+            upstream_lock_key=str(payload.get("upstream_lock_key", "")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ManifestValidationError("Manifest is missing required metadata") from exc

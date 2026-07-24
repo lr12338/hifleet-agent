@@ -64,6 +64,7 @@ class SkillManifest:
     capabilities: tuple[Mapping[str, Any], ...]
     upstream_commit: str = ""
     upstream_repository: str = ""
+    upstream_lock_key: str = ""
 
 
 @dataclass(frozen=True)

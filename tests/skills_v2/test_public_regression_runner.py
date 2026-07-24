@@ -66,3 +66,63 @@ def test_evaluate_enforces_tool_budget_and_forbidden_claims() -> None:
 def test_case_validation_rejects_overlapping_tool_policy() -> None:
     with pytest.raises(ValueError, match="case_tool_policy_conflict:case"):
         validate_cases([_case(forbidden_tools=["local_kb_search"])])
+
+
+def test_semantic_pass_requires_real_image_and_satisfied_assertions() -> None:
+    case = _case(
+        allowed_tools=["inspect_media", "local_kb_search"],
+        attachment="img.png",
+        required_observations=["图例"],
+        required_uncertainty=["不能确定"],
+        forbidden_certainty=["安全水域浮标"],
+    )
+    result = {
+        "status": "success",
+        "generated_answer": "仅凭截图不能确定符号含义，建议核对图例。",
+        "metrics": {"tool_names": ["inspect_media", "local_kb_search"]},
+    }
+    with_media = _evaluate(case, result, has_real_media=True)
+    assert with_media["status"] == "semantic_passed"
+    # Same answer but no real image travelled through /run -> not a semantic pass.
+    no_media = _evaluate(case, result, has_real_media=False)
+    assert no_media["status"] == "real_http_passed"
+
+
+def test_http_success_and_inspect_media_alone_is_not_semantic_pass() -> None:
+    case = _case(allowed_tools=["inspect_media"], attachment="img.png")  # no structured semantic assertions
+    result = {
+        "status": "success",
+        "generated_answer": "已查看图片。",
+        "metrics": {"tool_names": ["inspect_media"]},
+    }
+    evaluated = _evaluate(case, result, has_real_media=True)
+    assert evaluated["status"] == "real_http_passed"
+    assert evaluated["semantic_assertions_present"] is False
+
+
+def test_real_image_with_failed_semantic_assertion_is_failed() -> None:
+    case = _case(
+        allowed_tools=["inspect_media"],
+        attachment="img.png",
+        required_observations=["图例"],
+        forbidden_certainty=["安全水域浮标"],
+    )
+    result = {
+        "status": "success",
+        "generated_answer": "这是安全水域浮标。",
+        "metrics": {"tool_names": ["inspect_media"]},
+    }
+    evaluated = _evaluate(case, result, has_real_media=True)
+    assert evaluated["status"] == "failed"
+    assert evaluated["forbidden_certainty_found"] == ["安全水域浮标"]
+
+
+def test_pre_run_status_distinguishes_fixture_states() -> None:
+    from scripts.run_shared_skills_v2_regression import _pre_run_status
+
+    valid_no_url = _case(attachment="img.png", fixture_quality="valid")
+    assert _pre_run_status(valid_no_url, "") == ("fixture_prepared", "attachment_url_not_supplied")
+    invalid = _case(attachment="img.png", fixture_quality="invalid")
+    assert _pre_run_status(invalid, "https://x") == ("invalid_fixture", "fixture_quality_invalid")
+    absent = _case(attachment=None, fixture_quality="absent")
+    assert _pre_run_status(absent, "") == ("", "")

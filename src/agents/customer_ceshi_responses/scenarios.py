@@ -14,9 +14,9 @@ CONTRACTS = {
     "ship_lookup": ScenarioContract("ship_lookup", frozenset({"ship_search", "get_ship_position", "get_ship_archive", "get_ship_call_ports", "search_ports"})),
     "position_update": ScenarioContract("position_update", frozenset({"prepare_ship_update", "commit_ship_update", "cancel_ship_update", "ship_search"})),
     "static_update": ScenarioContract("static_update", frozenset({"prepare_ship_update", "commit_ship_update", "cancel_ship_update", "ship_search", "get_ship_archive"}), ("不得断言用户前台有编辑入口", "不得承诺立即生效")),
-    "platform_operation": ScenarioContract("platform_operation", frozenset({"local_kb_search", "web_search", "verify_public_page", "agent_browser_deep_search"}), ("不得根据内部工具证明前台功能",)),
-    "membership_permissions": ScenarioContract("membership_permissions", frozenset({"local_kb_search", "web_search", "verify_public_page"}), ("不得编造价格、额度或套餐",)),
-    "multimodal_symbol": ScenarioContract("multimodal_symbol", frozenset({"inspect_media", "local_kb_search", "web_search", "verify_public_page"}), ("不得只凭颜色命名符号",)),
+    "platform_operation": ScenarioContract("platform_operation", frozenset({"local_kb_search", "web_search"}), ("不得根据内部工具证明前台功能",)),
+    "membership_permissions": ScenarioContract("membership_permissions", frozenset({"local_kb_search", "web_search"}), ("不得编造价格、额度或套餐",)),
+    "multimodal_symbol": ScenarioContract("multimodal_symbol", frozenset({"inspect_media", "local_kb_search", "web_search"}), ("不得只凭颜色命名符号",)),
 }
 
 

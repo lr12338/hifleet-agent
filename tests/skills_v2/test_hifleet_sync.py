@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.sync_hifleet_skills import REPOSITORY, inspect_checkout, last_known_good, update_lock
+from scripts.sync_hifleet_skills import REPOSITORY, inspect_checkout, last_known_good, update_lock, update_manifest, update_skill_prompt
 
 
 def _candidate_checkout(tmp_path: Path, *, extra_skill_text: str = "") -> Path:
@@ -86,3 +86,53 @@ def test_lock_rejects_unvalidated_candidate_metadata(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="refusing_to_lock_unvalidated_candidate"):
         update_lock(lock_path, {"candidate_status": "validation_failed"})
+
+
+def test_apply_updates_lock_manifest_and_skill_prompt_consistently(tmp_path: Path, monkeypatch) -> None:
+    lock_path = tmp_path / "skills-lock.json"
+    lock_path.write_text(json.dumps({"version": 1, "skills": {}}), encoding="utf-8")
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        "schema_version: 1\nskill_id: hifleet_data\nskill_version: 0.0.0\nprompt_file: SKILL.md\n"
+        "upstream_lock_key: hifleet-skills\ncapabilities:\n"
+        "  - {id: get_ship_position, tool_name: get_ship_position, upstream_capability: get_position,"
+        " description: Read position, read_only: true, risk_level: medium, timeout_seconds: 20}\n",
+        encoding="utf-8",
+    )
+    skill_prompt_path = tmp_path / "SKILL.md"
+    skill_prompt_path.write_text("old stub", encoding="utf-8")
+    candidate = inspect_checkout(_candidate_checkout(tmp_path), repository=REPOSITORY, commit="e" * 40)
+
+    update_lock(lock_path, candidate)
+    update_manifest(manifest_path, candidate)
+    update_skill_prompt(skill_prompt_path, manifest_path, candidate)
+
+    lock_record = json.loads(lock_path.read_text(encoding="utf-8"))["skills"]["hifleet-skills"]
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    prompt_text = skill_prompt_path.read_text(encoding="utf-8")
+    # All three share the same reviewed version and commit.
+    assert lock_record["version"] == candidate["version"]
+    assert f"skill_version: {candidate['version']}" in manifest_text
+    assert f"upstream_commit: {candidate['commit']}" in manifest_text
+    assert f"version: {candidate['version']}" in prompt_text
+    assert f"commit: {candidate['commit']}" in prompt_text
+    assert f"contentHash: {candidate['content_hash']}" in prompt_text
+    # The project adapter mapping is carried into the prompt.
+    assert "get_ship_position" in prompt_text and "get_position" in prompt_text
+    assert "(project adapter)" not in prompt_text or "get_ship_position" in prompt_text
+
+
+def test_update_manifest_rejects_unvalidated_candidate(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text("skill_version: 0.0.0\nupstream_commit: old\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="refusing_to_sync_unvalidated_manifest"):
+        update_manifest(manifest_path, {"candidate_status": "validation_failed", "version": "1", "commit": "c"})
+
+
+def test_new_upstream_capability_stays_review_required_and_not_auto_exposed(tmp_path: Path) -> None:
+    candidate = _candidate_checkout(tmp_path)
+    (candidate / "scripts" / "open_console.py").write_text("def open_console():\n    return None\n", encoding="utf-8")
+    (candidate / "scripts" / "brand_new_data_feed.py").write_text("def fetch():\n    return {}\n", encoding="utf-8")
+    inspection = inspect_checkout(candidate, repository=REPOSITORY, commit="a" * 40)
+    assert "brand_new_data_feed" in inspection["review_required_capabilities"]
+    assert "brand_new_data_feed" not in inspection["approved_read_only_capabilities"]

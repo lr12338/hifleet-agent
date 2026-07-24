@@ -12,6 +12,9 @@ import argparse
 import hashlib
 import json
 import re
+import textwrap
+
+import yaml
 import subprocess
 import tempfile
 from pathlib import Path
@@ -171,6 +174,108 @@ def last_known_good(lock_path: Path) -> dict[str, str]:
     }
 
 
+MANIFEST_PATH = Path("src/skills/hifleet_data/manifest.yaml")
+SKILL_PROMPT_PATH = Path("src/skills/hifleet_data/SKILL.md")
+UPSTREAM_REPOSITORY_URL = "https://github.com/charleiWang/hifleet-skills"
+
+
+def _manifest_capabilities(manifest_path: Path) -> list[dict[str, Any]]:
+    payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+    return list(payload.get("capabilities") or [])
+
+
+def update_manifest(manifest_path: Path, candidate: dict[str, Any]) -> None:
+    """Keep the committed manifest snapshot in sync with the reviewed lock record.
+
+    Only the upstream version and commit change; the project-controlled adapter
+    capability list and mapping are never auto-extended from upstream.
+    """
+    if candidate.get("candidate_status") != "validated":
+        raise RuntimeError("refusing_to_sync_unvalidated_manifest")
+    text = manifest_path.read_text(encoding="utf-8")
+    text = re.sub(r"(?m)^skill_version:.*$", f"skill_version: {candidate['version']}", text)
+    if re.search(r"(?m)^upstream_commit:.*$", text):
+        text = re.sub(r"(?m)^upstream_commit:.*$", f"upstream_commit: {candidate['commit']}", text)
+    else:
+        text = re.sub(r"(?m)^skill_version:.*$", rf"\g<0>\nupstream_commit: {candidate['commit']}", text)
+    manifest_path.write_text(text, encoding="utf-8")
+
+
+def render_hifleet_skill_prompt(candidate: dict[str, Any], capabilities: list[dict[str, Any]]) -> str:
+    """Render the reviewed hifleet_data SKILL.md from the lock record + mapping."""
+    approved = textwrap.fill(", ".join(candidate.get("approved_read_only_capabilities") or []), width=80)
+    review_required = ", ".join(candidate.get("review_required_capabilities") or [])
+    required_env = ", ".join(candidate.get("required_env") or [])
+    rows = []
+    for cap in capabilities:
+        tool = str(cap.get("tool_name") or cap.get("id") or "")
+        upstream = str(cap.get("upstream_capability") or "")
+        label = upstream if upstream else "(project adapter)"
+        rows.append(f"| {tool} | {label} | {cap.get('description', '')} |")
+    mapping = "\n".join(rows)
+    review_section = review_required or "(none)"
+    return f"""# HiFleet Data V2
+
+You are using a locked, read-only data adapter for verified HiFleet vessel and
+traffic data. State only facts that are directly supported by the returned data.
+A successful HTTP/tool response alone never establishes that a customer-facing
+conclusion is semantically correct; always include the tool result's version
+metadata in trace data.
+
+Do not expose account, billing, registration, purchase, contact-unlock, console,
+charter-enrichment, or any other upstream write/review-required capability. Only
+the approved read-only capabilities listed below are available; everything else
+the upstream repository may contain must remain hidden.
+
+## Conservative data rules
+
+- Return vessel identity (ship name, MMSI/IMO), the queried data item, and its
+  data time. When there is no result, state the query condition or data latency;
+  never fabricate a record.
+- Trajectory queries must respect the configured day limit; narrow the range
+  instead of repeating an identical over-span request.
+- Distinguish observed data, data latency, and unsupported product claims. Use
+  hedged language ("可能/通常/不一定") only when evidence supports it.
+- Never infer fields that the tool did not return, and never let a weak or
+  conflicting web result override authoritative HiFleet data.
+
+## Upstream provenance (single source of truth: skills-lock.json)
+
+- upstream_repository: {UPSTREAM_REPOSITORY_URL}
+- version: {candidate['version']}
+- commit: {candidate['commit']}
+- contentHash: {candidate['content_hash']}
+- requiredEnv: {required_env}
+- verification: static-contract-reviewed
+
+## Approved read-only upstream capabilities
+
+{approved}
+
+## Review-required / rejected upstream capabilities (never auto-exposed)
+
+{review_section}
+
+## Capability to adapter tool mapping
+
+| adapter tool | upstream capability | description |
+| --- | --- | --- |
+{mapping}
+
+"(project adapter)" marks HiFleet-API-backed tools that this project reviews and
+exposes directly; they are not auto-derived from a new upstream script and any
+new upstream capability remains review-required until explicitly mapped here.
+"""
+
+
+def update_skill_prompt(skill_md_path: Path, manifest_path: Path, candidate: dict[str, Any]) -> None:
+    """Regenerate the reviewed SKILL.md so prompt, manifest and lock share one record."""
+    if candidate.get("candidate_status") != "validated":
+        raise RuntimeError("refusing_to_sync_unvalidated_prompt")
+    capabilities = _manifest_capabilities(manifest_path)
+    skill_md_path.write_text(render_hifleet_skill_prompt(candidate, capabilities), encoding="utf-8")
+
+
 def update_lock(lock_path: Path, candidate: dict[str, Any]) -> None:
     if candidate.get("candidate_status") != "validated":
         raise RuntimeError("refusing_to_lock_unvalidated_candidate")
@@ -198,6 +303,8 @@ def main() -> int:
     parser.add_argument("--repository", default=REPOSITORY)
     parser.add_argument("--apply", action="store_true", help="Update skills-lock.json after candidate validation.")
     parser.add_argument("--lock", type=Path, default=Path("skills-lock.json"))
+    parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument("--skill-prompt", type=Path, default=SKILL_PROMPT_PATH)
     args = parser.parse_args()
     try:
         candidate = inspect_candidate(args.repository, args.revision)
@@ -213,7 +320,11 @@ def main() -> int:
         return 2
     if args.apply:
         update_lock(args.lock, candidate)
+        update_manifest(args.manifest, candidate)
+        update_skill_prompt(args.skill_prompt, args.manifest, candidate)
         candidate["lock_status"] = "updated"
+        candidate["manifest_status"] = "updated"
+        candidate["skill_prompt_status"] = "updated"
     else:
         candidate["lock_status"] = "unchanged"
     print(json.dumps(candidate, ensure_ascii=False, sort_keys=True))

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +15,7 @@ from skills.core.result_normalizer import normalize_tool_result
 
 WRITE_TOOL_NAMES = {"upload_ship_position", "update_ship_static_info"}
 DENIED_TOOL_NAMES = WRITE_TOOL_NAMES | {
+    "verify_public_page",
     "agent_browser_deep_search",
     "web_search_agent_browser",
     "upsert_local_kb_entry",
@@ -52,7 +52,6 @@ class CapabilityRegistry:
         self._tools = {tool.name: tool for tool in tools if getattr(tool, "name", "") not in DENIED_TOOL_NAMES}
         self._shared_descriptors = {descriptor.name: descriptor for descriptor in shared_descriptors or ()}
         self._enforce_known_public_urls = enforce_known_public_urls
-        self._known_public_urls: set[str] = set()
 
     def descriptors(self) -> list[ToolDescriptor]:
         if self._shared_descriptors:
@@ -83,10 +82,6 @@ class CapabilityRegistry:
     def invoke(self, call: ToolCall) -> Observation:
         if call.name in DENIED_TOOL_NAMES or not self.has(call.name):
             return Observation(status="forbidden", capability=call.name, warnings=["Capability is not available to this agent."], retry_allowed=False)
-        if self._enforce_known_public_urls and call.name == "verify_public_page":
-            url = str(call.arguments.get("url") or "").strip()
-            if not url or url not in self._known_public_urls:
-                return Observation(status="forbidden", capability=call.name, warnings=["Only a URL returned by web_search in this runtime may be verified."], retry_allowed=False)
         descriptor = next((item for item in self.descriptors() if item.name == call.name), None)
         missing = [name for name in (descriptor.required_arguments if descriptor else ()) if name not in call.arguments or call.arguments[name] in (None, "")]
         if missing:
@@ -106,11 +101,6 @@ class CapabilityRegistry:
         shared_descriptor = self._shared_descriptors.get(call.name)
         if shared_descriptor is not None:
             result.data = normalize_tool_result(result.data, shared_descriptor)
-        if self._enforce_known_public_urls and call.name == "web_search":
-            self._known_public_urls.update(
-                url.rstrip(".,;:!?)]}\"")
-                for url in re.findall(r"https?://[^\s]+", json.dumps(result.data, ensure_ascii=False))
-            )
         result.data.setdefault("information_gain", "new facts returned" if result.facts else "no new facts returned")
         return result
 

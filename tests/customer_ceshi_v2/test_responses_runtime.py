@@ -905,7 +905,27 @@ def test_trajectory_default_range_injected_when_missing():
     defaulted = runtime._trajectory_default_range({})
     assert defaulted["starttime"]
     assert defaulted["endtime"]
-    assert runtime._trajectory_default_range({"starttime": "2026-07-01"}) == {"starttime": "2026-07-01"}
+    # Single-side ranges derive the missing bound within the configured day limit.
+    only_start = runtime._trajectory_default_range({"starttime": "2025-01-01"})
+    assert only_start["starttime"] == "2025-01-01"
+    assert only_start["endtime"] == "2025-01-31"
+    only_end = runtime._trajectory_default_range({"endtime": "2025-01-31"})
+    assert only_end["endtime"] == "2025-01-31"
+    assert only_end["starttime"] == "2025-01-01"
+
+
+def test_trajectory_reverse_and_boundary_ranges():
+    runtime = NativeToolRuntime(client=object(), registry=CapabilityRegistry(tools=[]), config={}, mode="chat_function_calling")
+    # Reverse range is rejected with an actionable order-check message.
+    reverse = runtime._trajectory_span_check({"starttime": "2026-07-23", "endtime": "2026-06-01"})
+    assert reverse is not None
+    assert reverse.status == "upstream_error"
+    assert "trajectory_reverse_range" in reverse.warnings
+    # A 30-day span is within the limit; a 31-day span is rejected.
+    assert runtime._trajectory_span_check({"starttime": "2026-06-23", "endtime": "2026-07-23"}) is None
+    exceeded = runtime._trajectory_span_check({"starttime": "2026-06-22", "endtime": "2026-07-23"})
+    assert exceeded is not None
+    assert "trajectory_span_exceeds_limit" in exceeded.warnings
 
 
 def test_trajectory_dedup_and_budget_prevent_budget_burn():

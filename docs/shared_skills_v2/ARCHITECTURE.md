@@ -30,9 +30,11 @@ Only three business Skills exist in V2:
 - `hifleet_data`: verified, read-only HiFleet data capabilities.
 - `ship_info_update`: transaction-level Draft tools; low-level writes are internal only.
 
-`web_search`, `verify_public_page`, and `inspect_media` are base capabilities,
-not business Skills. V2 exposes one web-search entry. customer_ceshi permits page
-verification only for a URL returned by `web_search` during that runtime.
+`web_search` and `inspect_media` are base capabilities, not business Skills.
+customer_ceshi V2 exposes only `web_search` for public-web evidence; `verify_public_page`,
+`agent_browser_deep_search`, and `web_search_agent_browser` are denied and are not
+described to the model. Weak, conflicting, or non-official web results must be answered
+conservatively or with a follow-up question; there is no browser tool to re-search.
 
 ## Current audit record (2026-07-23)
 
@@ -50,6 +52,18 @@ and `claim_guard.py`.
 | Write safety | Existing customer_ceshi Draft/confirmation logic remains. V2 offers only transaction-level model tools. |
 | Shared validation | `prepare_ship_update` now invokes the shared V2 position/static validators before creating a Draft and returns `invalid_fields` instead of silently accepting malformed values. |
 | API compatibility | `/run` and `/stream_run` remain in `src/main.py`; V2 changes no request or response field. |
+
+## Single source of truth for upstream metadata
+
+`skills-lock.json` is the authoritative record for the `hifleet_data` upstream
+version, commit, content hash, approved read-only capabilities, and required
+environment. The `hifleet_data` manifest declares `upstream_lock_key: hifleet-skills`;
+at runtime `SharedSkillRegistry` overrides `skill_version`/`upstream_commit` from the
+lock, and the adapter also carries `content_hash`/`last_known_good` in
+`source_versions`. `scripts/sync_hifleet_skills.py --apply` updates the lock, the
+manifest snapshot, and `SKILL.md` from the same reviewed candidate, so lock, manifest,
+prompt, and runtime metadata never diverge. New upstream capabilities are reported as
+`review_required` and are never auto-added to the manifest or exposed to the agent.
 
 ## Observability
 

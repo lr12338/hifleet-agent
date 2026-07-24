@@ -6,7 +6,10 @@ Each V2 Skill has `manifest.yaml` with `schema_version: 1`, `skill_id`,
 Each capability declares `id` (and optional `tool_name`), `description`,
 `read_only`, `risk_level`, `timeout_seconds`, and, for transaction tools,
 `requires_confirmation` plus an object `input_schema`. Upstream-backed manifests
-also record `upstream_repository` and `upstream_commit`.
+also record `upstream_repository`, `upstream_commit`, and `upstream_lock_key` (the
+`skills-lock.json` key that is the runtime authority for version/commit). Each
+upstream-backed capability may declare `upstream_capability` mapping the adapter tool
+to the reviewed upstream script (empty for project adapter extensions).
 
 The loader rejects malformed YAML, missing capabilities, duplicate names,
 non-object schemas, unsupported schema versions, and writable capabilities that

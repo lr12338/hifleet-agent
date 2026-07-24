@@ -4,10 +4,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterable
 
+import dataclasses
+
 from skills import SkillLoader
 
 from .contracts import SkillManifest, ToolDescriptor
 from .errors import ManifestValidationError, PolicyViolationError
+from .lock_store import load_skill_lock_record
 from .manifest_loader import load_manifest
 from .policy import profile_allows_tool
 
@@ -24,9 +27,29 @@ class SharedSkillRegistry:
             manifest = load_manifest(self.skills_dir / skill_id / "manifest.yaml")
             if manifest.schema_version != 1 or manifest.skill_id != skill_id:
                 raise ManifestValidationError(f"Unsupported manifest for {skill_id}")
-            manifests[skill_id] = manifest
+            manifests[skill_id] = self._apply_lock_authority(manifest)
         self._manifests = manifests
         return manifests
+
+    def _apply_lock_authority(self, manifest: SkillManifest) -> SkillManifest:
+        """Override upstream version/commit from skills-lock.json (single source of truth).
+
+        A manifest that declares ``upstream_lock_key`` must take its upstream version and
+        commit from the reviewed lock record, never from a stale hardcoded value. If the
+        lock is absent the manifest is returned unchanged so legacy_constrained fallback
+        can still operate.
+        """
+        if not manifest.upstream_lock_key:
+            return manifest
+        try:
+            record = load_skill_lock_record(self.workspace_path, manifest.upstream_lock_key)
+        except KeyError:
+            return manifest
+        return dataclasses.replace(
+            manifest,
+            skill_version=str(record.get("version") or manifest.skill_version),
+            upstream_commit=str(record.get("commit") or manifest.upstream_commit),
+        )
 
     @staticmethod
     def _schema_for(tool: Any) -> dict[str, Any]:

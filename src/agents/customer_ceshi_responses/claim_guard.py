@@ -41,11 +41,55 @@ def _structured_evidence_text(item: dict[str, Any]) -> str:
     return " ".join(fragments)
 
 
-def guard_claims(answer: str, observations: list[dict[str, Any]]) -> tuple[str, list[str]]:
-    """Remove high-risk sentences that lack direct lexical evidence.
+_NEGATION_PREFIXES = ("不", "没", "未", "非", "无", "否")
+_NEGATION_WORDS = ("无法", "不能", "不可", "不可以", "没有", "并非", "并不", "未能", "暂不", "尚不")
+_MIN_SUPPORT_PHRASE = 4
 
-    This is intentionally conservative: unrelated tool success never becomes proof of a
-    product capability, policy, attribution, UI entry, or completion claim.
+
+def _term_occurrences(term: str, text: str):
+    start = 0
+    while True:
+        index = text.find(term, start)
+        if index == -1:
+            return
+        yield index, text[max(0, index - 3):index]
+        start = index + len(term)
+
+
+def _is_negated_occurrence(prefix: str) -> bool:
+    if not prefix:
+        return False
+    if prefix[-1] in _NEGATION_PREFIXES:
+        return True
+    return any(prefix.endswith(word) for word in _NEGATION_WORDS)
+
+
+def _has_shared_phrase(sentence: str, evidence: str, min_len: int) -> bool:
+    """True when evidence contains a contiguous sentence fragment of >=min_len chars.
+
+    A lone keyword overlap (e.g. only "支持" shared) is not enough; the evidence must
+    repeat a meaningful phrase from the claim, which blocks weakly-related evidence.
+    """
+    if len(sentence) < min_len:
+        return False
+    for start in range(len(sentence) - min_len + 1):
+        if sentence[start:start + min_len] in evidence:
+            return True
+    return False
+
+
+def _number_tokens(text: str) -> set[str]:
+    return set(re.findall(r"\d+", text or ""))
+
+
+def guard_claims(answer: str, observations: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """Remove high-risk sentences that lack direct, non-contradicted evidence.
+
+    A high-risk claim is kept only when the evidence positively (non-negated) repeats a
+    meaningful phrase from the claim. Unrelated tool success, weakly-related evidence,
+    and evidence that negates the claim all remain blocked. This is intentionally
+    conservative: a keyword merely appearing in the evidence never proves a product
+    capability, policy, attribution, UI entry, or completion claim.
     """
     evidence = " ".join(
         _structured_evidence_text(item)
@@ -59,7 +103,32 @@ def guard_claims(answer: str, observations: list[dict[str, Any]]) -> tuple[str, 
         if not text:
             continue
         terms = [term.lower() for term in _HIGH_RISK.findall(text)]
-        if terms and not any(term in evidence for term in terms):
+        if not terms:
+            kept.append(text)
+            continue
+        lowered = text.lower()
+        contradiction = False
+        positive_support = False
+        for term in terms:
+            occurrences = list(_term_occurrences(term, evidence))
+            if not occurrences:
+                continue
+            if all(_is_negated_occurrence(prefix) for _, prefix in occurrences):
+                # Evidence negates this term; a positive claim is contradicted.
+                claim_occurrences = list(_term_occurrences(term, lowered))
+                if any(not _is_negated_occurrence(prefix) for _, prefix in claim_occurrences):
+                    contradiction = True
+            else:
+                positive_support = True
+        phrase_aligned = _has_shared_phrase(lowered, evidence, _MIN_SUPPORT_PHRASE)
+        claim_numbers = _number_tokens(lowered)
+        evidence_numbers = _number_tokens(evidence)
+        numeric_conflict = (
+            phrase_aligned
+            and bool(claim_numbers)
+            and not claim_numbers.issubset(evidence_numbers)
+        )
+        if contradiction or not positive_support or not phrase_aligned or numeric_conflict:
             blocked.append(text)
             continue
         kept.append(text)
