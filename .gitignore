@@ -48,3 +48,8 @@ artifacts/
 *.xlsx
 *.csv
 .cozeproj/reduction
+
+# Private regression fixtures: real HiFleet chart screenshots must never be committed.
+# Only cropped/redacted public fixtures may be checked in.
+fixtures/private/
+*.private-fixture.png
