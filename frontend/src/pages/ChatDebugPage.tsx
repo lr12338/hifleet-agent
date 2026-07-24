@@ -1,24 +1,51 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Card, Divider, Form, Input, Modal, Select, Space, Tag, Tooltip, Typography, Upload, type UploadProps, message } from "antd";
+import { Button, Card, Divider, Form, Input, Modal, Segmented, Select, Space, Tag, Tooltip, Typography, Upload, type UploadProps, message } from "antd";
 import type { UploadFile } from "antd/es/upload/interface";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import {
+  cancelTestRun,
   deleteChatDebugSession,
   fetchChatDebugSessions,
   fetchLlmConfig,
+  runTest,
   saveChatDebugSession,
   type StreamRunEvent,
   streamTestRun,
   uploadAdminAttachment
 } from "../api/client";
+import { redactForDisplay, sanitizeSignedUrl } from "../api/debugEvent";
 import { JsonViewer } from "../components/common/JsonViewer";
 import { StatusTag } from "../components/common/StatusTag";
 import { ARK_MODEL_OPTIONS, AUTO_ROUTE_MODEL_OPTION } from "../config/arkModels";
 import { useAdminShell } from "../layouts/AdminShell";
 import "./ChatDebugPage.css";
 
-type DebugEventType = "message_start" | "thinking" | "tool_request" | "tool_response" | "answer" | "message_end" | "upload" | "raw";
+function sanitizeSessionForPersist(session: ChatSession): ChatSession {
+  // 签名 URL 不写入持久化 Chat Session：对 lastRequest/lastResponse 中的 URL 查询参数脱敏。
+  const sanitizeUrls = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sanitizeUrls);
+    if (value && typeof value === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        if (k === "url" && typeof v === "string" && v.includes("?")) {
+          out[k] = sanitizeSignedUrl(v);
+        } else {
+          out[k] = sanitizeUrls(v);
+        }
+      }
+      return out;
+    }
+    return value;
+  };
+  return {
+    ...session,
+    lastRequest: sanitizeUrls(session.lastRequest),
+    lastResponse: sanitizeUrls(session.lastResponse)
+  };
+}
+
+type DebugEventType = "message_start" | "thinking" | "tool_request" | "tool_response" | "answer" | "message_end" | "upload" | "raw" | "run.started" | "route.selected" | "reasoning.summary" | "tool.started" | "tool.completed" | "tool.failed" | "evidence.summary" | "guard.result" | "answer.delta" | "answer.completed" | "run.completed" | "run.cancelled" | "run.failed" | "phase.started";
 type PanelType = "chat" | "backend" | "api" | "request";
 
 interface DebugEvent {
@@ -70,7 +97,9 @@ interface SessionMeta {
   session_id: string;
   user_id: string;
   source_channel: string;
-  agent_profile: string;
+  agent_profile: "customer_support" | "customer_ceshi";
+  endpoint: "/run" | "/stream_run";
+  response_mode?: "compact" | "full";
 }
 
 interface ChatSession {
@@ -87,8 +116,9 @@ interface ChatSession {
   lastResponse?: unknown;
   attachment?: {
     name: string;
-    url: string;
     key: string;
+    content_type?: string;
+    size?: number;
   };
 }
 
@@ -143,7 +173,9 @@ function createSession(seed = 1): ChatSession {
       session_id: `admin_chat_debug_${Date.now()}`,
       user_id: "admin_debug_user",
       source_channel: "admin_panel",
-      agent_profile: "customer_support"
+      agent_profile: "customer_support",
+      endpoint: "/stream_run",
+      response_mode: "compact"
     },
     userMessages: [],
     assistantMessages: [],
@@ -245,12 +277,27 @@ function normalizeThinkingText(text: string): ThinkingLine[] {
 function eventTitleMap(event: string): string {
   const mapping: Record<string, string> = {
     message_start: "消息开始",
-    thinking: "思考过程",
+    thinking: "推理摘要",
     tool_request: "工具请求",
     tool_response: "工具响应",
     answer: "回答输出",
+    answer_delta: "回答增量",
+    "answer.completed": "回答完成",
+    "answer.delta": "回答增量",
     message_end: "消息结束",
-    upload: "附件上传"
+    upload: "附件上传",
+    "run.started": "运行开始",
+    "run.completed": "运行完成",
+    "run.cancelled": "运行取消",
+    "run.failed": "运行失败",
+    "route.selected": "路由选择",
+    "reasoning.summary": "推理摘要",
+    "tool.started": "工具调用",
+    "tool.completed": "工具完成",
+    "tool.failed": "工具失败",
+    "evidence.summary": "证据与结果",
+    "guard.result": "安全检查",
+    "phase.started": "执行过程"
   };
   return mapping[event] || event;
 }
@@ -291,6 +338,7 @@ export function ChatDebugPage() {
   const [historyReady, setHistoryReady] = useState(false);
   const [defaultTextModel, setDefaultTextModel] = useState(AUTO_ROUTE_MODEL_OPTION.value);
   const abortRef = useRef<AbortController | null>(null);
+  const currentRunIdRef = useRef<string | null>(null);
   const streamContainerRef = useRef<HTMLDivElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const lastSavedSnapshotRef = useRef<string>("");
@@ -385,8 +433,10 @@ export function ChatDebugPage() {
       user_id: activeSession.meta.user_id,
       source_channel: activeSession.meta.source_channel,
       agent_profile: activeSession.meta.agent_profile,
+      endpoint: activeSession.meta.endpoint,
+      response_mode: activeSession.meta.response_mode || "compact",
       model: activeSession.meta.model,
-      payload: activeSession
+      payload: sanitizeSessionForPersist(activeSession)
     };
     const snapshot = safeFormat(persistPayload);
     if (snapshot === lastSavedSnapshotRef.current) {
@@ -494,10 +544,24 @@ export function ChatDebugPage() {
     }
   }, [form, selectedThinkingMode]);
 
+  const updateActiveMeta = (patch: Partial<SessionMeta>) => {
+    if (!activeSession) return;
+    setSessions((prev) => prev.map((s) => (s.id === activeSession.id ? { ...s, meta: { ...s.meta, ...patch } } : s)));
+  };
+
+  const profileRuntimeLabel =
+    activeSession?.meta.agent_profile === "customer_ceshi"
+      ? "customer_ceshi：Responses 优先实验链（不支持原生 Token 流，步骤流）"
+      : "customer_support：正式 Chat 客服链（LangGraph）";
+
   const stopStream = () => {
+    const runId = currentRunIdRef.current;
     abortRef.current?.abort();
     abortRef.current = null;
     setSending(false);
+    if (runId) {
+      void cancelTestRun(runId).catch(() => undefined);
+    }
     if (!activeSession) return;
     setSessions((prev) =>
       prev.map((session) => {
@@ -530,7 +594,8 @@ export function ChatDebugPage() {
                 attachment: {
                   name: localFile.name,
                   key: uploaded.key,
-                  url: uploaded.url
+                  content_type: uploaded.content_type,
+                  size: uploaded.size
                 },
                 debugEvents: [
                   ...session.debugEvents,
@@ -541,7 +606,6 @@ export function ChatDebugPage() {
                     payload: {
                       filename: localFile.name,
                       key: uploaded.key,
-                      url: uploaded.url,
                       size: uploaded.size,
                       content_type: uploaded.content_type
                     },
@@ -590,8 +654,11 @@ export function ChatDebugPage() {
       session_id: String(advancedValues.session_id || activeSession.meta.session_id),
       user_id: String(advancedValues.user_id || activeSession.meta.user_id),
       source_channel: String(advancedValues.source_channel || activeSession.meta.source_channel),
-      agent_profile: String(advancedValues.agent_profile || activeSession.meta.agent_profile)
+      agent_profile: (String(advancedValues.agent_profile || activeSession.meta.agent_profile) as SessionMeta["agent_profile"]),
+      endpoint: activeSession.meta.endpoint
     };
+    const runId = `debug_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    currentRunIdRef.current = runId;
 
     setSessions((prev) =>
       prev.map((session) =>
@@ -639,6 +706,7 @@ export function ChatDebugPage() {
         source_channel: nextMeta.source_channel,
         agent_profile: nextMeta.agent_profile,
         thinking: nextMeta.thinking,
+        ...(nextMeta.endpoint === "/run" ? { response_mode: activeSession.meta.response_mode || "compact" } : {}),
         ...(nextMeta.model && nextMeta.model !== AUTO_ROUTE_MODEL_OPTION.value ? { model: nextMeta.model } : {})
       };
       setSessions((prev) =>
@@ -652,142 +720,252 @@ export function ChatDebugPage() {
         )
       );
 
+      const handleStreamEvent = ({ event, data, raw }: StreamRunEvent) => {
+        const localNormalizedEvent = resolveEventType(event, data);
+        const localChunkText = getEventText(data);
+        const localEventTimestamp = nowLabel();
+        setSessions((prev) =>
+          prev.map((session) => {
+            if (session.id !== activeSession.id) return session;
+            const localDebugEvent: DebugEvent = {
+              id: `${Date.now()}-${session.debugEvents.length}`,
+              type: localNormalizedEvent,
+              title: eventTitleMap(localNormalizedEvent),
+              payload: data,
+              timestamp: localEventTimestamp,
+              raw: typeof raw === "string" ? raw : JSON.stringify(data)
+            };
+            const nextSession: ChatSession = {
+              ...session,
+              lastResponse: data,
+              debugEvents: [...session.debugEvents, localDebugEvent]
+            };
+            const dataObj = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+            const contentObj =
+              dataObj.content && typeof dataObj.content === "object"
+                ? (dataObj.content as Record<string, unknown>)
+                : {};
+            const v1Type = typeof dataObj.type === "string" ? dataObj.type : "";
+
+            // V1 answer.delta -> incremental answer
+            if (v1Type === "answer.delta") {
+              const delta = (dataObj.data as { delta?: string })?.delta;
+              if (typeof delta === "string") {
+                nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                  item.id === assistantId ? { ...item, answer: item.answer + delta } : item
+                );
+                return nextSession;
+              }
+            }
+            // V1 answer.completed -> set full answer
+            if (v1Type === "answer.completed") {
+              const full = (dataObj.data as { answer?: string })?.answer;
+              if (typeof full === "string") {
+                nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                  item.id === assistantId ? { ...item, answer: full } : item
+                );
+                return nextSession;
+              }
+            }
+            // V1 tool.started / tool.completed / tool.failed -> tool cards
+            if (v1Type === "tool.started") {
+              const toolName = String((dataObj.data as { tool_name?: string })?.tool_name || "unknown");
+              const callId = String(dataObj.call_id || `${Date.now()}-tool`);
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId
+                  ? { ...item, tools: [...item.tools, { id: callId, name: toolName, request: (dataObj.data as { arguments?: unknown })?.arguments }] }
+                  : item
+              );
+              return nextSession;
+            }
+            if (v1Type === "tool.completed" || v1Type === "tool.failed") {
+              const callId = String(dataObj.call_id || "");
+              const toolData = (dataObj.data as { tool_name?: string; result?: unknown; status?: string; error?: string }) || {};
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId
+                  ? {
+                      ...item,
+                      tools: item.tools.map((tool) =>
+                        tool.id === callId || (!callId && tool.id === item.tools[item.tools.length - 1]?.id)
+                          ? { ...tool, response: toolData.result ?? toolData.error ?? toolData, name: toolData.tool_name || tool.name }
+                          : tool
+                      )
+                    }
+                  : item
+              );
+              return nextSession;
+            }
+            // V1 reasoning.summary -> 推理摘要 (runtime_summary only, never hidden CoT)
+            if (v1Type === "reasoning.summary") {
+              const summaryText = typeof dataObj.summary === "string" ? dataObj.summary : "";
+              if (summaryText) {
+                nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                  item.id === assistantId ? { ...item, thinking: [...item.thinking, ...normalizeThinkingText(summaryText)] } : item
+                );
+                return nextSession;
+              }
+            }
+            // V1 run.completed / run.cancelled / run.failed -> end
+            if (v1Type === "run.completed" || v1Type === "run.cancelled" || v1Type === "run.failed") {
+              nextSession.status = "ended";
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId ? { ...item, status: "done" } : item
+              );
+              return nextSession;
+            }
+
+            // Legacy event handling (back-compat)
+            const thinkingText =
+              typeof dataObj.text === "string"
+                ? dataObj.text
+                : typeof dataObj.thinking === "string"
+                  ? dataObj.thinking
+                  : typeof contentObj.thinking === "string"
+                    ? contentObj.thinking
+                    : typeof contentObj.reasoning === "string"
+                      ? contentObj.reasoning
+                    : "";
+
+            if (localNormalizedEvent === "thinking" && thinkingText) {
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId
+                  ? { ...item, thinking: [...item.thinking, ...normalizeThinkingText(thinkingText)] }
+                  : item
+              );
+              return nextSession;
+            }
+
+            if (localNormalizedEvent === "tool_request") {
+              const toolPayload =
+                (contentObj.tool_request && typeof contentObj.tool_request === "object"
+                  ? (contentObj.tool_request as Record<string, unknown>)
+                  : dataObj) || {};
+              const toolName = String(toolPayload.tool_name || toolPayload.tool || toolPayload.name || "unknown_tool");
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId
+                  ? {
+                      ...item,
+                      tools: [
+                        ...item.tools,
+                        {
+                          id: `${Date.now()}-tool`,
+                          name: toolName,
+                          request: toolPayload.arguments || toolPayload.tool_args || toolPayload.args || toolPayload
+                        }
+                      ]
+                    }
+                  : item
+              );
+              nextSession.timeline = [
+                ...session.timeline,
+                {
+                  id: `${Date.now()}-timeline-tool-request`,
+                  text: `${localEventTimestamp} 调用了工具：${toolName}`,
+                  timestamp: localEventTimestamp,
+                  turnId: assistantId
+                }
+              ];
+              return nextSession;
+            }
+
+            if (localNormalizedEvent === "tool_response") {
+              const toolPayload =
+                (contentObj.tool_response && typeof contentObj.tool_response === "object"
+                  ? (contentObj.tool_response as Record<string, unknown>)
+                  : dataObj) || {};
+              const toolName = String(toolPayload.tool_name || toolPayload.tool || toolPayload.name || "unknown_tool");
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId
+                  ? {
+                      ...item,
+                      tools: item.tools.map((tool, index) =>
+                        index === item.tools.length - 1 && tool.name === toolName
+                          ? { ...tool, response: toolPayload.result || toolPayload.output || toolPayload.tool_result || toolPayload }
+                          : tool
+                      )
+                    }
+                  : item
+              );
+              nextSession.timeline = [
+                ...session.timeline,
+                {
+                  id: `${Date.now()}-timeline-tool-response`,
+                  text: `${localEventTimestamp} 工具返回：${toolName}`,
+                  timestamp: localEventTimestamp,
+                  turnId: assistantId
+                }
+              ];
+              return nextSession;
+            }
+
+            if (localNormalizedEvent === "answer" || (localNormalizedEvent === "raw" && localChunkText)) {
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId ? { ...item, answer: localChunkText ? item.answer + localChunkText : item.answer } : item
+              );
+              return nextSession;
+            }
+
+            if (localNormalizedEvent === "message_end") {
+              nextSession.status = "ended";
+              nextSession.assistantMessages = session.assistantMessages.map((item) =>
+                item.id === assistantId ? { ...item, status: "done" } : item
+              );
+              return nextSession;
+            }
+
+            return { ...nextSession };
+          })
+        );
+      };
+
+      if (nextMeta.endpoint === "/run") {
+        const result = await runTest({
+          endpoint: "/run",
+          payload,
+          run_id: runId
+        });
+        const body = (result.body ?? result) as Record<string, unknown>;
+        const answerText = String(
+          (body as { answer?: string }).answer ??
+            (body as { result?: { answer?: string } }).result?.answer ??
+            (body as { message?: string }).message ??
+            ""
+        );
+        setSessions((prev) =>
+          prev.map((session) =>
+            session.id !== activeSession.id
+              ? session
+              : {
+                  ...session,
+                  status: "ended",
+                  lastResponse: result,
+                  debugEvents: [
+                    ...session.debugEvents,
+                    {
+                      id: `${Date.now()}-run-meta`,
+                      type: "raw",
+                      title: `/run 结果`,
+                      payload: { status_code: result.status_code, latency_ms: result.latency_ms, run_id: result.run_id },
+                      timestamp: nowLabel()
+                    }
+                  ],
+                  assistantMessages: session.assistantMessages.map((item) =>
+                    item.id === assistantId ? { ...item, status: "done", answer: answerText || item.answer } : item
+                  )
+                }
+          )
+        );
+        setSending(false);
+        abortRef.current = null;
+        setAttachmentFiles([]);
+        form.setFieldValue("text", "");
+        return;
+      }
+
       await streamTestRun(
         payload,
         {
-          onEvent: ({ event, data, raw }: StreamRunEvent) => {
-            const normalizedEvent = resolveEventType(event, data);
-            const chunkText = getEventText(data);
-            const eventTimestamp = nowLabel();
-            setSessions((prev) =>
-              prev.map((session) => {
-                if (session.id !== activeSession.id) return session;
-                const debugEvent: DebugEvent = {
-                  id: `${Date.now()}-${session.debugEvents.length}`,
-                  type: normalizedEvent,
-                  title: eventTitleMap(normalizedEvent),
-                  payload: data,
-                  timestamp: eventTimestamp,
-                  raw
-                };
-                const nextSession: ChatSession = {
-                  ...session,
-                  lastResponse: data,
-                  debugEvents: [...session.debugEvents, debugEvent]
-                };
-
-                const dataObj = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
-                const contentObj =
-                  dataObj.content && typeof dataObj.content === "object"
-                    ? (dataObj.content as Record<string, unknown>)
-                    : {};
-                const thinkingText =
-                  typeof dataObj.text === "string"
-                    ? dataObj.text
-                    : typeof dataObj.thinking === "string"
-                      ? dataObj.thinking
-                      : typeof contentObj.thinking === "string"
-                        ? contentObj.thinking
-                        : typeof contentObj.reasoning === "string"
-                          ? contentObj.reasoning
-                        : "";
-
-                if (normalizedEvent === "thinking" && thinkingText) {
-                  nextSession.assistantMessages = session.assistantMessages.map((item) =>
-                    item.id === assistantId
-                      ? {
-                          ...item,
-                          thinking: [...item.thinking, ...normalizeThinkingText(thinkingText)]
-                        }
-                      : item
-                  );
-                  return nextSession;
-                }
-
-                if (normalizedEvent === "tool_request") {
-                  const toolPayload =
-                    (contentObj.tool_request && typeof contentObj.tool_request === "object"
-                      ? (contentObj.tool_request as Record<string, unknown>)
-                      : dataObj) || {};
-                  const toolName = String(toolPayload.tool_name || toolPayload.tool || toolPayload.name || "unknown_tool");
-                  nextSession.assistantMessages = session.assistantMessages.map((item) =>
-                    item.id === assistantId
-                      ? {
-                          ...item,
-                          tools: [
-                            ...item.tools,
-                            {
-                              id: `${Date.now()}-tool`,
-                              name: toolName,
-                              request: toolPayload.arguments || toolPayload.tool_args || toolPayload.args || toolPayload
-                            }
-                          ]
-                        }
-                      : item
-                  );
-                  nextSession.timeline = [
-                    ...session.timeline,
-                    {
-                      id: `${Date.now()}-timeline-tool-request`,
-                      text: `${eventTimestamp} 调用了工具：${toolName}`,
-                      timestamp: eventTimestamp,
-                      turnId: assistantId
-                    }
-                  ];
-                  return nextSession;
-                }
-
-                if (normalizedEvent === "tool_response") {
-                  const toolPayload =
-                    (contentObj.tool_response && typeof contentObj.tool_response === "object"
-                      ? (contentObj.tool_response as Record<string, unknown>)
-                      : dataObj) || {};
-                  const toolName = String(toolPayload.tool_name || toolPayload.tool || toolPayload.name || "unknown_tool");
-                  nextSession.assistantMessages = session.assistantMessages.map((item) =>
-                    item.id === assistantId
-                      ? {
-                          ...item,
-                          tools: item.tools.map((tool, index) =>
-                            index === item.tools.length - 1 && tool.name === toolName
-                              ? { ...tool, response: toolPayload.result || toolPayload.output || toolPayload.tool_result || toolPayload }
-                              : tool
-                          )
-                        }
-                      : item
-                  );
-                  nextSession.timeline = [
-                    ...session.timeline,
-                    {
-                      id: `${Date.now()}-timeline-tool-response`,
-                      text: `${eventTimestamp} 工具返回：${toolName}`,
-                      timestamp: eventTimestamp,
-                      turnId: assistantId
-                    }
-                  ];
-                  return nextSession;
-                }
-
-                if (normalizedEvent === "answer" || (normalizedEvent === "raw" && chunkText)) {
-                  nextSession.assistantMessages = session.assistantMessages.map((item) =>
-                    item.id === assistantId ? { ...item, answer: chunkText ? item.answer + chunkText : item.answer } : item
-                  );
-                  return nextSession;
-                }
-
-                if (normalizedEvent === "message_end") {
-                  nextSession.status = "ended";
-                  nextSession.assistantMessages = session.assistantMessages.map((item) =>
-                    item.id === assistantId ? { ...item, status: "done" } : item
-                  );
-                  return nextSession;
-                }
-
-                return {
-                  ...nextSession
-                };
-              })
-            );
-          },
+          onEvent: handleStreamEvent,
           onDone: () => {
             setSending(false);
             abortRef.current = null;
@@ -909,7 +1087,7 @@ export function ChatDebugPage() {
           </div>
           <div className="chat-debug-toolbar-meta">
             <Tag color={environmentTagColor}>环境：{environmentLabel}</Tag>
-            <Tag>Agent：Hifleet 主 Agent</Tag>
+            <Tag color={activeSession.meta.agent_profile === "customer_ceshi" ? "geekblue" : "green"}>Profile：{profileRuntimeLabel}</Tag>
             <Tag>Model：{activeSession.meta.model === AUTO_ROUTE_MODEL_OPTION.value ? `自动路由 / ${defaultTextModel}` : activeSession.meta.model}</Tag>
             <Tag>版本：admin-ui-v2</Tag>
           </div>
@@ -929,8 +1107,10 @@ export function ChatDebugPage() {
                   user_id: activeSession.meta.user_id,
                   source_channel: activeSession.meta.source_channel,
                   agent_profile: activeSession.meta.agent_profile,
+                  endpoint: activeSession.meta.endpoint,
+                  response_mode: activeSession.meta.response_mode || "compact",
                   model: activeSession.meta.model,
-                  payload: activeSession
+                  payload: sanitizeSessionForPersist(activeSession)
                 }).then(() => message.success("当前调试案例已保存"));
               }}
             >
@@ -966,6 +1146,38 @@ export function ChatDebugPage() {
         </div>
 
         <div className="chat-debug-toolbar-strip">
+          <Space size={8} wrap className="chat-debug-core-controls">
+            <Segmented
+              size="small"
+              value={activeSession.meta.endpoint}
+              onChange={(val) => updateActiveMeta({ endpoint: val as SessionMeta["endpoint"] })}
+              options={[
+                { label: "/run（非流式）", value: "/run" },
+                { label: "/stream_run（SSE）", value: "/stream_run" }
+              ]}
+            />
+            <Segmented
+              size="small"
+              value={activeSession.meta.agent_profile}
+              onChange={(val) => updateActiveMeta({ agent_profile: val as SessionMeta["agent_profile"] })}
+              options={[
+                { label: "customer_support", value: "customer_support" },
+                { label: "customer_ceshi", value: "customer_ceshi" }
+              ]}
+            />
+            {activeSession.meta.endpoint === "/run" && (
+              <Segmented
+                size="small"
+                value={activeSession.meta.response_mode || "compact"}
+                onChange={(val) => updateActiveMeta({ response_mode: val as "compact" | "full" })}
+                options={[
+                  { label: "compact", value: "compact" },
+                  { label: "full", value: "full" }
+                ]}
+              />
+            )}
+            <Typography.Text type="secondary">{profileRuntimeLabel}</Typography.Text>
+          </Space>
           <div className="chat-debug-tabbar">
             {([
               ["chat", "对话视图"],
@@ -1104,7 +1316,7 @@ export function ChatDebugPage() {
                                     ))}
                                   </ul>
                                 ) : (
-                                  <Typography.Text type="secondary">暂无思考过程</Typography.Text>
+                                  <Typography.Text type="secondary">暂无推理摘要</Typography.Text>
                                 )}
                               </div>
                             </details>
@@ -1117,11 +1329,11 @@ export function ChatDebugPage() {
                                     <div className="chat-debug-tool-name">{tool.name}</div>
                                     <div className="chat-debug-tool-section">
                                       <strong>请求参数</strong>
-                                      <JsonViewer value={tool.request || {}} maxHeight={180} />
+                                      <JsonViewer value={redactForDisplay(tool.request || {})} maxHeight={180} />
                                     </div>
                                     <div className="chat-debug-tool-section">
                                       <strong>返回结果</strong>
-                                      <JsonViewer value={tool.response || {}} maxHeight={180} />
+                                      <JsonViewer value={redactForDisplay(tool.response || {})} maxHeight={180} />
                                     </div>
                                   </div>
                                 ))}
@@ -1157,7 +1369,7 @@ export function ChatDebugPage() {
                         <strong>{event.title}</strong>
                         <span style={{ color: "#6b7280", fontSize: 12 }}>{event.timestamp}</span>
                       </div>
-                      <JsonViewer value={event.raw || event.payload} maxHeight={260} />
+                      <JsonViewer value={redactForDisplay(event.raw || event.payload)} maxHeight={260} />
                     </div>
                   ))
                 ) : (
@@ -1170,12 +1382,12 @@ export function ChatDebugPage() {
                   <div className="chat-debug-panel-card">
                     <strong>最近请求</strong>
                     <Divider style={{ margin: "10px 0" }} />
-                    <JsonViewer value={activeSession.lastRequest || {}} maxHeight={260} />
+                    <JsonViewer value={redactForDisplay(activeSession.lastRequest || {})} maxHeight={260} />
                   </div>
                   <div className="chat-debug-panel-card">
                     <strong>最近响应事件</strong>
                     <Divider style={{ margin: "10px 0" }} />
-                    <JsonViewer value={activeSession.lastResponse || {}} maxHeight={260} />
+                    <JsonViewer value={redactForDisplay(activeSession.lastResponse || {})} maxHeight={260} />
                   </div>
                 </>
               ) : null}
@@ -1280,11 +1492,11 @@ export function ChatDebugPage() {
             </Card>
 
             <Card title="当前请求参数" bordered={false} className="chat-debug-inspector-card">
-              <JsonViewer value={activeSession.lastRequest || {}} maxHeight={220} />
+              <JsonViewer value={redactForDisplay(activeSession.lastRequest || {})} maxHeight={220} />
             </Card>
 
             <Card title="最近响应" bordered={false} className="chat-debug-inspector-card">
-              <JsonViewer value={activeSession.lastResponse || {}} maxHeight={220} />
+              <JsonViewer value={redactForDisplay(activeSession.lastResponse || {})} maxHeight={220} />
             </Card>
           </div>
 
