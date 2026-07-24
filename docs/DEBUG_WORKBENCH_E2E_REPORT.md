@@ -32,7 +32,22 @@
 ### 构建
 - 前端 `tsc -b && vite build`：通过。
 
-## 3. 需真实服务的验证项（限制）
+## 3. 真实 E2E 冒烟（已执行）
+
+在本地服务 `http://127.0.0.1:10123`（`ARK_API_KEY` 在线、本地知识库已加载）执行真实四象限冒烟，结果：
+
+| 象限 | 结果 |
+| --- | --- |
+| `/run` × customer_support（compact） | 真实 HTTP 200，返回真实客户回复，含 run_id |
+| `/stream_run` × customer_support（V1 调试 Token） | `run.started -> reasoning.summary(runtime_summary) -> answer.started -> answer.completed -> run.completed`，真实回复 |
+| `/stream_run` × customer_ceshi（V1 步骤流） | `run.started -> phase.started(步骤流) -> route.selected -> answer.started -> answer.completed -> run.completed`，真实回复，无假 token 增量 |
+| `/admin/test/run` 代理 `/run` | 返回 target_url/status_code/脱敏 headers/body/latency_ms/run_id |
+| SSRF 拦截 | `target_agent_url=http://evil.example.com` -> HTTP 400 |
+| `/admin/test/cancel/{run_id}` | HTTP 200，已完成 run 返回 not_found（正确） |
+
+`/run` 与 `/stream_run` 的最终客户回复语义一致（同为 HiFleet 客服问候）。customer_ceshi 如实标记步骤流，未宣称原生 Responses token 流。冒烟中发现并修复 `ToolCallCallbackHandler` 缺少 `run_inline` 的真实缺陷（继承 BaseCallbackHandler）。
+
+## 4. 需真实服务的扩展验证项（限制）
 
 下列需真实 ARK_API_KEY/Postgres/LLM 在线，本环境部分测试（如 `test_customer_support_router`、`test_customer_support_intent_agent`、`test_customer_ceshi_readable_trace` 等）会发起真实模型调用，不适合在 CI 离线跑。建议在具备密钥的环境执行真实四象限 curl：
 
@@ -57,6 +72,6 @@ curl -X POST http://127.0.0.1:10123/cancel/<run_id>
 
 每象限确认：最终回答存在、无重复回答、无重复工具、工具 request/response 配对、run.completed 正确、无伪造事件、无敏感字段泄露、`/run` 与 `/stream_run` 最终客户回复语义一致、不同 Session 不串上下文。
 
-## 4. 已知不相关失败
+## 5. 已知不相关失败
 
 `tests/test_smart_search_tools.py::test_web_search_passes_and_enforces_block_hosts` 在干净 HEAD `bfd29d0`（无本次改动）即失败，属 web_search block_hosts 过滤的既有 bug，与本次工作无关，不在本次修复范围。
