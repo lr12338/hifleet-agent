@@ -7,6 +7,14 @@
 - 外部 `/run`、微信客服旧格式、多模态输入、工具调用和安全输出分别在哪一层完成
 - 线上排障时应该看哪些文件和字段
 
+> **阅读范围（2026-07-24）：** 本文的主图和多数流程以正式
+> `customer_support` legacy 主链为中心。`customer_ceshi` 已有独立的
+> Responses/Shared Skills V2 运行时，不能再按本文的 legacy Browser 或
+> standard-agent 说明推断其工具权限。维护 `customer_ceshi` 请优先阅读
+> [CUSTOMER_CESHI_ARCHITECTURE.md](CUSTOMER_CESHI_ARCHITECTURE.md) 与
+> [shared_skills_v2/README.md](shared_skills_v2/README.md)；按反馈排查请从
+> [DEVELOPER_TROUBLESHOOTING.md](DEVELOPER_TROUBLESHOOTING.md) 开始。
+
 ## 1. 总体架构
 
 ```mermaid
@@ -16,7 +24,7 @@ flowchart TD
     Main --> Normalize[消息归一化]
     Normalize --> Profile[profile 解析]
     Profile --> Build[build_agent]
-    Build --> CS[customer_support / customer_ceshi lightweight graph]
+    Build --> CS[customer_support legacy lightweight graph]
     CS --> Pre[preprocess]
     Pre --> Perception[direct multimodal perception]
     Pre --> Understanding[CustomerUnderstanding JSON hint]

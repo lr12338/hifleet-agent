@@ -1,5 +1,7 @@
 # Shared Skills V2 Architecture
 
+> 中文阅读入口与专题职责见 [README.md](README.md)。本文件说明实现边界；验收结论请只引用 [../customer_ceshi_acceptance_status.md](../customer_ceshi_acceptance_status.md)。
+
 ## Runtime boundary
 
 `src/skills/core/` is a new, manifest-driven layer. It does not modify or replace
@@ -8,8 +10,8 @@ loading behavior. `config/agent_profiles.json` controls runtime selection.
 
 | Profile | Default mode | Adapter | User-visible behavior |
 | --- | --- | --- | --- |
-| `customer_support` | `legacy` | `skills.adapters.customer_support` | Legacy only; V2 is shadow-ready but not used by its production chain. |
-| `customer_ceshi` | `v2` | `skills.adapters.customer_ceshi` | Existing Responses/Chat runtime receives V2 descriptors, tools, and Skill instructions. |
+| `customer_support` | `legacy` | `skills.adapters.customer_support` | Legacy customer reply remains primary; opt-in V2 shadow injects the shared Skill prompt into a no-tool assessment. |
+| `customer_ceshi` | `v2` | `skills.adapters.customer_ceshi` | Existing Responses/Chat runtime receives V2 descriptors, tools, and Skill instructions; V2 load failure uses a constrained legacy fallback. |
 
 `CUSTOMER_SUPPORT_SKILLS_MODE` and `CUSTOMER_CESHI_SKILLS_MODE` override the
 mode without code changes. Invalid values fall back to safe defaults.

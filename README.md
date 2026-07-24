@@ -4,6 +4,14 @@ HiFleet 企业客服生产服务。正式客服链路使用 Chat Completions API
 
 生产调用规范（两条客服链路共用）见 [docs/CUSTOMER_SERVICE_API.md](docs/CUSTOMER_SERVICE_API.md)。`customer_support` 的生产运行与安全规则见 [docs/CUSTOMER_SUPPORT.md](docs/CUSTOMER_SUPPORT.md)。
 
+## 文档导航
+
+- **首次了解项目或定位反馈问题**：[docs/README.md](docs/README.md) → [docs/DEVELOPER_TROUBLESHOOTING.md](docs/DEVELOPER_TROUBLESHOOTING.md)。
+- **接口接入**：[docs/CUSTOMER_SERVICE_API.md](docs/CUSTOMER_SERVICE_API.md)。
+- **正式客服链路**：[docs/CUSTOMER_SUPPORT.md](docs/CUSTOMER_SUPPORT.md)。
+- **`customer_ceshi` 与验收事实**：[docs/CUSTOMER_CESHI_ARCHITECTURE.md](docs/CUSTOMER_CESHI_ARCHITECTURE.md) → [docs/customer_ceshi_acceptance_status.md](docs/customer_ceshi_acceptance_status.md)。
+- **Shared Skills V2**：[docs/shared_skills_v2/README.md](docs/shared_skills_v2/README.md)。
+
 ## 快速启动
 
 ```bash
