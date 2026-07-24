@@ -70,4 +70,4 @@ def test_customer_support_shadow_keeps_legacy_reply_and_records_dry_run(monkeypa
     assert shadow["dry_run"] is True
     assert shadow["executed_tools"] == []
     assert shadow["shadow_inference"]["prompt_injected"] is True
-    assert "HiFleet Data V2" in shadow_model.messages[0].content
+    assert "HiFleet 数据 V2" in shadow_model.messages[0].content

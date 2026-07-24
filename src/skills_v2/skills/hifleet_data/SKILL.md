@@ -1,29 +1,21 @@
-# HiFleet Data V2
+# HiFleet 数据 V2
 
-You are using a locked, read-only data adapter for verified HiFleet vessel and
-traffic data. State only facts that are directly supported by the returned data.
-A successful HTTP/tool response alone never establishes that a customer-facing
-conclusion is semantically correct; always include the tool result's version
-metadata in trace data.
+你正在使用一个锁定的、只读的 HiFleet 船舶与通航数据适配器。只陈述有返回数据直接支持
+的事实。一次成功的 HTTP/工具响应本身不构成客户面结论在语义上正确；始终在 trace 数据中
+包含工具结果的版本元数据。
 
-Do not expose account, billing, registration, purchase, contact-unlock, console,
-charter-enrichment, or any other upstream write/review-required capability. Only
-the approved read-only capabilities listed below are available; everything else
-the upstream repository may contain must remain hidden.
+不得暴露账户、充值、注册、购买、联系人解锁、控制台、租船信息增强或任何其他上游写入/
+待审核能力。仅以下经审批准的只读能力可用；上游仓库可能包含的其他一切能力必须保持隐藏。
 
-## Conservative data rules
+## 保守数据规则
 
-- Return vessel identity (ship name, MMSI/IMO), the queried data item, and its
-  data time. When there is no result, state the query condition or data latency;
-  never fabricate a record.
-- Trajectory queries must respect the configured day limit; narrow the range
-  instead of repeating an identical over-span request.
-- Distinguish observed data, data latency, and unsupported product claims. Use
-  hedged language ("可能/通常/不一定") only when evidence supports it.
-- Never infer fields that the tool did not return, and never let a weak or
-  conflicting web result override authoritative HiFleet data.
+- 返回船舶标识（船名、MMSI/IMO）、所查数据项及其数据时间。无结果时陈述查询条件或数据
+  延迟，绝不编造记录。
+- 轨迹查询须遵守配置的天数限制；收窄范围而非重复相同的超范围请求。
+- 区分观测数据、数据延迟和不支持的产品主张。仅在证据支持时使用对冲语言（"可能/通常/不一定"）。
+- 绝不推断工具未返回的字段，绝不让弱匹配或冲突的网页结果覆盖权威 HiFleet 数据。
 
-## Upstream provenance (single source of truth: V2 lock)
+## 上游来源（单源真相：V2 lock）
 
 - upstream_repository: https://github.com/charleiWang/hifleet-skills
 - version: 0.3.21
@@ -32,35 +24,41 @@ the upstream repository may contain must remain hidden.
 - requiredEnv: HIFLEET_API_KEY
 - verification: static-contract-reviewed
 
-## Approved read-only upstream capabilities
+## 已批准只读上游能力
 
 get_archive, get_area_traffic, get_areas, get_avoidredsea_traffic, get_casualty,
 get_maritime_penalty, get_port, get_position, get_psc, get_psc_anomalies,
 get_psc_openclaw_stats, get_sanction, get_strait_traffic
 
-## Review-required / rejected upstream capabilities (never auto-exposed)
+## 待审核/拒绝的上游能力（永不自动暴露）
 
 charter_contact_dedup, charter_enrich_helpers, open_console
 
-## Capability to adapter tool mapping
+## 能力到适配器工具映射
 
-| adapter tool | upstream capability | description |
+| 适配器工具 | 上游能力 | 说明 |
 | --- | --- | --- |
-| ship_search | (project adapter) | Search vessels by a user-supplied identifier. |
-| get_ship_position | get_position | Read the latest vessel position. |
-| get_ship_archive | get_archive | Read vessel archive data. |
-| get_psc_records | get_psc | Read vessel PSC records. |
-| get_area_traffic | get_area_traffic | Read area traffic statistics. |
-| get_strait_traffic | get_strait_traffic | Read strait traffic statistics. |
-| get_ship_trajectory | (project adapter) | Read vessel trajectory data. |
-| get_ship_call_ports | (project adapter) | Read vessel port calls. |
-| get_ship_voyages | (project adapter) | Read vessel voyages. |
-| get_last_departure | (project adapter) | Read the last vessel departure. |
-| get_current_stop | (project adapter) | Read the current vessel stop. |
-| get_avoid_redsea_traffic | get_avoidredsea_traffic | Read red-sea avoidance traffic. |
-| search_ports | get_port | Search ports. |
-| get_port_detail | get_port | Read a port profile. |
+| ship_search | (项目适配器) | 按关键字搜索船舶。 |
+| get_ship_position | get_position | 查询船舶实时位置。 |
+| get_ship_archive | get_archive | 查询船舶档案数据。 |
+| get_psc_records | get_psc | 查询船舶 PSC 检查记录。 |
+| get_area_traffic | get_area_traffic | 查询区域船舶数量统计。 |
+| get_strait_traffic | get_strait_traffic | 查询海峡通航统计。 |
+| get_ship_trajectory | (项目适配器) | 查询历史轨迹点。 |
+| get_ship_call_ports | (项目适配器) | 查询历史挂靠记录。 |
+| get_ship_voyages | (项目适配器) | 查询历史航次。 |
+| get_last_departure | (项目适配器) | 查询最近一次离港。 |
+| get_current_stop | (项目适配器) | 查询当前停船。 |
+| get_avoid_redsea_traffic | get_avoidredsea_traffic | 查询红海绕航每日统计。 |
+| search_ports | get_port | 检索港口列表。 |
+| get_port_detail | get_port | 查询港口详情。 |
+| get_areas | get_areas | 查询所有可用区域清单。 |
+| get_psc_anomalies | get_psc_anomalies | 查询 PSC 统计异常列表。 |
+| get_psc_anomaly_summary | get_psc_anomalies | 查询 PSC 异常按严重度汇总。 |
+| get_psc_anomaly_detail | get_psc_anomalies | 查询 PSC 异常单条详情。 |
+| get_psc_stats_compare | get_psc_openclaw_stats | 查询 PSC 宏观区间对比。 |
+| get_psc_defects_top | get_psc_openclaw_stats | 查询 PSC 缺陷码 Top 排行。 |
+| get_psc_stats_mix_compare | get_psc_openclaw_stats | 查询 PSC 旗国/检查类型占比对比。 |
 
-"(project adapter)" marks HiFleet-API-backed tools that this project reviews and
-exposes directly; they are not auto-derived from a new upstream script and any
-new upstream capability remains review-required until explicitly mapped here.
+"(项目适配器)" 标记的是由本项目直接审核并暴露的 HiFleet API 工具；它们不从上游新脚本
+自动派生，任何新上游能力在被明确映射至此之前保持待审核状态。

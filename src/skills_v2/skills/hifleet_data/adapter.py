@@ -964,6 +964,137 @@ def get_port_detail(port_id: str) -> str:
 # AIS 航行状态 — API直接接收中文文本
 # 有效值：在航 失控 帆船在航 搁浅 操纵能力受限 机动船在航 系泊 锚泊 停泊 未知 未定义 正在捕鱼作业 限于吃水 高速船留用 地效翼船留用 待定义
 
+
+
+@tool
+def get_areas() -> str:
+    """查询所有可用区域清单，返回区域 ID 与名称映射。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_areas")
+    try:
+        data = _http_json("GET", "/position/areas/token", {})
+        output = _format_json_result(data, "区域清单")
+        _emit_result("get_areas", ctx, ToolResult(status="ok", code="AREAS_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"区域清单查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_areas", ctx if "ctx" in locals() else None, ToolResult(status="error", code="AREAS_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_psc_anomalies(startdate: str = "", enddate: str = "", page: str = "", limit: str = "") -> str:
+    """查询 PSC 统计异常列表，可按日期范围筛选并分页。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_psc_anomalies")
+    try:
+        params = {"startdate": startdate, "enddate": enddate, "page": page, "limit": limit}
+        data = _http_json("GET", "/pscapi/openclaw/anomalies", params, auth_scope="psc")
+        output = _format_json_result(data, "PSC异常列表")
+        _emit_result("get_psc_anomalies", ctx, ToolResult(status="ok", code="PSC_ANOMALIES_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"PSC异常列表查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_psc_anomalies", ctx if "ctx" in locals() else None, ToolResult(status="error", code="PSC_ANOMALIES_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_psc_anomaly_summary(startdate: str = "", enddate: str = "") -> str:
+    """查询 PSC 统计异常按严重度汇总。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_psc_anomaly_summary")
+    try:
+        params = {"startdate": startdate, "enddate": enddate}
+        data = _http_json("GET", "/pscapi/openclaw/anomalies/summary", params, auth_scope="psc")
+        output = _format_json_result(data, "PSC异常汇总")
+        _emit_result("get_psc_anomaly_summary", ctx, ToolResult(status="ok", code="PSC_ANOMALY_SUMMARY_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"PSC异常汇总查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_psc_anomaly_summary", ctx if "ctx" in locals() else None, ToolResult(status="error", code="PSC_ANOMALY_SUMMARY_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_psc_anomaly_detail(anomaly_id: str) -> str:
+    """查询 PSC 统计异常单条详情，anomaly_id 为数字 ID。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_psc_anomaly_detail")
+    try:
+        if not str(anomaly_id).strip().isdigit():
+            output = "请提供数字格式的异常 ID。"
+            _emit_result("get_psc_anomaly_detail", ctx, ToolResult(status="error", code="PSC_ANOMALY_DETAIL_BAD_INPUT", message=output, retriable=False, latency_ms=int((time.time() - t0) * 1000), source="validation"))
+            return output
+        aid = str(anomaly_id).strip()
+        key = _psc_api_key()
+        query_parts = []
+        if key:
+            query_parts.append(("api_key", key))
+            query_parts.append(("usertoken", key))
+        url = _api_base() + "/pscapi/openclaw/anomalies/" + aid + "?" + urllib.parse.urlencode(query_parts)
+        with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=60) as resp:
+            data = json.loads(resp.read().decode())
+        output = _format_json_result(data, "PSC异常详情")
+        _emit_result("get_psc_anomaly_detail", ctx, ToolResult(status="ok", code="PSC_ANOMALY_DETAIL_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"PSC异常详情查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_psc_anomaly_detail", ctx if "ctx" in locals() else None, ToolResult(status="error", code="PSC_ANOMALY_DETAIL_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_psc_stats_compare(startdate: str = "", enddate: str = "", compare_startdate: str = "", compare_enddate: str = "") -> str:
+    """查询 PSC 宏观区间对比，对比两个时间区间的检查统计。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_psc_stats_compare")
+    try:
+        params = {"startdate": startdate, "enddate": enddate, "compare_startdate": compare_startdate, "compare_enddate": compare_enddate}
+        data = _http_json("GET", "/pscapi/openclaw/stats/compare", params, auth_scope="psc")
+        output = _format_json_result(data, "PSC区间对比")
+        _emit_result("get_psc_stats_compare", ctx, ToolResult(status="ok", code="PSC_STATS_COMPARE_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"PSC区间对比查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_psc_stats_compare", ctx if "ctx" in locals() else None, ToolResult(status="error", code="PSC_STATS_COMPARE_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_psc_defects_top(startdate: str = "", enddate: str = "", limit: str = "") -> str:
+    """查询 PSC 缺陷码 Top 排行。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_psc_defects_top")
+    try:
+        params = {"startdate": startdate, "enddate": enddate, "limit": limit}
+        data = _http_json("GET", "/pscapi/openclaw/stats/defects/top", params, auth_scope="psc")
+        output = _format_json_result(data, "PSC缺陷Top")
+        _emit_result("get_psc_defects_top", ctx, ToolResult(status="ok", code="PSC_DEFECTS_TOP_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"PSC缺陷Top查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_psc_defects_top", ctx if "ctx" in locals() else None, ToolResult(status="error", code="PSC_DEFECTS_TOP_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
+@tool
+def get_psc_stats_mix_compare(startdate: str = "", enddate: str = "") -> str:
+    """查询 PSC 旗国/检查类型占比对比。"""
+    t0 = time.time()
+    ctx = request_context.get() or new_context(method="get_psc_stats_mix_compare")
+    try:
+        params = {"startdate": startdate, "enddate": enddate}
+        data = _http_json("GET", "/pscapi/openclaw/stats/mix/compare", params, auth_scope="psc")
+        output = _format_json_result(data, "PSC占比对比")
+        _emit_result("get_psc_stats_mix_compare", ctx, ToolResult(status="ok", code="PSC_STATS_MIX_COMPARE_OK", message=output, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+    except Exception as e:
+        output = f"PSC占比对比查询失败: {str(e)}，请稍后重试。"
+        _emit_result("get_psc_stats_mix_compare", ctx if "ctx" in locals() else None, ToolResult(status="error", code="PSC_STATS_MIX_COMPARE_ERROR", message=output, retriable=True, latency_ms=int((time.time() - t0) * 1000), source="hifleet_api"))
+        return output
+
+
 def get_hifleet_data_tools():
     """Return the read-only HiFleet data tools exposed by this V2 Skill."""
     return [
@@ -981,6 +1112,13 @@ def get_hifleet_data_tools():
         get_avoid_redsea_traffic,
         search_ports,
         get_port_detail,
+        get_areas,
+        get_psc_anomalies,
+        get_psc_anomaly_summary,
+        get_psc_anomaly_detail,
+        get_psc_stats_compare,
+        get_psc_defects_top,
+        get_psc_stats_mix_compare,
     ]
 
 
@@ -989,5 +1127,8 @@ __all__ = [
     "get_area_traffic", "get_strait_traffic", "get_ship_trajectory",
     "get_ship_call_ports", "get_ship_voyages", "get_last_departure",
     "get_current_stop", "get_avoid_redsea_traffic", "search_ports",
-    "get_port_detail", "get_hifleet_data_tools",
+    "get_port_detail", "get_areas", "get_psc_anomalies",
+    "get_psc_anomaly_summary", "get_psc_anomaly_detail",
+    "get_psc_stats_compare", "get_psc_defects_top",
+    "get_psc_stats_mix_compare", "get_hifleet_data_tools",
 ]

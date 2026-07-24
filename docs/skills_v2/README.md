@@ -23,7 +23,7 @@ Shared Skills V2 已与 legacy Skills 完成**物理路径解耦**。两套 Skil
 | --- | --- | --- |
 | `knowledge_retrieval` | `local_kb_search` | 只读本地知识库检索，输出证据 ID/来源/匹配度/摘要 |
 | `web_search` | `web_search` | 单次公开网页搜索；不含 `verify_public_page`/`agent_browser_deep_search`/`web_search_agent_browser` |
-| `hifleet_data` | 14 个只读 HiFleet 数据工具 | 锁定、受审的只读数据适配器；不含任何写入或 browser 工具 |
+| `hifleet_data` | 21 个只读 HiFleet 数据工具 | 锁定、受审的只读数据适配器；不含任何写入或 browser 工具 |
 | `ship_info_update` | `prepare_ship_update`/`commit_ship_update`/`cancel_ship_update` | 两阶段确认的船舶信息更新；底层写入工具归此 Skill，不进入 `hifleet_data` |
 
 ## customer_support 默认保持 legacy

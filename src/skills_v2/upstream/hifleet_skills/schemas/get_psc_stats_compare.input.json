@@ -1,0 +1,26 @@
+{
+  "description": "查询 PSC 宏观区间对比，对比两个时间区间的检查统计。",
+  "properties": {
+    "startdate": {
+      "default": "",
+      "title": "Startdate",
+      "type": "string"
+    },
+    "enddate": {
+      "default": "",
+      "title": "Enddate",
+      "type": "string"
+    },
+    "compare_startdate": {
+      "default": "",
+      "title": "Compare Startdate",
+      "type": "string"
+    },
+    "compare_enddate": {
+      "default": "",
+      "title": "Compare Enddate",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

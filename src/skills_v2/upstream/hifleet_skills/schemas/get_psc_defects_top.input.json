@@ -1,0 +1,21 @@
+{
+  "description": "查询 PSC 缺陷码 Top 排行。",
+  "properties": {
+    "startdate": {
+      "default": "",
+      "title": "Startdate",
+      "type": "string"
+    },
+    "enddate": {
+      "default": "",
+      "title": "Enddate",
+      "type": "string"
+    },
+    "limit": {
+      "default": "",
+      "title": "Limit",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

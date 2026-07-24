@@ -4,105 +4,152 @@ skill_version: 0.3.21
 prompt_file: SKILL.md
 upstream_repository: https://github.com/charleiWang/hifleet-skills
 upstream_commit: e4acf599192f3f1d247ef2da00e78d0cff89819c
-# src/skills_v2/upstream/hifleet_skills/lock.json is the single source of truth for upstream version/commit.
-# The registry overrides skill_version/upstream_commit from this lock key at runtime.
 upstream_lock_key: hifleet-skills
 capabilities:
-  - id: ship_search
-    tool_name: ship_search
-    upstream_capability: ""
-    description: Search vessels by a user-supplied identifier.
-    read_only: true
-    risk_level: low
-    timeout_seconds: 20
-  - id: get_ship_position
-    tool_name: get_ship_position
-    upstream_capability: get_position
-    description: Read the latest vessel position.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_ship_archive
-    tool_name: get_ship_archive
-    upstream_capability: get_archive
-    description: Read vessel archive data.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_psc_records
-    tool_name: get_psc_records
-    upstream_capability: get_psc
-    description: Read vessel PSC records.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_area_traffic
-    tool_name: get_area_traffic
-    upstream_capability: get_area_traffic
-    description: Read area traffic statistics.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_strait_traffic
-    tool_name: get_strait_traffic
-    upstream_capability: get_strait_traffic
-    description: Read strait traffic statistics.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_ship_trajectory
-    tool_name: get_ship_trajectory
-    upstream_capability: ""
-    description: Read vessel trajectory data.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 30
-  - id: get_ship_call_ports
-    tool_name: get_ship_call_ports
-    upstream_capability: ""
-    description: Read vessel port calls.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_ship_voyages
-    tool_name: get_ship_voyages
-    upstream_capability: ""
-    description: Read vessel voyages.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_last_departure
-    tool_name: get_last_departure
-    upstream_capability: ""
-    description: Read the last vessel departure.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_current_stop
-    tool_name: get_current_stop
-    upstream_capability: ""
-    description: Read the current vessel stop.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: get_avoid_redsea_traffic
-    tool_name: get_avoid_redsea_traffic
-    upstream_capability: get_avoidredsea_traffic
-    description: Read red-sea avoidance traffic.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
-  - id: search_ports
-    tool_name: search_ports
-    upstream_capability: get_port
-    description: Search ports.
-    read_only: true
-    risk_level: low
-    timeout_seconds: 20
-  - id: get_port_detail
-    tool_name: get_port_detail
-    upstream_capability: get_port
-    description: Read a port profile.
-    read_only: true
-    risk_level: medium
-    timeout_seconds: 20
+- id: ship_search
+  tool_name: ship_search
+  upstream_capability: ''
+  description: Search vessels by a user-supplied identifier.
+  read_only: true
+  risk_level: low
+  timeout_seconds: 20
+- id: get_ship_position
+  tool_name: get_ship_position
+  upstream_capability: get_position
+  description: Read the latest vessel position.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_ship_archive
+  tool_name: get_ship_archive
+  upstream_capability: get_archive
+  description: Read vessel archive data.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_psc_records
+  tool_name: get_psc_records
+  upstream_capability: get_psc
+  description: Read vessel PSC records.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_area_traffic
+  tool_name: get_area_traffic
+  upstream_capability: get_area_traffic
+  description: Read area traffic statistics.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_strait_traffic
+  tool_name: get_strait_traffic
+  upstream_capability: get_strait_traffic
+  description: Read strait traffic statistics.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_ship_trajectory
+  tool_name: get_ship_trajectory
+  upstream_capability: ''
+  description: Read vessel trajectory data.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 30
+- id: get_ship_call_ports
+  tool_name: get_ship_call_ports
+  upstream_capability: ''
+  description: Read vessel port calls.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_ship_voyages
+  tool_name: get_ship_voyages
+  upstream_capability: ''
+  description: Read vessel voyages.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_last_departure
+  tool_name: get_last_departure
+  upstream_capability: ''
+  description: Read the last vessel departure.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_current_stop
+  tool_name: get_current_stop
+  upstream_capability: ''
+  description: Read the current vessel stop.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_avoid_redsea_traffic
+  tool_name: get_avoid_redsea_traffic
+  upstream_capability: get_avoidredsea_traffic
+  description: Read red-sea avoidance traffic.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: search_ports
+  tool_name: search_ports
+  upstream_capability: get_port
+  description: Search ports.
+  read_only: true
+  risk_level: low
+  timeout_seconds: 20
+- id: get_port_detail
+  tool_name: get_port_detail
+  upstream_capability: get_port
+  description: Read a port profile.
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_areas
+  tool_name: get_areas
+  upstream_capability: get_areas
+  description: 查询所有可用区域清单，返回区域 ID 与名称映射。
+  read_only: true
+  risk_level: low
+  timeout_seconds: 20
+- id: get_psc_anomalies
+  tool_name: get_psc_anomalies
+  upstream_capability: get_psc_anomalies
+  description: 查询 PSC 统计异常列表，可按日期范围筛选并分页。
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_psc_anomaly_summary
+  tool_name: get_psc_anomaly_summary
+  upstream_capability: get_psc_anomalies
+  description: 查询 PSC 统计异常按严重度汇总。
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_psc_anomaly_detail
+  tool_name: get_psc_anomaly_detail
+  upstream_capability: get_psc_anomalies
+  description: 查询 PSC 统计异常单条详情。
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_psc_stats_compare
+  tool_name: get_psc_stats_compare
+  upstream_capability: get_psc_openclaw_stats
+  description: 查询 PSC 宏观区间对比。
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_psc_defects_top
+  tool_name: get_psc_defects_top
+  upstream_capability: get_psc_openclaw_stats
+  description: 查询 PSC 缺陷码 Top 排行。
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20
+- id: get_psc_stats_mix_compare
+  tool_name: get_psc_stats_mix_compare
+  upstream_capability: get_psc_openclaw_stats
+  description: 查询 PSC 旗国/检查类型占比对比。
+  read_only: true
+  risk_level: medium
+  timeout_seconds: 20

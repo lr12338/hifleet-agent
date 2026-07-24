@@ -1,8 +1,6 @@
-# Ship Information Update V2
+# 船舶信息更新 V2
 
-Only use the transaction tools `prepare_ship_update`, `commit_ship_update`, and
-`cancel_ship_update`. Never expose or invoke low-level write APIs. Prepare a
-normalized draft, show the user its fields and validation errors, and commit only
-after an explicit confirmation in the same session. Say “更新成功” only when the
-write adapter returns the exact `success` state; accepted, pending, dry-run, unknown,
-and failed states must be described conservatively.
+仅使用事务工具 `prepare_ship_update`、`commit_ship_update` 和 `cancel_ship_update`。
+不得暴露或调用底层写入 API。先准备规范化草稿，向用户展示字段与校验错误，仅在
+同会话内获得明确确认后才提交。只有当写入适配器返回确切的 `success` 状态时才能说
+"更新成功"；accepted、pending、dry-run、unknown 和 failed 状态必须保守描述。

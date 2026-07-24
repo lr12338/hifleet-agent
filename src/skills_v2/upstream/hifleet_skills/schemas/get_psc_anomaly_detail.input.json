@@ -1,0 +1,13 @@
+{
+  "description": "查询 PSC 统计异常单条详情，anomaly_id 为数字 ID。",
+  "properties": {
+    "anomaly_id": {
+      "title": "Anomaly Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "anomaly_id"
+  ],
+  "type": "object"
+}

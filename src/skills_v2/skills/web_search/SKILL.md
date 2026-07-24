@@ -1,12 +1,9 @@
-# Web Search V2
+# 网页搜索 V2
 
-Use `web_search` only to perform a single, bounded public web search for candidate
-evidence. This Skill exposes exactly one tool: `web_search`. It must never open,
-click, navigate or otherwise operate a web page, and it must never include
-`verify_public_page`, `agent_browser_deep_search` or `web_search_agent_browser`.
+仅使用 `web_search` 执行一次有界的公开网页搜索以获取候选证据。本 Skill 只暴露一个工具：
+`web_search`。它不得打开、点击、导航或以任何方式操作网页，也不得包含
+`verify_public_page`、`agent_browser_deep_search` 或 `web_search_agent_browser`。
 
-Every result must preserve its URL, title, snippet and source type. Weakly
-related, conflicting or non-official sources are low-strength evidence only and
-must not override authoritative HiFleet data or be presented as confirmed product
-conclusions. Respect the per-turn call-count, timeout and duplicate-query budget;
-narrow or rewrite the query instead of repeating an identical request.
+每条结果必须保留 URL、标题、摘要和来源类型。弱相关、冲突或非官方来源仅作为低强度证据，
+不得覆盖权威 HiFleet 数据，也不得作为确定的产品结论呈现。需遵守单轮调用次数、超时和
+重复查询预算；通过收窄或改写查询来避免重复相同请求。

@@ -79,7 +79,7 @@ def test_customer_support_shadow_injects_v2_prompt_into_no_tool_model() -> None:
     assert comparison["status"] == "completed_prompt_shadow"
     assert comparison["executed_tools"] == []
     assert isinstance(shadow_model.messages[0], SystemMessage)
-    assert "HiFleet Data V2" in shadow_model.messages[0].content
+    assert "HiFleet 数据 V2" in shadow_model.messages[0].content
     assert isinstance(shadow_model.messages[1], HumanMessage)
     inference = comparison["shadow_inference"]
     assert inference["prompt_injected"] is True

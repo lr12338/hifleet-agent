@@ -1,0 +1,16 @@
+{
+  "description": "查询 PSC 旗国/检查类型占比对比。",
+  "properties": {
+    "startdate": {
+      "default": "",
+      "title": "Startdate",
+      "type": "string"
+    },
+    "enddate": {
+      "default": "",
+      "title": "Enddate",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

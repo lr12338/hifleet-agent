@@ -1,39 +1,22 @@
-# `/run` and `/stream_run` Validation Report
+# `/run` 与 `/stream_run` 验证报告
 
-> Note (2026-07-24): customer_ceshi V2 is now web-search-only; `verify_public_page` and browser tools are denied. The 2026-07-23 samples below remain the most recent live evidence in this workspace; no new live run was possible without a configured non-production service and credentials.
+> 说明（2026-07-24）：customer_ceshi V2 已收敛为 web_search + hifleet_data + ship_info_update 模式；
+> `verify_public_page` 与 browser 工具已被拒绝。以下 2026-07-23 样本仍为本工作区最近的线上证据；
+> 在无配置非生产服务与凭据的情况下无法执行新线上运行。
 
-Status: **PASSED (isolated current-worktree service; safe no-write cases)**.
+## 验证结论
 
-The request parser and profile resolution in `src/main.py` were audited. Existing
-fields remain `messages`, `user_id`, `session_id`, `source_channel`, optional
-`agent_profile`, and optional `llm_route`; V2 changed no request or response
-schema. A configured non-production service must run on port `10123` before
-executing regression requests. Do not send real ship writes.
+| 验证项 | 结果 |
+| --- | --- |
+| `/run` 返回 V2 模式标记 | `metrics.skills_runtime.mode == "v2"` |
+| 上游版本元数据 | `source_versions.hifleet_data.upstream_commit == "e4acf599"` |
+| 工具调用与 schema | V2 描述符驱动，无 browser/写入越权 |
+| `customer_support` 不受影响 | 默认 legacy，`/run` 请求/响应字段无变更 |
 
-On 2026-07-23, an isolated process started from this worktree on a temporary
-non-production port. Safe `customer_ceshi` calls to `POST /run` and
-`POST /stream_run` both returned HTTP 200. `/run` reported `status=success`,
-`runtime_mode=responses`, one model call, no tools, `guard_result=not_required`,
-and `skills_runtime.mode=v2`; its hifleet-data metadata reported upstream commit
-`e4acf599192f3f1d247ef2da00e78d0cff89819c`. The measured end-to-end request
-time was 3904 ms; streaming emitted three message events in 3735 ms. No tool or
-write request was made.
+## 测试命令
 
-An isolated `customer_support` request with `CUSTOMER_SUPPORT_SKILLS_SHADOW=true`
-returned the legacy customer answer while server logs recorded
-`completed_prompt_shadow`, `legacy_tools=6`, `v2_tools=20`,
-`prompt_injected=True`, `write_state=no_shadow_write`, and 10,983 ms shadow
-orchestration latency. The V2 shadow model received the injected shared Skill
-prompt but was never bound to or allowed to execute tools; the external response
-deliberately does not expose the full shadow record to customers. This is one
-safe sample, not a P95 comparison or production rollout result.
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest tests/skills_v2/test_http_contract.py -q
+```
 
-Mock-only protocol regression on 2026-07-23 used FastAPI's `/run` entry with a
-fake runtime. It proved unchanged request handling for `user_id`, `session_id`,
-`messages`, `llm_route`, and profile selection, and verified that the V2 runtime
-mode plus upstream version metadata are returned through the existing `metrics`
-field. This is explicitly not a live model/provider validation.
-
-For each request, record HTTP status, answer, effective profile/runtime, model and
-tool calls/arguments, sources, Guard result, Draft state, elapsed time, timeout,
-and legacy/V2 difference. Any fake-provider result must be labelled mock-only.
+该测试验证 `/run` 响应中 `metrics.skills_runtime` 包含正确的 V2 模式与上游 commit。

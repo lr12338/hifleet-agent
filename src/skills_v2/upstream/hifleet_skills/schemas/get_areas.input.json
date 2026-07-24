@@ -1,0 +1,5 @@
+{
+  "description": "查询所有可用区域清单，返回区域 ID 与名称映射。",
+  "properties": {},
+  "type": "object"
+}

@@ -1,46 +1,36 @@
-# Dual-Chain Migration, Shadowing, and Rollback
+# 双链路迁移、影子与回滚
 
-## Current state
+## 当前状态
 
-- `customer_support` remains `legacy` by default.
-- `customer_ceshi` uses V2 when manifest loading succeeds; on V2 load failure it
-  logs the exception class and uses a `safe_constrained` runtime. That fallback
-  still denies direct writes, knowledge administration, and both autonomous
-  browser-search tools and `verify_public_page`; only `web_search` remains for
-  public-web evidence.
-- The customer_support adapter is shadow-only. Set
-  `CUSTOMER_SUPPORT_SKILLS_SHADOW=true` to record a V2 comparison while the legacy
-  graph continues producing the customer-visible answer. When the existing text
-  model is available, the shadow receives the shared V2 Skill prompt and produces
-  one no-tool JSON assessment; otherwise it records the contract-only fallback.
-  A shadow write is always dry-run-only and never invokes a duplicate low-level
-  write.
+| 链路 | 默认模式 | 说明 |
+| --- | --- | --- |
+| `customer_support` | legacy | 主链保持 legacy 回复；V2 仅做可选无工具影子评估 |
+| `customer_ceshi` | v2 | 加载 V2 工具与 Prompt；失败进入 safe_constrained 降级 |
 
-## Shadow comparison
+## 模式切换
 
-For the same customer_support request, retain the legacy user response and record
-the V2 scenario, allowed tools, legacy-only tools, evidence count, high-risk
-success claim indicator, reply length, source versions, write state, tool count,
-and orchestration latency. A prompt-backed record additionally includes the V2
-scenario, filtered recommended tools, parameter/evidence requirements, confidence,
-and proposed-reply risk indicators. It never binds or executes tools; parameters
-and evidence are not replayed, so a shadow run cannot duplicate reads or writes.
-Promotion remains internal account → 5% → 20% → 50% → 100%. This repository does
-not claim a production rollout.
+```bash
+# customer_ceshi 切换为配置级回退（仍走 V2 safe_constrained，不加载 legacy）
+CUSTOMER_CESHI_SKILLS_MODE=legacy
 
-## Rollback
+# customer_support 开启 V2 影子评估（不改回复，仅注入 Prompt 做无工具比对）
+CUSTOMER_SUPPORT_SKILLS_SHADOW=true
+```
 
-Set `CUSTOMER_CESHI_SKILLS_MODE=legacy` (or the `skill_runtime` mode in
-`config/agent_profiles.json`) and restart through the normal deployment procedure.
-For customer_support retain or set `CUSTOMER_SUPPORT_SKILLS_MODE=legacy`. Backup
-tag `skills-baseline-20260723` and branch `backup/skills-v1-20260723` point to
-the original main commit. No API client contract change is required.
+## V2 加载失败降级
 
-## Ship-update confirmation
+当 V2 registry/manifest/lock 无法安全加载时，记录异常类并使用 `safe_constrained` 运行时。
+该 fallback 无工具、注入保守 Prompt、不加载 legacy Skills。运行时元数据 `mode = safe_constrained`。
 
-The model can prepare, commit, or cancel only a session-bound Draft. Invalid
-fields remain in `invalid_fields`; they cannot be silently dropped. Position
-updates require a nine-digit MMSI, longitude, latitude, and explicit
-`yyyy-MM-dd HH:mm:ss` timestamp. Static updates require MMSI plus one update
-field. A `ship_type`/`minotype` conflict blocks commit. Only `success` may be
-described as “更新成功”.
+## 影子评估
+
+`customer_support` 的 V2 影子评估通过 `compare_legacy_trace_with_v2()` 构建：
+- 注入 V2 Skill Prompt 到无工具模型
+- 不执行任何工具、不重放写入
+- 仅产出契约级比对记录（工具选择差异、证据数量、写入状态）
+
+## 回滚
+
+详见 [ROLLBACK.md](ROLLBACK.md)。两种场景：
+- V2 loader 失败：自动进入 safe_constrained
+- 上游版本回退：`sync_hifleet_skills.py rollback`

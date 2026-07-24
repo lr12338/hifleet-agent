@@ -1,18 +1,19 @@
-# Legacy / V2 Tool Mapping
+# Legacy / V2 工具映射
 
-| Legacy source | V2 contract | V2 availability |
+| Legacy 来源 | V2 契约 | V2 可用性 |
 | --- | --- | --- |
-| `knowledge_qa.local_kb_search` | `knowledge_retrieval.local_kb_search` | External profiles |
-| `knowledge_qa.web_search` | base `web_search` | External profiles; one entry only |
-| `knowledge_qa.web_search_agent_browser` | none | Removed |
-| `browser_verify.verify_public_page` | none | Removed from customer_ceshi V2 (legacy customer_support keeps it) |
-| `browser_verify.agent_browser_deep_search` | none | Removed |
-| Read-only `hifleet_ship_service` tools | `hifleet_data` descriptors | External profiles after local manifest validation |
-| `upload_ship_position` | internal adapter behind `commit_ship_update` | Never model-visible |
-| `update_ship_static_info` | internal adapter behind `commit_ship_update` | Never model-visible |
-| `knowledge_admin.upsert_local_kb_entry` | none | Never in external V2 profiles |
-| customer_ceshi Draft tools | `ship_info_update` manifest descriptors | External profiles, confirmation-gated |
+| `skills.knowledge_qa.tools.local_kb_search` | `skills_v2.skills.knowledge_retrieval.adapter.local_kb_search` | 可用 |
+| `skills.knowledge_qa.tools.web_search` | `skills_v2.skills.web_search.adapter.web_search` | 可用 |
+| `skills.knowledge_qa.tools.web_search_agent_browser` | (拒绝) | 不可用 |
+| `skills.browser_verify.tools.verify_public_page` | (拒绝) | 不可用 |
+| `skills.browser_verify.tools.agent_browser_deep_search` | (拒绝) | 不可用 |
+| `skills.hifleet_ship_service.tools.ship_search` | `skills_v2.skills.hifleet_data.adapter.ship_search` | 可用 |
+| `skills.hifleet_ship_service.tools.get_ship_position` | `skills_v2.skills.hifleet_data.adapter.get_ship_position` | 可用 |
+| `skills.hifleet_ship_service.tools.get_ship_archive` | `skills_v2.skills.hifleet_data.adapter.get_ship_archive` | 可用 |
+| `skills.hifleet_ship_service.tools.get_psc_records` | `skills_v2.skills.hifleet_data.adapter.get_psc_records` | 可用 |
+| `skills.hifleet_ship_service.tools.get_area_traffic` | `skills_v2.skills.hifleet_data.adapter.get_area_traffic` | 可用 |
+| `skills.hifleet_ship_service.tools.get_strait_traffic` | `skills_v2.skills.hifleet_data.adapter.get_strait_traffic` | 可用 |
+| `skills.hifleet_ship_service.tools.upload_ship_position` | `skills_v2.skills.ship_info_update.adapter.upload_ship_position` | 仅 ship_info_update 内部，模型不可直接调用 |
+| `skills.hifleet_ship_service.tools.update_ship_static_info` | `skills_v2.skills.ship_info_update.adapter.update_ship_static_info` | 仅 ship_info_update 内部，模型不可直接调用 |
 
-Legacy names and schemas remain unchanged for `customer_support=legacy`. V2 schema
-changes are represented by the descriptor contracts and transaction manifests,
-rather than silently renaming a legacy endpoint.
+> V2 新增 7 个工具（get_areas + PSC openclaw 6 个）无 legacy 对应，为 V2 独有扩展。

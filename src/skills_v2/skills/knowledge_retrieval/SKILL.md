@@ -1,6 +1,5 @@
-# Knowledge Retrieval V2
+# 知识库检索 V2
 
-Use `local_kb_search` only to retrieve HiFleet internal evidence. Preserve returned
-document source and version when using it. An empty or weak result is not evidence
-for a product capability, plan, permission, upload format, or user-interface claim.
-Do not perform knowledge-base administration in an external customer conversation.
+仅使用 `local_kb_search` 检索 HiFleet 内部知识库证据。使用时保留返回的文档来源与版本。
+空结果或弱匹配结果不构成对产品能力、套餐、权限、上传格式或界面操作的主张证据。
+在外部客户对话中不执行知识库管理操作。

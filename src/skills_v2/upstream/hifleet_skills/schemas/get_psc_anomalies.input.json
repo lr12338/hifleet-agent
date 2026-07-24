@@ -1,0 +1,26 @@
+{
+  "description": "查询 PSC 统计异常列表，可按日期范围筛选并分页。",
+  "properties": {
+    "startdate": {
+      "default": "",
+      "title": "Startdate",
+      "type": "string"
+    },
+    "enddate": {
+      "default": "",
+      "title": "Enddate",
+      "type": "string"
+    },
+    "page": {
+      "default": "",
+      "title": "Page",
+      "type": "string"
+    },
+    "limit": {
+      "default": "",
+      "title": "Limit",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

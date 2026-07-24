@@ -1,63 +1,57 @@
-# Shared Skills V2 Capability Mapping
+# Shared Skills V2 能力映射
 
-customer_ceshi V2 exposes only the tools below. Browser/page-verification
-capabilities (`verify_public_page`, `agent_browser_deep_search`,
-`web_search_agent_browser`) are denied and not described to the model.
-`customer_support` legacy retains its own browser capability unchanged.
+customer_ceshi V2 仅暴露以下工具。Browser/页面验证/深度搜索/知识库管理/底层写入均被拒绝。
 
-## Foundation (non-business) tools
+## knowledge_retrieval（只读本地知识库）
 
-| Tool | V2 availability | Notes |
-| --- | --- | --- |
-| `web_search` | exposed | One public-web evidence entry; weak/conflicting results answered conservatively. |
-| `inspect_media` | exposed | DeepSeek-led media perception; never a business tool loop. |
-| `verify_public_page` | denied | Removed from customer_ceshi V2. |
-| `agent_browser_deep_search` | denied | Removed. |
-| `web_search_agent_browser` | denied | Removed. |
-
-## Business Skills
-
-| Skill | Tools | Confirmation | Source of truth |
+| 工具 | 上游能力 | 风险 | 说明 |
 | --- | --- | --- | --- |
-| `knowledge_retrieval` | `local_kb_search` | read-only | local manifest |
-| `hifleet_data` | 14 read-only adapter tools | read-only | `src/skills_v2/upstream/hifleet_skills/lock.json` (hifleet-skills) |
-| `ship_info_update` | `prepare_ship_update`, `commit_ship_update`, `cancel_ship_update` | all require confirmation | local manifest + shared validators |
+| `local_kb_search` | (项目) | medium | 检索本地知识库，返回证据 ID/来源/匹配度/摘要 |
 
-## hifleet_data adapter -> upstream capability mapping
+## web_search（单次公开网页搜索）
 
-Approved upstream read-only capabilities (13): `get_archive`, `get_area_traffic`,
-`get_areas`, `get_avoidredsea_traffic`, `get_casualty`, `get_maritime_penalty`,
-`get_port`, `get_position`, `get_psc`, `get_psc_anomalies`,
-`get_psc_openclaw_stats`, `get_sanction`, `get_strait_traffic`.
-Review-required (never exposed): `charter_contact_dedup`,
-`charter_enrich_helpers`, `open_console`.
+| 工具 | 上游能力 | 风险 | 说明 |
+| --- | --- | --- | --- |
+| `web_search` | (项目) | low | 单次网页搜索，保留 URL/标题/摘要/来源类型 |
 
-| adapter tool | upstream capability | kind |
+## hifleet_data（只读 HiFleet 数据，21 个工具）
+
+| 工具 | 上游能力 | 风险 | 说明 |
+| --- | --- | --- | --- |
+| `ship_search` | (项目) | low | 按关键字搜索船舶 |
+| `get_ship_position` | get_position | medium | 查询船舶实时位置 |
+| `get_ship_archive` | get_archive | medium | 查询船舶档案 |
+| `get_psc_records` | get_psc | medium | 查询 PSC 检查记录 |
+| `get_area_traffic` | get_area_traffic | medium | 查询区域船舶数量 |
+| `get_strait_traffic` | get_strait_traffic | medium | 查询海峡通航统计 |
+| `get_ship_trajectory` | (项目) | medium | 查询历史轨迹点 |
+| `get_ship_call_ports` | (项目) | medium | 查询历史挂靠记录 |
+| `get_ship_voyages` | (项目) | medium | 查询历史航次 |
+| `get_last_departure` | (项目) | medium | 查询最近一次离港 |
+| `get_current_stop` | (项目) | medium | 查询当前停船 |
+| `get_avoid_redsea_traffic` | get_avoidredsea_traffic | medium | 查询红海绕航每日统计 |
+| `search_ports` | get_port | low | 检索港口列表 |
+| `get_port_detail` | get_port | medium | 查询港口详情 |
+| `get_areas` | get_areas | low | 查询所有可用区域清单 |
+| `get_psc_anomalies` | get_psc_anomalies | medium | 查询 PSC 统计异常列表 |
+| `get_psc_anomaly_summary` | get_psc_anomalies | medium | 查询 PSC 异常按严重度汇总 |
+| `get_psc_anomaly_detail` | get_psc_anomalies | medium | 查询 PSC 异常单条详情 |
+| `get_psc_stats_compare` | get_psc_openclaw_stats | medium | 查询 PSC 宏观区间对比 |
+| `get_psc_defects_top` | get_psc_openclaw_stats | medium | 查询 PSC 缺陷码 Top 排行 |
+| `get_psc_stats_mix_compare` | get_psc_openclaw_stats | medium | 查询 PSC 旗国/检查类型占比对比 |
+
+## ship_info_update（两阶段确认写入）
+
+| 工具 | 风险 | 需确认 | 说明 |
+| --- | --- | --- | --- |
+| `prepare_ship_update` | high | 是 | 生成并校验更新草稿 |
+| `commit_ship_update` | high | 是 | 同会话确认后提交 |
+| `cancel_ship_update` | medium | 是 | 取消当前草稿 |
+
+## 拒绝暴露的上游能力
+
+| 上游能力 | 状态 | 原因 |
 | --- | --- | --- |
-| `ship_search` | - | project adapter |
-| `get_ship_position` | `get_position` | upstream-approved |
-| `get_ship_archive` | `get_archive` | upstream-approved |
-| `get_psc_records` | `get_psc` | upstream-approved |
-| `get_area_traffic` | `get_area_traffic` | upstream-approved |
-| `get_strait_traffic` | `get_strait_traffic` | upstream-approved |
-| `get_ship_trajectory` | - | project adapter |
-| `get_ship_call_ports` | - | project adapter |
-| `get_ship_voyages` | - | project adapter |
-| `get_last_departure` | - | project adapter |
-| `get_current_stop` | - | project adapter |
-| `get_avoid_redsea_traffic` | `get_avoidredsea_traffic` | upstream-approved |
-| `search_ports` | `get_port` | upstream-approved |
-| `get_port_detail` | `get_port` | upstream-approved |
-
-"project adapter" marks HiFleet-API-backed tools this project reviews and exposes
-directly; they are not auto-derived from upstream scripts. A new upstream
-capability stays review-required until explicitly mapped here and in
-`src/skills_v2/skills/hifleet_data/manifest.yaml`.
-
-## Denied for external V2 profiles
-
-`upload_ship_position`, `update_ship_static_info` (internal behind
-`commit_ship_update`), `upsert_local_kb_entry`, `verify_public_page`,
-`agent_browser_deep_search`, `web_search_agent_browser`,
-`download_public_file_to_artifact`, `run_sandboxed_python`,
-`upload_customer_artifact`.
+| `open_console` | review_required | 控制台换票，高风险 |
+| `charter_contact_dedup` | review_required | 联系人去重，写入类 |
+| `charter_enrich_helpers` | review_required | 租船信息增强，写入类 |

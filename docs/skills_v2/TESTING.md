@@ -1,89 +1,44 @@
-# Shared Skills V2 Test and Validation Record
+# Shared Skills V2 测试与验证记录
 
-`tests/skills_v2/` covers manifests, duplicate names, mode defaults and rollback,
-adapter contract equivalence, forbidden external tools (including
-`verify_public_page`), update validators, result version metadata, the
-lock-anchored `source_versions`, the sync closed loop, mocked `/run` protocol
-compatibility, and the customer_support opt-in dry-run shadow record.
+`tests/skills_v2/` 覆盖 manifest、工具去重、模式默认值、回滚、边界独立性、能力契约与上游同步。
 
-```bash
-PYTHONPATH=src .venv/bin/python -m pytest -q tests/skills_v2
-```
+## 测试套件
 
-`tests/customer_ceshi/` and `tests/customer_ceshi_v2/` cover the scenario
-contracts, Claim Guard (negation/conflict/weak-relevance), ship-update Drafts and
-confirmation, trajectory reverse/single-side/boundary handling, placeholder
-rejection, and the native Responses/Chat runtime loop.
+| 测试文件 | 覆盖内容 |
+| --- | --- |
+| `test_shared_registry.py` | 模式默认值、影子评估、共享契约、能力暴露限制、manifest 校验、写入校验器 |
+| `test_customer_ceshi_v2_registry.py` | V2 bundle 构建、加载失败降级、lock 锚定版本、web_search 独立 Skill |
+| `test_boundaries.py` | AST 边界扫描、customer_ceshi 只用 V2、customer_support 不用 V2、safe fallback、上游 apply 失败保护 |
+| `test_hifleet_sync.py` | 候选审计、lock 更新、manifest 同步、SKILL.md 重生成、未审核能力保护 |
+| `test_hifleet_data_capabilities.py` | 每个 approved 能力有 adapter 工具 + schema + 契约测试；review_required 不暴露 |
+| `test_http_contract.py` | `/run` 响应含 V2 模式与上游 commit |
+| `test_customer_support_shadow_graph.py` | 影子评估图构建与 trace 字段 |
+| `test_public_regression_runner.py` | 公共语义回归用例校验与评估逻辑 |
 
-The `/run` and `/stream_run` implementation in `src/main.py` was not changed.
-HTTP verification requires a separately configured non-production service and
-model credentials; this task does not restart a service or send real ship
-writes. See `HTTP_VALIDATION.md` for the accurate current status.
-
-## Current counts (HEAD of `codex/shared-skills-v2`)
+## 运行命令
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m pytest -q tests/skills_v2 tests/customer_ceshi tests/customer_ceshi_v2
+# V2 核心测试
+PYTHONPATH=src .venv/bin/python -m pytest tests/skills_v2 -q
+
+# customer_ceshi 链路回归
+PYTHONPATH=src .venv/bin/python -m pytest tests/customer_ceshi -q
+PYTHONPATH=src .venv/bin/python -m pytest tests/customer_ceshi_v2 -q
+
+# customer_support 只读保护回归
+PYTHONPATH=src .venv/bin/python -m pytest tests/skills_v2/test_shared_registry.py tests/skills_v2/test_customer_support_shadow_graph.py tests/skills_v2/test_boundaries.py -q
+
+# 上游一致性自检
+PYTHONPATH=src .venv/bin/python scripts/skills_v2/sync_hifleet_skills.py verify
 ```
 
-| Suite | passed | skipped | xfailed | failed |
+## 当前基线（2026-07-24）
+
+| 套件 | passed | skipped | xfailed | failed |
 | --- | --- | --- | --- | --- |
-| `tests/skills_v2` | 35 | 0 | 0 | 0 |
+| `tests/skills_v2` | 70 | 0 | 0 | 0 |
 | `tests/customer_ceshi` | 54 | 0 | 0 | 0 |
 | `tests/customer_ceshi_v2` | 106 | 1 | 7 | 0 |
-| **combined** | **195** | **1** | **7** | **0** |
 
-The 7 `xfailed` items are obsolete Doubao-led media assertions (media is now
-DeepSeek-led through `inspect_media`); they carry specific reasons and are not
-masks for real failures. See `XFAIL_AUDIT.md`.
-
-## Public regression runner statuses
-
-`scripts/skills_v2/run_shared_skills_v2_regression.py` no longer reports only
-`passed`/`failed`/`blocked`. Each case gets one of:
-
-- `fixture_prepared` - a valid fixture exists but no serving URL was supplied;
-- `invalid_fixture` - `fixture_quality: invalid`;
-- `mock_only` - exercised against a mock, not real `/run`;
-- `real_http_passed` - real `/run` succeeded with policy/budgets satisfied but
-  no image-semantic verification (text case, or no structured assertions);
-- `semantic_passed` - a real image travelled through `/run`/`/stream_run` into
-  the model **and** the structured semantic assertions
-  (`required_observations`, `required_uncertainty`, `forbidden_certainty`,
-  `required_layer_distinctions`) were satisfied;
-- `failed` - HTTP failure or a policy/semantic assertion failed;
-- `blocked` - `contract_only` cases or a required attachment that is unavailable.
-
-HTTP 200, an `inspect_media` call, or the absence of a fixed forbidden string
-never count as `semantic_passed` on their own. `semantic_score` is required and
-non-empty for every case; it is the human criterion encoded by the structured
-assertions.
-
-```bash
-PYTHONPATH=src .venv/bin/python scripts/skills_v2/run_shared_skills_v2_regression.py \
-  --base-url http://127.0.0.1:18128 \
-  --attachment-base-url http://127.0.0.1:18080/fixtures \
-  --report reports/shared_skills_v2/public-regression.json
-```
-
-M03/M05 carry `fixture_quality: valid` (the real HiFleet chart fixture); without
-a serving URL they report `fixture_prepared`, not a pass. M01 is
-`reference_only`. The controlled-evidence cases E09-E12 are `contract_only` and
-remain `blocked` until their deterministic fixture service is supplied; they are
-never counted as live semantic passes.
-
-## Live results available in this workspace
-
-No live model latency baseline or full attachment corpus is available in this
-workspace. The 2026-07-23 isolated M02/M04/M05 probe (3 passed subset) and the
-isolated `/run`/`/stream_run` HTTP samples in `HTTP_VALIDATION.md` remain the
-most recent live evidence; they are not a 5/5 or corpus-wide acceptance result.
-Before customer_support promotion, run the applicable cases over both chains and
-record legacy/V2 tools, evidence, claims, Draft states, and P95 orchestration
-time.
-
-The V2-load failure regression forces manifest construction to fail and verifies
-that the resulting `safe_constrained` runtime omits direct writes, knowledge
-administration, `verify_public_page`, `web_search_agent_browser`, and
-`agent_browser_deep_search`. This is a local deterministic fallback test, not a
-production failure simulation.
+> `tests/customer_ceshi_v2` 中 1 个 skipped 为需真实模型凭据的 smoke 测试；7 个 xfail 为已废弃的
+> Doubao 主导媒体行为（详见 [XFAIL_AUDIT.md](XFAIL_AUDIT.md)），非真实失败。

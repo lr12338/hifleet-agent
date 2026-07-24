@@ -1,22 +1,19 @@
-# xfail Audit (customer_ceshi_v2)
+# xfail 审计（customer_ceshi_v2）
 
-HEAD of `codex/shared-skills-v2`. The 7 `xfail` items in
-`tests/customer_ceshi_v2/test_responses_runtime.py` were audited individually.
-All assert **obsolete Doubao-led media behavior** that was intentionally removed
-when media orchestration moved to a DeepSeek-led loop through `inspect_media`.
-They carry specific reasons and are not masks for real failures; none could be
-turned into a pass without re-introducing the removed architecture.
+`codex/shared-skills-v2` HEAD。`tests/customer_ceshi_v2/test_responses_runtime.py` 中 7 个
+`xfail` 项已逐条审计。它们全部断言**已废弃的 Doubao 主导媒体行为**，这些行为在媒体编排改用
+DeepSeek 主导循环（通过 `inspect_media`）时被有意移除。每项都有明确原因，不是真实失败的掩码；
+除非重新引入已移除的架构，否则无法转为通过。
 
-| Test | xfail reason | Audit verdict |
+| 测试 | xfail 原因 | 审计结论 |
 | --- | --- | --- |
-| `test_single_model_router_uses_doubao_only_for_image_request` | media must remain DeepSeek-led and no longer selects a Doubao business loop | Obsolete; keep. Current design routes media perception to Doubao but keeps DeepSeek as orchestrator. |
-| `test_multimodal_responses_uses_doubao_read_only_tool_loop_and_previous_response_id` | Doubao no longer owns business tools or previous_response_id loops | Obsolete; keep. Doubao is perception-only. |
-| `test_multimodal_responses_supports_video_audio_and_mixed_content` | mixed media is orchestrated by DeepSeek through inspect_media | Obsolete; keep. |
-| `test_multimodal_responses_accepts_http_dict_messages` | HTTP media messages no longer invoke a standalone Doubao runtime | Obsolete; keep. |
-| `test_responses_stops_tools_after_answerable_search_result` | can_answer metadata cannot force model completion | Obsolete; keep. The loop deliberately no longer force-stops on `can_answer`. |
-| `test_media_ais_evidence_allows_one_follow_up_direct_position_update` | media evidence cannot bypass prepare/confirm/commit | Obsolete; keep. Writes require the Draft gate. |
-| `test_media_ais_evidence_accepts_explicit_commands_and_confirm_only_once` | direct media writes are intentionally removed | Obsolete; keep. |
+| `test_single_model_router_uses_doubao_only_for_image_request` | 媒体须保持 DeepSeek 主导，不再选择 Doubao 业务循环 | 已废弃；保留。当前设计将媒体感知路由到 Doubao 但保持 DeepSeek 为编排器。 |
+| `test_multimodal_responses_uses_doubao_read_only_tool_loop_and_previous_response_id` | Doubao 不再拥有业务工具或 previous_response_id 循环 | 已废弃；保留。Doubao 仅做感知。 |
+| `test_multimodal_responses_supports_video_audio_and_mixed_content` | 混合媒体由 DeepSeek 通过 inspect_media 编排 | 已废弃；保留。 |
+| `test_multimodal_responses_accepts_http_dict_messages` | HTTP 媒体消息不再调用独立 Doubao 运行时 | 已废弃；保留。 |
+| `test_responses_stops_tools_after_answerable_search_result` | can_answer 元数据无法强制模型完成 | 已废弃；保留。循环有意不再在 `can_answer` 上强制停止。 |
+| `test_media_ais_evidence_allows_one_follow_up_direct_position_update` | 媒体证据不能绕过 prepare/confirm/commit | 已废弃；保留。写入须经过 Draft 门禁。 |
+| `test_media_ais_evidence_accepts_explicit_commands_and_confirm_only_once` | 直接媒体写入已被有意移除 | 已废弃；保留。 |
 
-No environment-blocked failure is hidden behind these `xfail` markers. If the
-media orchestration design is revisited, these tests should be rewritten to
-assert the new behavior rather than restored verbatim.
+这些 `xfail` 标记后没有隐藏环境阻塞的失败。若媒体编排设计被重新审视，应重写这些测试以断言
+新行为，而非逐字恢复。
