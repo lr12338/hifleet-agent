@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from langchain_core.callbacks import BaseCallbackHandler
+
 from .contracts import EventPhase
 from .emitter import DebugEmitter
 from .redaction import redact_value
@@ -149,7 +151,7 @@ def finalize_support_run(emitter: DebugEmitter, cursor: SupportCursor, *, status
     return emitted
 
 
-class ToolCallCallbackHandler:
+class ToolCallCallbackHandler(BaseCallbackHandler):
     """LangChain callback handler that emits REAL tool.started/completed events.
 
     Pass it via ``config={"callbacks": [handler]}`` to ``graph.astream``. It only
