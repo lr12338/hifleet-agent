@@ -1,5 +1,6 @@
 import type { AgentErrorItem, ApiCallItem, DashboardSummary, LogStats, SessionSummaryItem, ToolInvocationItem } from "../types";
 import { getAdminApiKey } from "../auth/adminAuth";
+import { consumeSSEStream } from "./sseParser";
 
 export interface LogListResponse {
   total: number;
@@ -105,8 +106,8 @@ export async function runTest(payload: {
   payload: Record<string, unknown>;
   run_id?: string;
   stream?: boolean;
-}) {
-  return requestJson<Record<string, unknown>>("/admin/test/run", {
+}): Promise<RunTestResponse> {
+  return requestJson<RunTestResponse>("/admin/test/run", {
     method: "POST",
     body: JSON.stringify(payload)
   });
@@ -148,6 +149,18 @@ export interface StreamRunEvent {
   event: string;
   data: unknown;
   raw: string;
+  id?: string;
+}
+
+/** Response shape returned by the hardened /run admin proxy. */
+export interface RunTestResponse {
+  target_url: string;
+  status_code: number;
+  headers: Record<string, string>;
+  body: Record<string, unknown>;
+  latency_ms: number;
+  run_id: string;
+  [key: string]: unknown;
 }
 
 export interface PersistedChatDebugSession {
@@ -163,12 +176,18 @@ export interface PersistedChatDebugSession {
   updated_at: string;
 }
 
+/**
+ * Consume an SSE endpoint using the robust parser (handles \n\n and \r\n\r\n,
+ * cross-chunk splits, multi-line data, heartbeats, duplicate-id de-dupe, terminal
+ * detection and incomplete-stream marking). Translates to the legacy
+ * StreamRunEvent shape used by the UI.
+ */
 async function consumeEventStream(
   url: string,
   payload: Record<string, unknown>,
   handlers: {
     onEvent?: (event: StreamRunEvent) => void;
-    onDone?: () => void;
+    onDone?: (event?: { incompleteStream: boolean; terminalType: string | null }) => void;
   },
   signal?: AbortSignal
 ) {
@@ -186,65 +205,21 @@ async function consumeEventStream(
     throw new Error(`Request failed: ${res.status}`);
   }
 
-  const reader = res.body?.getReader();
-  if (!reader) {
-    throw new Error("Empty stream body");
-  }
-
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-
-  const emitBlock = (block: string) => {
-    if (!block.trim()) return;
-    const lines = block.split("\n");
-    let eventName = "message";
-    const dataLines: string[] = [];
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        eventName = line.slice(6).trim() || "message";
-        continue;
-      }
-      if (line.startsWith("data:")) {
-        dataLines.push(line.slice(5).trimStart());
-      }
-    }
-    if (!dataLines.length) return;
-    const raw = dataLines.join("\n");
-    let data: unknown = raw;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      data = raw;
-    }
-    handlers.onEvent?.({ event: eventName, data, raw });
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let splitIndex = buffer.indexOf("\n\n");
-    while (splitIndex >= 0) {
-      const block = buffer.slice(0, splitIndex);
-      emitBlock(block);
-      buffer = buffer.slice(splitIndex + 2);
-      splitIndex = buffer.indexOf("\n\n");
-    }
-  }
-
-  const tail = buffer.trim();
-  if (tail) {
-    emitBlock(tail);
-  }
-
-  handlers.onDone?.();
+  const result = await consumeSSEStream(
+    res,
+    {
+      onEvent: (ev) => handlers.onEvent?.({ event: ev.event, data: ev.data, raw: ev.raw, id: ev.id })
+    },
+    signal
+  );
+  handlers.onDone?.({ incompleteStream: result.incompleteStream, terminalType: result.terminalType });
 }
 
 export async function streamTestRun(
   payload: Record<string, unknown>,
   handlers: {
     onEvent?: (event: StreamRunEvent) => void;
-    onDone?: () => void;
+    onDone?: (event?: { incompleteStream: boolean; terminalType: string | null }) => void;
   },
   signal?: AbortSignal,
   runId?: string
@@ -262,6 +237,14 @@ export async function streamTestRun(
   );
 }
 
+/** Cancel an upstream run by run_id (stop button). Aborting fetch alone is not enough. */
+export async function cancelTestRun(runId: string) {
+  return requestJson<{ status_code: number; body: Record<string, unknown> }>(
+    `/admin/test/cancel/${encodeURIComponent(runId)}`,
+    { method: "POST" }
+  );
+}
+
 export async function streamArkChat(
   payload: Record<string, unknown>,
   handlers: {
@@ -270,7 +253,7 @@ export async function streamArkChat(
   },
   signal?: AbortSignal
 ) {
-  return consumeEventStream("/admin/ark/chat", payload, handlers, signal);
+  return consumeEventStream("/admin/ark/chat", payload, { onEvent: handlers.onEvent, onDone: () => handlers.onDone?.() }, signal);
 }
 
 export async function fetchChatDebugSessions(limit = 20) {
