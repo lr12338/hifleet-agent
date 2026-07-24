@@ -3615,7 +3615,7 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
     shadow_model = getattr(ctx, "customer_support_v2_shadow_model", None) if ctx is not None else None
     if shadow_model is None:
         try:
-            from skills.core.policy import customer_support_shadow_enabled
+            from skills_v2.core.policy import customer_support_shadow_enabled
 
             if customer_support_shadow_enabled(workspace_path):
                 shadow_model = _build_llm(ctx, cfg, streaming=False)
@@ -4407,10 +4407,10 @@ def _build_lightweight_customer_support_agent(ctx, cfg: dict[str, Any], workspac
             pending_used=bool(route_trace.get("pending_used") or (route_trace.get("readable_trace") or {}).get("input_summary", {}).get("pending_used")),
         )
         try:
-            from skills.core.policy import customer_support_shadow_enabled
+            from skills_v2.core.policy import customer_support_shadow_enabled
 
             if customer_support_shadow_enabled(workspace_path):
-                from skills.adapters.customer_support import compare_legacy_trace_with_v2
+                from skills_v2.adapters.customer_support_shadow import compare_legacy_trace_with_v2
 
                 shadow_record = compare_legacy_trace_with_v2(
                     route_trace=route_trace,

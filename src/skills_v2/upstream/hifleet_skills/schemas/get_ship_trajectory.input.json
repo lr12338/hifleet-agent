@@ -1,0 +1,28 @@
+{
+  "description": "查询单船历史轨迹点。\n\nArgs:\n    mmsi: 船舶MMSI编号\n    starttime: 开始时间，yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss\n    endtime: 结束时间，yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss\n    zoom: 轨迹压缩级别，默认7",
+  "properties": {
+    "mmsi": {
+      "title": "Mmsi",
+      "type": "string"
+    },
+    "starttime": {
+      "default": "",
+      "title": "Starttime",
+      "type": "string"
+    },
+    "endtime": {
+      "default": "",
+      "title": "Endtime",
+      "type": "string"
+    },
+    "zoom": {
+      "default": "7",
+      "title": "Zoom",
+      "type": "string"
+    }
+  },
+  "required": [
+    "mmsi"
+  ],
+  "type": "object"
+}

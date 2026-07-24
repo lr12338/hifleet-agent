@@ -1,0 +1,21 @@
+{
+  "description": "查询指定区域的船舶数量和列表。\n\n适用场景：用户想了解某区域当前有多少艘船。\n支持三种方式：区域名称（中文/英文自动匹配）、区域ID、坐标范围(bbox)。\n\nArgs:\n    area_name: 区域名称，如 \"红海\"、\"波斯湾\"、\"南海\"，自动匹配内置ID\n    area_id: 区域ID（与area_name/bbox三选一），如 \"1\"\n    bbox: 矩形范围 \"左经,下纬,右经,上纬\"，如 \"120,15,121,17\"\n\nReturns:\n    区域船舶数量和部分船舶列表",
+  "properties": {
+    "area_name": {
+      "default": "",
+      "title": "Area Name",
+      "type": "string"
+    },
+    "area_id": {
+      "default": "",
+      "title": "Area Id",
+      "type": "string"
+    },
+    "bbox": {
+      "default": "",
+      "title": "Bbox",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

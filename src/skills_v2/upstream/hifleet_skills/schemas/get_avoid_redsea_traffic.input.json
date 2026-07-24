@@ -1,0 +1,21 @@
+{
+  "description": "查询红海绕航每日统计。",
+  "properties": {
+    "startdate": {
+      "default": "",
+      "title": "Startdate",
+      "type": "string"
+    },
+    "enddate": {
+      "default": "",
+      "title": "Enddate",
+      "type": "string"
+    },
+    "i18n": {
+      "default": "zh",
+      "title": "I18N",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

@@ -6,11 +6,11 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
-from skills.adapters.customer_support import build_customer_support_shadow_bundle, compare_legacy_trace_with_v2
-from skills.core.manifest_loader import load_manifest
-from skills.core.policy import customer_support_shadow_enabled, resolve_skill_runtime
-from skills.ship_info_update.validators import validate_position_update, validate_static_update
+from skills_v2.adapters.customer_ceshi import build_customer_ceshi_bundle
+from skills_v2.adapters.customer_support_shadow import build_customer_support_shadow_bundle, compare_legacy_trace_with_v2
+from skills_v2.core.manifest_loader import load_manifest
+from skills_v2.core.policy import customer_support_shadow_enabled, resolve_skill_runtime
+from skills_v2.skills.ship_info_update.validators import validate_position_update, validate_static_update
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -124,7 +124,7 @@ def test_external_v2_never_exposes_low_level_writes_or_knowledge_admin() -> None
 
 
 def test_manifests_are_machine_readable_and_unique() -> None:
-    manifests = [load_manifest(ROOT / "src" / "skills" / skill / "manifest.yaml") for skill in ("knowledge_retrieval", "hifleet_data", "ship_info_update")]
+    manifests = [load_manifest(ROOT / "src" / "skills_v2" / "skills" / skill / "manifest.yaml") for skill in ("knowledge_retrieval", "web_search", "hifleet_data", "ship_info_update")]
     names = [str(item.get("tool_name") or item.get("id")) for manifest in manifests for item in manifest.capabilities]
     assert len(names) == len(set(names))
 
@@ -136,7 +136,7 @@ def test_ship_update_validators_reject_invalid_and_conflicting_data() -> None:
 
 
 def test_knowledge_retrieval_is_an_independent_read_only_skill() -> None:
-    manifest = load_manifest(ROOT / "src" / "skills" / "knowledge_retrieval" / "manifest.yaml")
+    manifest = load_manifest(ROOT / "src" / "skills_v2" / "skills" / "knowledge_retrieval" / "manifest.yaml")
     assert manifest.skill_id == "knowledge_retrieval"
     assert manifest.upstream_commit == ""
     names = [str(cap.get("tool_name") or cap.get("id")) for cap in manifest.capabilities]
@@ -145,7 +145,7 @@ def test_knowledge_retrieval_is_an_independent_read_only_skill() -> None:
 
 
 def test_ship_info_update_skills_require_confirmation_and_validators() -> None:
-    manifest = load_manifest(ROOT / "src" / "skills" / "ship_info_update" / "manifest.yaml")
+    manifest = load_manifest(ROOT / "src" / "skills_v2" / "skills" / "ship_info_update" / "manifest.yaml")
     names = [str(cap.get("id")) for cap in manifest.capabilities]
     assert names == ["prepare_ship_update", "commit_ship_update", "cancel_ship_update"]
     assert all(cap.get("requires_confirmation") is True for cap in manifest.capabilities)

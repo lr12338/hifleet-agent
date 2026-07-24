@@ -1,0 +1,13 @@
+{
+  "description": "查询单港详情，port_id 应来自 search_ports 返回项 piuid。",
+  "properties": {
+    "port_id": {
+      "title": "Port Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "port_id"
+  ],
+  "type": "object"
+}

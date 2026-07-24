@@ -1,0 +1,13 @@
+{
+  "description": "查询船舶PSC（港口国监督）检查记录和滞留情况。\n\n适用场景：用户要查看某艘船的PSC检查历史。\n需要IMO编号，若仅有MMSI或船名，需先通过ship_search或get_ship_archive获取IMO。\n\nArgs:\n    imo: 船舶IMO编号，如 \"9613886\"\n\nReturns:\n    PSC检查记录列表",
+  "properties": {
+    "imo": {
+      "title": "Imo",
+      "type": "string"
+    }
+  },
+  "required": [
+    "imo"
+  ],
+  "type": "object"
+}

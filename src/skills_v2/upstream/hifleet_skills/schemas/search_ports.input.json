@@ -1,0 +1,16 @@
+{
+  "description": "检索港口列表。详情查询需使用返回项中的 piuid 作为 port_id。",
+  "properties": {
+    "port_name": {
+      "default": "",
+      "title": "Port Name",
+      "type": "string"
+    },
+    "port_code": {
+      "default": "",
+      "title": "Port Code",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

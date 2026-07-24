@@ -1,0 +1,26 @@
+{
+  "description": "查询海峡通航统计数据，按方向和船型分类。\n\n适用场景：用户想了解某海峡的通航情况（如霍尔木兹海峡、曼德海峡等）。\n支持海峡名称自动匹配OID，需指定日期范围。\n\nArgs:\n    strait_name: 海峡名称，如 \"霍尔木兹海峡\"、\"曼德海峡\"、\"苏伊士运河\"，自动匹配OID\n    oid: 海峡OID（与strait_name二选一），如 \"24480\"\n    startdate: 开始日期(yyyy-MM-dd)，如 \"2026-05-07\"，默认今天\n    enddate: 结束日期(yyyy-MM-dd)，如 \"2026-05-07\"，默认今天\n\nReturns:\n    海峡通航统计数据",
+  "properties": {
+    "strait_name": {
+      "default": "",
+      "title": "Strait Name",
+      "type": "string"
+    },
+    "oid": {
+      "default": "",
+      "title": "Oid",
+      "type": "string"
+    },
+    "startdate": {
+      "default": "",
+      "title": "Startdate",
+      "type": "string"
+    },
+    "enddate": {
+      "default": "",
+      "title": "Enddate",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

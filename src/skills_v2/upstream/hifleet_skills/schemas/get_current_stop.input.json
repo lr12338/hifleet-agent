@@ -1,0 +1,13 @@
+{
+  "description": "查询船舶当前停船/到港位置与停船时长。",
+  "properties": {
+    "mmsi": {
+      "title": "Mmsi",
+      "type": "string"
+    }
+  },
+  "required": [
+    "mmsi"
+  ],
+  "type": "object"
+}

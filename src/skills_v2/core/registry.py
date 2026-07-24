@@ -1,0 +1,124 @@
+"""V2 registry: builds descriptors/manifests/tools/prompt from V2 skills only."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Iterable
+
+import dataclasses
+
+from .descriptors import SkillManifest, ToolDescriptor
+from .errors import ManifestValidationError, PolicyViolationError
+from .lock_store import load_skill_lock_record
+from .loader import get_tools_by_names
+from .manifest_loader import load_manifest
+from .policy import profile_allows_tool
+
+
+SHIP_UPDATE_TOOL_NAMES = frozenset({"prepare_ship_update", "commit_ship_update", "cancel_ship_update"})
+
+
+class SharedSkillRegistry:
+    def __init__(self, workspace_path: str | Path | None = None) -> None:
+        self.workspace_path = Path(workspace_path or Path(__file__).resolve().parents[3])
+        self.skills_dir = self.workspace_path / "src" / "skills_v2" / "skills"
+        self._manifests: dict[str, SkillManifest] = {}
+
+    def load_manifests(self, skill_ids: Iterable[str] = ("knowledge_retrieval", "web_search", "hifleet_data", "ship_info_update")) -> dict[str, SkillManifest]:
+        manifests: dict[str, SkillManifest] = {}
+        for skill_id in skill_ids:
+            manifest = load_manifest(self.skills_dir / skill_id / "manifest.yaml")
+            if manifest.schema_version != 1 or manifest.skill_id != skill_id:
+                raise ManifestValidationError(f"Unsupported manifest for {skill_id}")
+            manifests[skill_id] = self._apply_lock_authority(manifest)
+        self._manifests = manifests
+        return manifests
+
+    def _apply_lock_authority(self, manifest: SkillManifest) -> SkillManifest:
+        """Override upstream version/commit from the V2 lock (single source of truth).
+
+        A manifest that declares ``upstream_lock_key`` takes its upstream version and
+        commit from the reviewed V2 lock record, never from a stale hardcoded value.
+        If the lock is absent the manifest is returned unchanged so the safe fallback
+        can still operate.
+        """
+        if not manifest.upstream_lock_key:
+            return manifest
+        try:
+            record = load_skill_lock_record(self.workspace_path, manifest.upstream_lock_key)
+        except KeyError:
+            return manifest
+        return dataclasses.replace(
+            manifest,
+            skill_version=str(record.get("version") or manifest.skill_version),
+            upstream_commit=str(record.get("commit") or manifest.upstream_commit),
+        )
+
+    @staticmethod
+    def _schema_for(tool: Any) -> dict[str, Any]:
+        schema_model = getattr(tool, "args_schema", None)
+        if schema_model is None:
+            raise ManifestValidationError(f"Tool {getattr(tool, 'name', '<unknown>')} has no input schema")
+        if hasattr(schema_model, "model_json_schema"):
+            schema = schema_model.model_json_schema()
+        elif hasattr(schema_model, "schema"):
+            schema = schema_model.schema()
+        else:
+            raise ManifestValidationError(f"Tool {getattr(tool, 'name', '<unknown>')} schema is unsupported")
+        schema.pop("title", None)
+        return schema
+
+    def descriptors_for(self, skill_ids: Iterable[str], *, external_profile: bool = True) -> tuple[ToolDescriptor, ...]:
+        manifests = self.load_manifests(skill_ids)
+        requested_names = [
+            str(capability.get("tool_name") or capability.get("id"))
+            for manifest in manifests.values()
+            for capability in manifest.capabilities
+            if str(capability.get("tool_name") or capability.get("id")) not in SHIP_UPDATE_TOOL_NAMES
+        ]
+        tools_by_name = {tool.name: tool for tool in get_tools_by_names(requested_names)}
+        descriptors: list[ToolDescriptor] = []
+        seen: set[str] = set()
+        for skill_id, manifest in manifests.items():
+            for capability in manifest.capabilities:
+                name = str(capability.get("tool_name") or capability.get("id"))
+                if name in seen:
+                    raise ManifestValidationError(f"Duplicate V2 tool name: {name}")
+                seen.add(name)
+                if external_profile and not profile_allows_tool(skill_id, name):
+                    raise PolicyViolationError(f"Tool {name} is not allowed for external V2 profiles")
+                if name in SHIP_UPDATE_TOOL_NAMES:
+                    schema = dict(capability["input_schema"])
+                else:
+                    tool = tools_by_name.get(name)
+                    if tool is None:
+                        raise ManifestValidationError(f"Manifest tool {name} is not available in V2 adapters")
+                    schema = self._schema_for(tool)
+                descriptors.append(ToolDescriptor(
+                    name=name,
+                    skill_id=skill_id,
+                    description=str(capability.get("description") or ""),
+                    input_schema=schema,
+                    read_only=bool(capability.get("read_only", True)),
+                    risk_level=str(capability.get("risk_level", "low")),
+                    timeout_seconds=int(capability.get("timeout_seconds", 20)),
+                    requires_confirmation=bool(capability.get("requires_confirmation", False)),
+                    upstream_commit=manifest.upstream_commit,
+                    skill_version=manifest.skill_version,
+                    metadata={"capability_id": str(capability.get("id") or name)},
+                ))
+        return tuple(descriptors)
+
+    def tools_for(self, descriptors: Iterable[ToolDescriptor]) -> tuple[Any, ...]:
+        wanted = [descriptor.name for descriptor in descriptors if descriptor.name not in SHIP_UPDATE_TOOL_NAMES]
+        return tuple(get_tools_by_names(wanted))
+
+    def prompt_for(self, skill_ids: Iterable[str]) -> str:
+        manifests = self._manifests or self.load_manifests(skill_ids)
+        parts: list[str] = []
+        for skill_id in skill_ids:
+            manifest = manifests[skill_id]
+            prompt_path = self.skills_dir / skill_id / manifest.prompt_file
+            if not prompt_path.exists():
+                raise ManifestValidationError(f"Prompt file is missing for {skill_id}")
+            parts.append(prompt_path.read_text(encoding="utf-8").strip())
+        return "\n\n---\n\n".join(part for part in parts if part)

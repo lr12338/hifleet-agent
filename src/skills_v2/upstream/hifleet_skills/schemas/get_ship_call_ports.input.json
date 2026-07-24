@@ -1,0 +1,28 @@
+{
+  "description": "查询单船历史挂靠记录；未提供时间范围时默认查询最近一年。",
+  "properties": {
+    "mmsi": {
+      "title": "Mmsi",
+      "type": "string"
+    },
+    "starttime": {
+      "default": "",
+      "title": "Starttime",
+      "type": "string"
+    },
+    "endtime": {
+      "default": "",
+      "title": "Endtime",
+      "type": "string"
+    },
+    "accuracyval": {
+      "default": "6",
+      "title": "Accuracyval",
+      "type": "string"
+    }
+  },
+  "required": [
+    "mmsi"
+  ],
+  "type": "object"
+}

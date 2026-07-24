@@ -1,0 +1,23 @@
+{
+  "description": "查询单船历史航次。未提供时间范围时使用简版航次接口。",
+  "properties": {
+    "mmsi": {
+      "title": "Mmsi",
+      "type": "string"
+    },
+    "starttime": {
+      "default": "",
+      "title": "Starttime",
+      "type": "string"
+    },
+    "endtime": {
+      "default": "",
+      "title": "Endtime",
+      "type": "string"
+    }
+  },
+  "required": [
+    "mmsi"
+  ],
+  "type": "object"
+}

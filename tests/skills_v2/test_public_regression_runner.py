@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from scripts.run_shared_skills_v2_regression import _evaluate, validate_cases
+from scripts.skills_v2.run_shared_skills_v2_regression import _evaluate, validate_cases
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,7 +28,7 @@ def _case(**overrides):
 
 
 def test_public_regression_catalogue_covers_required_extension_categories() -> None:
-    cases = yaml.safe_load((ROOT / "docs/shared_skills_v2/REGRESSION_CASES.yaml").read_text(encoding="utf-8"))["cases"]
+    cases = yaml.safe_load((ROOT / "docs/skills_v2/REGRESSION_CASES.yaml").read_text(encoding="utf-8"))["cases"]
 
     validate_cases(cases)
 
@@ -118,7 +118,7 @@ def test_real_image_with_failed_semantic_assertion_is_failed() -> None:
 
 
 def test_pre_run_status_distinguishes_fixture_states() -> None:
-    from scripts.run_shared_skills_v2_regression import _pre_run_status
+    from scripts.skills_v2.run_shared_skills_v2_regression import _pre_run_status
 
     valid_no_url = _case(attachment="img.png", fixture_quality="valid")
     assert _pre_run_status(valid_no_url, "") == ("fixture_prepared", "attachment_url_not_supplied")

@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "skills": {
+    "hifleet-skills": {
+      "source": "charleiWang/hifleet-skills",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "version": "0.3.21",
+      "commit": "e4acf599192f3f1d247ef2da00e78d0cff89819c",
+      "lastKnownGood": "e4acf599192f3f1d247ef2da00e78d0cff89819c",
+      "contentHash": "7118592bea375511a477bf29c7b882e01726fcc8f2e38df1c2bf60927c0e0f8a",
+      "requiredEnv": [
+        "HIFLEET_API_KEY"
+      ],
+      "approvedReadOnlyCapabilities": [
+        "get_archive",
+        "get_area_traffic",
+        "get_areas",
+        "get_avoidredsea_traffic",
+        "get_casualty",
+        "get_maritime_penalty",
+        "get_port",
+        "get_position",
+        "get_psc",
+        "get_psc_anomalies",
+        "get_psc_openclaw_stats",
+        "get_sanction",
+        "get_strait_traffic"
+      ],
+      "reviewRequiredCapabilities": [
+        "charter_contact_dedup",
+        "charter_enrich_helpers",
+        "open_console"
+      ],
+      "verification": "static-contract-reviewed"
+    }
+  }
+}

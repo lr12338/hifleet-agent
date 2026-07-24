@@ -1,0 +1,13 @@
+{
+  "description": "按关键字搜索船舶，返回匹配船舶的MMSI、IMO、船名、船型、船旗。\n\n适用场景：用户给出船名、MMSI或关键字，需要获取船舶标识信息。\n此工具常作为其他查询的前置步骤（获取MMSI/IMO后再查船位/档案/PSC）。\n\nArgs:\n    keyword: 搜索关键字（船名、MMSI等），如 \"YU MING\"、\"414726000\"\n\nReturns:\n    匹配船舶列表",
+  "properties": {
+    "keyword": {
+      "title": "Keyword",
+      "type": "string"
+    }
+  },
+  "required": [
+    "keyword"
+  ],
+  "type": "object"
+}

@@ -10,7 +10,7 @@ from agents.customer_ceshi_responses.builder import NativeToolRuntime
 from agents.customer_ceshi_v2.contracts import ToolCall
 from agents.customer_ceshi_v2.tools import CapabilityRegistry
 from agents.profiles import get_profile
-from skills.core.contracts import ToolDescriptor
+from skills_v2.core.descriptors import ToolDescriptor
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -74,7 +74,7 @@ def test_prepare_ship_update_enforces_shared_invalid_fields_contract() -> None:
     assert result.data["invalid_fields"] == ["mmsi", "lon", "lat", "updatetime"]
 
 
-def test_v2_load_failure_uses_constrained_legacy_registry(monkeypatch) -> None:
+def test_v2_load_failure_uses_safe_constrained_registry(monkeypatch) -> None:
     monkeypatch.setattr(
         "agents.customer_ceshi_responses.builder.build_customer_ceshi_bundle",
         lambda _workspace_path: (_ for _ in ()).throw(RuntimeError("broken manifest")),
@@ -88,7 +88,7 @@ def test_v2_load_failure_uses_constrained_legacy_registry(monkeypatch) -> None:
     text_runtime = runtime.runtime.text_runtime
 
     assert text_runtime.skill_runtime_metadata == {
-        "mode": "legacy_constrained",
+        "mode": "safe_constrained",
         "source_versions": {},
         "fallback_reason": "RuntimeError",
     }
@@ -97,30 +97,31 @@ def test_v2_load_failure_uses_constrained_legacy_registry(monkeypatch) -> None:
 
 
 def test_hifleet_source_versions_are_anchored_to_the_lock(monkeypatch) -> None:
-    """Runtime source_versions must come from skills-lock.json, not a stale manifest."""
+    """Runtime source_versions must come from the V2 lock, not a stale manifest."""
     import json
 
-    from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
+    from skills_v2.adapters.customer_ceshi import build_customer_ceshi_bundle
 
     bundle = build_customer_ceshi_bundle(str(ROOT))
-    record = json.loads((ROOT / "skills-lock.json").read_text(encoding="utf-8"))["skills"]["hifleet-skills"]
+    record = json.loads((ROOT / "src" / "skills_v2" / "upstream" / "hifleet_skills" / "lock.json").read_text(encoding="utf-8"))["skills"]["hifleet-skills"]
     sv = bundle.source_versions["hifleet_data"]
     assert sv["upstream_commit"] == record["commit"]
     assert sv["skill_version"] == record["version"]
     assert sv["content_hash"] == record["contentHash"]
-    # The V2 bundle exposes web_search only; no browser verification tool.
-    foundation = {item.name for item in bundle.descriptors if item.skill_id == "foundation"}
-    assert foundation == {"web_search"}
+    # The V2 bundle exposes web_search as its own Skill; no browser verification tool.
+    web_search_skill = {item.name for item in bundle.descriptors if item.skill_id == "web_search"}
+    assert web_search_skill == {"web_search"}
+    assert "verify_public_page" not in {item.name for item in bundle.descriptors}
 
 
 def test_lock_override_beats_stale_manifest_commit(monkeypatch) -> None:
     """If the manifest commit diverges from the lock, the lock wins at runtime."""
     import json
 
-    from skills.core.registry import SharedSkillRegistry
+    from skills_v2.core.registry import SharedSkillRegistry
 
     registry = SharedSkillRegistry(str(ROOT))
     manifests = registry.load_manifests(("hifleet_data",))
-    record = json.loads((ROOT / "skills-lock.json").read_text(encoding="utf-8"))["skills"]["hifleet-skills"]
+    record = json.loads((ROOT / "src" / "skills_v2" / "upstream" / "hifleet_skills" / "lock.json").read_text(encoding="utf-8"))["skills"]["hifleet-skills"]
     assert manifests["hifleet_data"].upstream_commit == record["commit"]
     assert manifests["hifleet_data"].upstream_lock_key == "hifleet-skills"

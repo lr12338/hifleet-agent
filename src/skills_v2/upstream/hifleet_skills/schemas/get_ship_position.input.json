@@ -1,0 +1,13 @@
+{
+  "description": "查询船舶实时位置、航速、航向、航行状态等动态数据。\n\n适用场景：用户要查某艘船的当前位置、航速、航向等。\n需要MMSI编号，若用户仅提供船名，需先调用ship_search获取MMSI。\n\nArgs:\n    mmsi: 船舶MMSI编号，如 \"414726000\"\n\nReturns:\n    船舶实时位置信息（含微信可点击链接）",
+  "properties": {
+    "mmsi": {
+      "title": "Mmsi",
+      "type": "string"
+    }
+  },
+  "required": [
+    "mmsi"
+  ],
+  "type": "object"
+}

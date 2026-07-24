@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "Shared Skills V2 runtime configuration. The active skill_runtime modes are still resolved by src/skills_v2/core/policy.py from config/agent_profiles.json and the env overrides documented here; this file documents the V2 defaults and is the canonical place for V2-only runtime settings.",
+  "profiles": {
+    "customer_ceshi": {
+      "default_mode": "v2",
+      "env_override": "CUSTOMER_CESHI_SKILLS_MODE",
+      "allowed_modes": ["v2", "legacy"],
+      "fallback": "safe_constrained"
+    },
+    "customer_support": {
+      "default_mode": "legacy",
+      "env_override": "CUSTOMER_SUPPORT_SKILLS_MODE",
+      "allowed_modes": ["legacy"],
+      "shadow_env_override": "CUSTOMER_SUPPORT_SKILLS_SHADOW",
+      "shadow_default": false
+    }
+  },
+  "v2_skills": ["knowledge_retrieval", "web_search", "hifleet_data", "ship_info_update"],
+  "v2_lock": "src/skills_v2/upstream/hifleet_skills/lock.json",
+  "capability_map": "src/skills_v2/upstream/hifleet_skills/capability_map.yaml"
+}

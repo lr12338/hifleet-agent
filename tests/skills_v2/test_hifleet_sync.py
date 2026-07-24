@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.sync_hifleet_skills import REPOSITORY, inspect_checkout, last_known_good, update_lock, update_manifest, update_skill_prompt
+from scripts.skills_v2.sync_hifleet_skills import REPOSITORY, inspect_checkout, last_known_good, update_lock, update_manifest, update_skill_prompt
 
 
 def _candidate_checkout(tmp_path: Path, *, extra_skill_text: str = "") -> Path:

@@ -1,0 +1,16 @@
+{
+  "description": "查询船舶档案信息，包括基本参数、尺寸、载重吨、建造年份、轮机、公司等。\n\n适用场景：用户要查看船舶的详细参数信息。\n需要MMSI或IMO编号（二选一），若仅有船名需先调用ship_search。\n\nArgs:\n    mmsi: 船舶MMSI编号（与imo二选一），如 \"414726000\"\n    imo: 船舶IMO编号（与mmsi二选一），如 \"9613886\"\n\nReturns:\n    船舶档案详细信息",
+  "properties": {
+    "mmsi": {
+      "default": "",
+      "title": "Mmsi",
+      "type": "string"
+    },
+    "imo": {
+      "default": "",
+      "title": "Imo",
+      "type": "string"
+    }
+  },
+  "type": "object"
+}

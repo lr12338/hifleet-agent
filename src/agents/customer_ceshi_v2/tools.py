@@ -5,12 +5,12 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from typing import Any
 
-from skills import SkillLoader
+from skills_v2.core.loader import available_tool_names as _v2_tool_names, get_tools_by_names as _get_v2_tools
 
 from .contracts import Observation, ToolCall
 
-from skills.core.contracts import ToolDescriptor as SharedToolDescriptor
-from skills.core.result_normalizer import normalize_tool_result
+from skills_v2.core.descriptors import ToolDescriptor as SharedToolDescriptor
+from skills_v2.core.result_normalizer import normalize_tool_result
 
 
 WRITE_TOOL_NAMES = {"upload_ship_position", "update_ship_static_info"}
@@ -48,7 +48,7 @@ class CapabilityRegistry:
         shared_descriptors: list[SharedToolDescriptor] | tuple[SharedToolDescriptor, ...] | None = None,
         enforce_known_public_urls: bool = False,
     ):
-        tools = tools if tools is not None else SkillLoader.get_tools_by_skill_names(skill_names or [])
+        tools = tools if tools is not None else _get_v2_tools(_v2_tool_names())
         self._tools = {tool.name: tool for tool in tools if getattr(tool, "name", "") not in DENIED_TOOL_NAMES}
         self._shared_descriptors = {descriptor.name: descriptor for descriptor in shared_descriptors or ()}
         self._enforce_known_public_urls = enforce_known_public_urls

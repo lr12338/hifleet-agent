@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string"
+    },
+    "data": {
+      "type": "object"
+    },
+    "facts": {
+      "type": "array"
+    }
+  },
+  "required": [
+    "status"
+  ]
+}

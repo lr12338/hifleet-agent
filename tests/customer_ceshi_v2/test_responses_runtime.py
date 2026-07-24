@@ -667,7 +667,7 @@ def test_responses_stops_tools_after_answerable_search_result():
 
 
 def test_direct_update_candidate_requires_explicit_current_turn_identity_and_fields(monkeypatch):
-    from skills.hifleet_ship_service import tools as ship_tools
+    from skills_v2.skills.ship_info_update import adapter as ship_tools
 
     runtime = NativeToolRuntime(
         client=ChatToolClient(),
@@ -694,7 +694,7 @@ def test_direct_update_candidate_requires_explicit_current_turn_identity_and_fie
 
 @pytest.mark.xfail(reason="obsolete: media evidence cannot bypass prepare/confirm/commit")
 def test_media_ais_evidence_allows_one_follow_up_direct_position_update(monkeypatch):
-    from skills.hifleet_ship_service import tools as ship_tools
+    from skills_v2.skills.ship_info_update import adapter as ship_tools
 
     calls = []
     monkeypatch.setattr(ship_tools, "upload_ship_position", SimpleNamespace(invoke=lambda args: (calls.append(args) or "上传成功")))
@@ -723,7 +723,7 @@ def test_media_ais_evidence_allows_one_follow_up_direct_position_update(monkeypa
 
 @pytest.mark.xfail(reason="obsolete: direct media writes are intentionally removed")
 def test_media_ais_evidence_accepts_explicit_commands_and_confirm_only_once(monkeypatch):
-    from skills.hifleet_ship_service import tools as ship_tools
+    from skills_v2.skills.ship_info_update import adapter as ship_tools
 
     calls = []
     monkeypatch.setattr(ship_tools, "upload_ship_position", SimpleNamespace(invoke=lambda args: (calls.append(args) or "上传成功")))

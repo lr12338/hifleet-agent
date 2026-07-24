@@ -1,0 +1,13 @@
+{
+  "description": "查询船舶最近一次离港港口与离港时间。",
+  "properties": {
+    "mmsi": {
+      "title": "Mmsi",
+      "type": "string"
+    }
+  },
+  "required": [
+    "mmsi"
+  ],
+  "type": "object"
+}

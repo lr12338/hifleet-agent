@@ -29,10 +29,11 @@ from agents.customer_ceshi_v2.tracing import safe_trace
 from agents.customer_ceshi_responses.ship_updates import PositionNormalizer, ShipIdentityNormalizer, ShipUpdateDraftStore, StaticFieldNormalizer, TimeNormalizer
 from agents.customer_ceshi_responses.claim_guard import guard_claims, limit_reply
 from agents.customer_ceshi_responses.scenarios import classify as classify_scenario
-from skills.adapters.customer_ceshi import build_customer_ceshi_bundle
-from skills.core.contracts import ToolDescriptor as SharedToolDescriptor
-from skills.core.policy import resolve_skill_runtime
-from skills.ship_info_update import validate_position_update, validate_static_update
+from skills_v2.adapters.customer_ceshi import build_customer_ceshi_bundle
+from skills_v2.fallback.safe_constrained import build_safe_constrained_bundle
+from skills_v2.core.descriptors import ToolDescriptor as SharedToolDescriptor
+from skills_v2.core.policy import resolve_skill_runtime
+from skills_v2.skills.ship_info_update import validate_position_update, validate_static_update
 
 
 CHECKPOINT_NAMESPACE = "customer_ceshi_responses"
@@ -606,7 +607,7 @@ def _update_candidate_schema(*, responses: bool) -> dict[str, Any]:
 
 
 def _ship_update_transaction_schemas(*, responses: bool) -> list[dict[str, Any]]:
-    from skills.ship_info_update import transaction_descriptors
+    from skills_v2.skills.ship_info_update.schemas import transaction_descriptors
 
     descriptors = transaction_descriptors()
     return [descriptor.responses_schema() if responses else descriptor.chat_schema() for descriptor in descriptors]
@@ -1162,7 +1163,7 @@ class NativeToolRuntime:
                 return Observation(status="invalid_input", capability=UPDATE_CANDIDATE_TOOL_NAME, warnings=["invalid_updatetime"], retry_allowed=False, suggested_fix="请提供可识别的更新时间，例如 2026-07-15 18:00:00。")
             if any(not self._current_value(current_user_text, merged[field]) and trusted.get(field) != merged[field] for field in required):
                 return Observation(status="invalid_input", capability=UPDATE_CANDIDATE_TOOL_NAME, warnings=["untrusted_position_values"], retry_allowed=False)
-            from skills.hifleet_ship_service.tools import upload_ship_position
+            from skills_v2.skills.ship_info_update.adapter import upload_ship_position
 
             allowed = ("mmsi", "lon", "lat", "speed", "heading", "course", "destination", "eta", "draft", "updatetime", "navstatus", "ship_name")
             tool_args = {field: merged[field] for field in allowed}
@@ -1176,7 +1177,7 @@ class NativeToolRuntime:
                 return Observation(status="invalid_input", capability=UPDATE_CANDIDATE_TOOL_NAME, warnings=["static_field_required"], retry_allowed=False, suggested_fix="请至少提供一项要更新的静态字段。")
             if any(not self._current_value(current_user_text, value) and trusted.get(field) != value for field, value in provided.items()):
                 return Observation(status="invalid_input", capability=UPDATE_CANDIDATE_TOOL_NAME, warnings=["untrusted_static_values"], retry_allowed=False)
-            from skills.hifleet_ship_service.tools import update_ship_static_info
+            from skills_v2.skills.ship_info_update.adapter import update_ship_static_info
 
             raw = update_ship_static_info.invoke({"mmsi": mmsi, **provided})
             return self._write_observation("update_ship_static_info", raw, {"mmsi": mmsi, **provided})
@@ -2323,9 +2324,16 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
             )
         except Exception as exc:
             v2_fallback_reason = type(exc).__name__
-            logger.warning("customer_ceshi Skills V2 is unavailable; using the existing constrained runtime: %s", v2_fallback_reason)
+            logger.warning("customer_ceshi Skills V2 is unavailable; using the V2 safe-constrained fallback: %s", v2_fallback_reason)
+            v2_bundle = build_safe_constrained_bundle(workspace_path)
+            registry = CapabilityRegistry(
+                tools=list(v2_bundle.tools),
+                shared_descriptors=v2_bundle.descriptors,
+                enforce_known_public_urls=True,
+            )
     registry = registry or CapabilityRegistry(
-        skill_names=list(getattr(profile, "skills", []) or []),
+        tools=list(build_safe_constrained_bundle(workspace_path).tools),
+        shared_descriptors=build_safe_constrained_bundle(workspace_path).descriptors,
         enforce_known_public_urls=True,
     )
     if client is None:
@@ -2360,7 +2368,7 @@ def build_customer_ceshi_responses_agent(ctx: Any, cfg: dict[str, Any], workspac
         profile_prompt="\n\n---\n\n".join(part for part in (read_profile_prompt(profile), skill_prompt) if part),
         tool_descriptors=v2_bundle.descriptors if v2_bundle is not None else (),
         skill_runtime_metadata={
-            "mode": "v2" if v2_bundle is not None else ("legacy_constrained" if requested_v2 else "legacy"),
+            "mode": v2_bundle.mode if v2_bundle is not None else "legacy",
             "source_versions": dict(v2_bundle.source_versions) if v2_bundle is not None else {},
             **({"fallback_reason": v2_fallback_reason} if v2_fallback_reason else {}),
         },
